@@ -1,0 +1,5 @@
+duckdb
+flask
+openai
+aiohttp
+tqdm

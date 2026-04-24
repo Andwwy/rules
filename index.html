@@ -6,184 +6,266 @@
 <title>Rules Browser</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-       background: #f0f0f5; color: #1a1a2e; height: 100vh; overflow: hidden; }
-
-/* ── Splash ─────────────────────────────────────────────────────────────── */
-.splash { display: flex; align-items: center; justify-content: center;
-          height: 100vh; background: #0f0f22; }
-.splash-card { background: #1a1a2e; border-radius: 16px; padding: 40px 48px;
-               max-width: 540px; width: 100%; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
-.splash-card h1 { color: #fff; font-size: 22px; margin-bottom: 8px; }
-.splash-card p  { color: #7070a0; font-size: 14px; margin-bottom: 28px; line-height: 1.6; }
-.file-slots { display: flex; flex-direction: column; gap: 10px; margin-bottom: 24px; }
-.file-slot { display: flex; align-items: center; gap: 12px; padding: 12px 14px;
-             border-radius: 8px; border: 1.5px solid #2a2a4a; }
-.file-slot.loaded { border-color: #22c55e; }
-.file-slot.failed { border-color: #4a2a2a; }
-.file-slot.loading { border-color: #2a2a4a; }
-.slot-icon { font-size: 18px; width: 24px; text-align: center; color: #4a4a6a; }
-.file-slot.loaded .slot-icon { color: #22c55e; }
-.file-slot.failed .slot-icon { color: #6a3a3a; }
-.slot-info { flex: 1; }
-.slot-name { font-size: 13px; color: #c0c0e0; font-weight: 500; }
-.slot-desc { font-size: 11px; color: #5a5a7a; margin-top: 2px; }
-.slot-action { font-size: 12px; color: #6060a0; }
-.file-slot.loaded .slot-action { color: #22c55e; }
-.file-slot.failed .slot-action { color: #7a4a4a; }
-.splash-note { font-size: 11px; color: #4a4a6a; text-align: center; margin-top: 16px; }
-
-/* ── App layout ──────────────────────────────────────────────────────────── */
+:root {
+  --bg: #eef1f5;
+  --panel: #101827;
+  --panel-muted: #6b7280;
+  --card: #ffffff;
+  --ink: #111827;
+  --line: #d7dce5;
+  --accent: #1d4ed8;
+  --green: #15803d;
+  --amber: #b45309;
+  --pink: #be185d;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  height: 100vh;
+  overflow: hidden;
+}
 .layout { display: flex; height: 100vh; }
-.sidebar { width: 240px; background: #1a1a2e; color: #c8c8e0; display: flex;
-           flex-direction: column; flex-shrink: 0; overflow: hidden; }
-.sidebar h1 { font-size: 14px; font-weight: 700; color: #fff; letter-spacing: 0.5px;
-              padding: 16px; border-bottom: 1px solid #2a2a4a; flex-shrink: 0; }
-.sidebar-inner { padding: 12px 16px 16px; overflow-y: auto; flex: 1; }
-.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.main-header { padding: 14px 20px; background: white; border-bottom: 1px solid #e0e0e8;
-               display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
-.main-scroll { flex: 1; overflow-y: auto; padding: 10px 16px; }
-
-/* ── Sidebar elements ────────────────────────────────────────────────────── */
-.section-label { font-size: 10px; text-transform: uppercase; letter-spacing: 1.2px;
-                 color: #5a5a7a; margin-bottom: 6px; margin-top: 14px; }
-.db-list, .cat-list { display: flex; flex-direction: column; gap: 2px; }
-.db-btn, .cat-btn { display: flex; justify-content: space-between; align-items: center;
-                    padding: 6px 10px; border-radius: 6px; border: none; background: transparent;
-                    color: #9090b0; cursor: pointer; font-size: 13px; width: 100%; text-align: left; }
-.db-btn:hover, .cat-btn:hover { background: #252545; color: #d0d0f0; }
-.db-btn.active, .cat-btn.active { background: #252545; color: #fff; }
-.db-count { font-size: 11px; color: #6060a0; }
-.db-btn.active .db-count { color: #9090c0; }
-.cat-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 7px; }
-.search-input { width: 100%; padding: 8px 10px; border-radius: 7px; border: 1px solid #2a2a4a;
-                background: #0f0f22; color: #e0e0f0; font-size: 13px; margin-top: 4px; }
-.search-input:focus { outline: none; border-color: #5050a0; }
-.search-input::placeholder { color: #4a4a6a; }
-.progress-bar { height: 4px; background: #252545; border-radius: 2px; overflow: hidden; }
-.progress-fill { height: 100%; background: linear-gradient(90deg,#22c55e,#6366f1);
-                 border-radius: 2px; transition: width 0.4s; }
-.progress-label { font-size: 11px; color: #5a5a7a; margin-top: 5px; text-align: right; }
-.stat-rows { margin-top: 8px; }
-.stat-row { display: flex; justify-content: space-between; font-size: 12px; color: #7070a0; padding: 2px 0; }
-.open-more-btn { display: block; width: 100%; margin-top: 16px; padding: 7px;
-                 border-radius: 6px; border: 1px dashed #2a2a4a; background: transparent;
-                 color: #6060a0; font-size: 12px; cursor: pointer; text-align: center; }
-.open-more-btn:hover { border-color: #6366f1; color: #9090f0; }
-.loaded-file { font-size: 11px; color: #4a4a6a; padding: 3px 0; display: flex;
-               align-items: center; gap: 6px; }
-.loaded-file .dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; }
-
-/* ── Cards ───────────────────────────────────────────────────────────────── */
-.total-info { font-size: 13px; color: #666; }
-.kbd-hint { font-size: 11px; color: #aaa; background: #f5f5f5; border: 1px solid #ddd;
-            border-radius: 4px; padding: 2px 6px; }
-.rules-list { display: flex; flex-direction: column; gap: 4px;
-              max-width: 860px; margin: 0 auto; }
-.rule-card { background: white; border-radius: 6px; padding: 8px 12px 7px;
-             box-shadow: 0 1px 2px rgba(0,0,0,.05); border-left: 3px solid #e0e0e8;
-             transition: border-color 0.15s; outline: none; }
-.rule-card:focus { box-shadow: 0 0 0 2px #6366f1; }
-.rule-card.cat-deterministic { border-left-color: #22c55e; }
-.rule-card.cat-llm   { border-left-color: #6366f1; }
-.rule-card.cat-mixed { border-left-color: #f59e0b; }
-.rule-text { font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
-             margin-bottom: 5px; color: #1a1a2e; max-height: 72px; overflow: hidden;
-             position: relative; }
-.rule-text.expanded { max-height: none; }
-.rule-text:not(.expanded)::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0;
-                                    height: 28px; background: linear-gradient(transparent,white); }
-.expand-btn { font-size: 10px; color: #6366f1; cursor: pointer; border: none;
-              background: none; padding: 0; margin-bottom: 5px; display: block; }
-.rule-meta { font-size: 10px; color: #aaa; margin-bottom: 5px;
-             display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.rule-meta a { color: #6366f1; text-decoration: none; }
-.rule-meta a:hover { text-decoration: underline; }
-.tag { background: #f0f0f8; padding: 1px 5px; border-radius: 3px; font-size: 10px; color: #8080a0; }
-.tag.source { background: #f0f4ff; color: #4455aa; }
-.rule-actions { display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
-.action-btn { padding: 2px 10px; border-radius: 20px; border: 1px solid; cursor: pointer;
-              font-size: 11px; font-weight: 500; background: transparent; transition: all .1s; }
-.action-btn.det { border-color:#22c55e; color:#22c55e; }
-.action-btn.det:hover, .action-btn.det.active { background:#22c55e; color:white; }
-.action-btn.mix { border-color:#f59e0b; color:#f59e0b; }
-.action-btn.mix:hover, .action-btn.mix.active { background:#f59e0b; color:white; }
-.action-btn.llm { border-color:#6366f1; color:#6366f1; }
-.action-btn.llm:hover, .action-btn.llm.active { background:#6366f1; color:white; }
-.action-btn.clr { border-color:#ddd; color:#bbb; font-size:10px; padding:1px 7px; }
-.action-btn.clr:hover { border-color:#999; color:#666; }
-.mech-select { padding:2px 6px; border-radius:5px; border:1px solid #e0e0e8;
-               font-size:11px; color:#666; background:white; }
-.load-more { text-align:center; padding:24px 0; }
-.load-more-btn { padding:9px 28px; border-radius:8px; border:1.5px solid #6366f1;
-                 color:#6366f1; background:transparent; cursor:pointer; font-size:14px; }
-.load-more-btn:hover { background:#6366f1; color:white; }
-.empty { text-align:center; color:#aaa; padding:60px 20px; font-size:15px; }
-.saving-indicator { font-size:11px; color:#22c55e; margin-left:8px; opacity:0; transition:opacity .3s; }
-.saving-indicator.show { opacity:1; }
-.download-btn { font-size:12px; padding:4px 12px; border-radius:6px; border:1px solid #22c55e;
-                color:#22c55e; background:transparent; cursor:pointer; margin-left:8px; }
-.download-btn:hover { background:#22c55e; color:#fff; }
-.download-btn.pending { border-color:#f59e0b; color:#f59e0b; }
-.download-btn.pending:hover { background:#f59e0b; color:#fff; }
-.error-banner { background:#fee; border:1px solid #fcc; padding:10px 14px; border-radius:8px;
-                font-size:13px; color:#c00; margin-bottom:12px; }
+.sidebar {
+  width: 280px;
+  background: var(--panel);
+  color: white;
+  display: flex;
+  flex-direction: column;
+}
+.sidebar h1 {
+  font-size: 15px;
+  font-weight: 700;
+  padding: 16px 18px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.sidebar-inner {
+  overflow-y: auto;
+  padding: 14px 16px 20px;
+}
+.section-label {
+  font-size: 10px;
+  letter-spacing: 1.3px;
+  text-transform: uppercase;
+  color: var(--panel-muted);
+  margin: 14px 0 6px;
+}
+.search-input {
+  width: 100%;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.04);
+  color: white;
+  border-radius: 8px;
+  padding: 9px 10px;
+  font-size: 13px;
+}
+.search-input::placeholder { color: #7b8595; }
+.btn-list { display: flex; flex-direction: column; gap: 4px; }
+.side-btn {
+  width: 100%;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #d4d9e2;
+  padding: 8px 10px;
+  cursor: pointer;
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.side-btn:hover { background: rgba(255,255,255,0.06); }
+.side-btn.active { background: rgba(59,130,246,0.2); color: white; }
+.side-count { color: #8d99ad; font-size: 11px; }
+.loaded-file {
+  font-size: 12px;
+  color: #b7c0cf;
+  padding: 3px 0;
+}
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.main-header {
+  background: white;
+  border-bottom: 1px solid var(--line);
+  padding: 14px 20px;
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: center;
+}
+.main-scroll {
+  overflow-y: auto;
+  padding: 18px 20px 36px;
+}
+.header-title { font-size: 14px; color: #4b5563; }
+.header-note {
+  font-size: 11px;
+  color: #6b7280;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+.rules-list {
+  max-width: 980px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.card {
+  background: var(--card);
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  padding: 16px 18px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+.card { border-left: 4px solid var(--accent); }
+.card-text {
+  font-size: 15px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  margin-bottom: 12px;
+}
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-bottom: 10px;
+}
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 11px;
+}
+.tag.type { background: #eff6ff; color: #1d4ed8; }
+.tag.det { background: #ecfdf5; color: var(--green); }
+.tag.mix { background: #fffbeb; color: var(--amber); }
+.tag.llm { background: #fdf2f8; color: var(--pink); }
+.tag.low { background: #fff7ed; color: #c2410c; }
+.tag.marked { background: #fee2e2; color: #b91c1c; }
+.reasoning {
+  margin-top: 10px;
+  font-size: 13px;
+  color: #4b5563;
+  line-height: 1.55;
+}
+.reasoning strong { color: #1f2937; }
+.source-link {
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+}
+.source-link:hover { text-decoration: underline; }
+.splash {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(circle at top, #1f2937, #0f172a);
+  color: white;
+}
+.splash-card {
+  width: min(560px, calc(100vw - 32px));
+  background: rgba(17,24,39,0.95);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 20px;
+  padding: 28px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+}
+.splash-card h1 {
+  font-size: 22px;
+  margin-bottom: 8px;
+}
+.splash-card p {
+  color: #b4bfd1;
+  line-height: 1.6;
+  font-size: 14px;
+}
+.status-list {
+  margin-top: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.status-row {
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+.status-row .dim { color: #9aa6b9; }
+.empty, .error {
+  max-width: 740px;
+  margin: 40px auto 0;
+  background: white;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  padding: 22px;
+  color: #4b5563;
+}
+.error { border-color: #fecaca; background: #fff7f7; color: #991b1b; }
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  .sidebar { width: 100%; height: 42vh; }
+}
 </style>
 </head>
 <body>
 
-<!-- ── Splash screen ──────────────────────────────────────────────────────── -->
 <div id="splash" class="splash">
   <div class="splash-card">
     <h1>Rules Browser</h1>
-    <p>Loading database files…</p>
-    <div class="file-slots" id="fileSlots"></div>
-    <p class="splash-note" id="splashError" style="color:#f66;display:none"></p>
+    <p>Loading <code>processed_v2.db</code>. This is the V2 browser for your current taxonomy.</p>
+    <div id="statusList" class="status-list"></div>
+    <p id="splashError" style="display:none; margin-top:16px; color:#fca5a5;"></p>
   </div>
 </div>
 
-<!-- ── Main app ───────────────────────────────────────────────────────────── -->
 <div id="app" class="layout" style="display:none">
   <div class="sidebar">
-    <h1>Rules Browser
-      <span id="savingIndicator" class="saving-indicator">saved</span>
-      <button id="downloadBtn" class="download-btn" title="Download modified processed.db">↓ Download</button>
-    </h1>
+    <h1>Rules Browser</h1>
     <div class="sidebar-inner">
-      <div class="section-label">Database</div>
-      <div id="dbList" class="db-list"></div>
+      <div class="section-label">Dataset</div>
+      <div id="tabList" class="btn-list"></div>
 
-      <div class="section-label">Filter</div>
-      <input id="searchInput" class="search-input" placeholder="Search rules…" autocomplete="off">
-      <div id="catList" class="cat-list" style="margin-top:8px"></div>
+      <div class="section-label">Search</div>
+      <input id="searchInput" class="search-input" placeholder="Search rule text">
 
-      <div class="section-label" style="margin-top:14px">Mechanism</div>
-      <div id="mechList" class="cat-list"></div>
+      <div class="section-label">Primary Filter</div>
+      <div id="categoryList" class="btn-list"></div>
 
-      <div class="section-label" style="margin-top:14px">Source</div>
-      <div id="sourceList" class="cat-list"></div>
+      <div class="section-label" id="secondaryLabel">Secondary Filter</div>
+      <div id="secondaryList" class="btn-list"></div>
 
-      <div class="section-label">Progress</div>
-      <div class="progress-bar"><div id="progressFill" class="progress-fill" style="width:0%"></div></div>
-      <div id="progressLabel" class="progress-label">—</div>
-      <div id="statRows" class="stat-rows"></div>
+      <div class="section-label">Source</div>
+      <div id="sourceList" class="btn-list"></div>
 
-      <button id="openMoreBtn" class="open-more-btn">+ Open another DB file</button>
+      <div class="section-label">Loaded Files</div>
       <div id="loadedFiles"></div>
     </div>
   </div>
 
   <div class="main">
     <div class="main-header">
-      <span id="totalInfo" class="total-info">Loading…</span>
-      <span class="kbd-hint">D · M · L to categorize · ↑↓ to navigate</span>
+      <div id="totalInfo" class="header-title">Loading…</div>
+      <div class="header-note">V2 browser</div>
     </div>
-    <div class="main-scroll" id="mainScroll">
+    <div class="main-scroll">
       <div id="rulesList" class="rules-list"></div>
-      <div id="loadMoreDiv" class="load-more" style="display:none">
-        <button id="loadMoreBtn" class="load-more-btn">Load more</button>
-      </div>
     </div>
   </div>
 </div>
@@ -191,37 +273,37 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
 <script type="module">
 import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm';
 
-// ── Constants ─────────────────────────────────────────────────────────────
-
-const MECHANISMS = ['','linter','formatter','type-checker','git-hook','ci-gate',
-                    'gitignore','regex','filesystem','db-constraint','shell-script','other'];
-const PAGE = 30;
-
-const DB_SLOTS = [
-  { key: 'processed', file: 'processed.db', desc: 'Categorized rules', required: true },
-  { key: 'rules',     file: 'rules.db',     desc: 'Source DB 1',      required: false },
-  { key: 'rules2',    file: 'rules2.db',    desc: 'Source DB 2',      required: false },
-  { key: 'rules3',    file: 'rules3.db',    desc: 'Source DB 3',      required: false },
-];
-
-// ── State ─────────────────────────────────────────────────────────────────
-
-const S = {
-  db: null, conn: null,
-  loaded: new Set(),  // which slot keys are loaded
-  dirty: false,       // unsaved changes to processed_rules
-  tab: '_all',        // current tab key
-  tabs: [],           // [{key, label, mode, total, det, llm, mix, unc}]
-  category: 'all', mechanism: '', source: '', search: '',
-  offset: 0, total: 0, loading: false, mode: 'processed',
-  focusedCard: null,
+const DB_FILE = {
+  file: 'processed_v2.db',
+  desc: 'New taxonomy with rule_type, confidence, labels, and reasoning'
 };
 
-// ── DuckDB init ───────────────────────────────────────────────────────────
+const S = {
+  db: null,
+  conn: null,
+  loaded: false,
+  total: 0,
+  search: '',
+  category: 'all',
+  secondary: '',
+  source: ''
+};
+
+function esc(text) {
+  return text == null ? '' : String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function sqlStr(value) {
+  return value == null ? 'NULL' : `'${String(value).replace(/'/g, "''")}'`;
+}
 
 async function initDuckDB() {
   const bundles = duckdb.getJsDelivrBundles();
-  const bundle  = await duckdb.selectBundle(bundles);
+  const bundle = await duckdb.selectBundle(bundles);
   const workerUrl = URL.createObjectURL(
     new Blob([`importScripts("${bundle.mainWorker}")`], { type: 'text/javascript' })
   );
@@ -231,70 +313,17 @@ async function initDuckDB() {
   return db;
 }
 
-// ── File loading ──────────────────────────────────────────────────────────
-
-async function fetchDbFile(key, url) {
-  const resp = await fetch(url);
-  if (!resp.ok) return false;
-  const buffer = new Uint8Array(await resp.arrayBuffer());
-  await S.db.registerFileBuffer(`${key}.db`, buffer);
-  return true;
-}
-
-async function attachDb(key) {
-  const fname  = `${key}.db`;
-  const schema = key; // use key as schema name
-  try {
-    await S.conn.query(`ATTACH '${fname}' AS ${schema} (READ_ONLY)`);
-  } catch (e) {
-    console.warn(`ATTACH ${key} failed:`, e.message);
-    throw e;
-  }
-}
-
-async function ensureProcessedTable() {
-  await S.conn.query(`
-    CREATE TABLE IF NOT EXISTS processed_rules (
-      id VARCHAR PRIMARY KEY,
-      source_db VARCHAR NOT NULL,
-      source_id VARCHAR NOT NULL,
-      source_url VARCHAR,
-      repo_name VARCHAR,
-      rule_source VARCHAR,
-      rule_text TEXT NOT NULL,
-      rule_index INTEGER,
-      enforcement_category VARCHAR,
-      enforcement_mechanism VARCHAR,
-      enforcement_notes TEXT,
-      processed_at TIMESTAMP
-    )
-  `);
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────
-
-function esc(s) {
-  return s == null ? '' : String(s)
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;');
-}
-
-function sqlStr(s) {
-  // Safe string literal for trusted internal values (no user-injected SQL)
-  return s == null ? 'NULL' : `'${String(s).replace(/'/g,"''")}'`;
-}
-
 async function rows(sql) {
   const result = await S.conn.query(sql);
-  const fields = result.schema.fields.map(f => f.name);
+  const fields = result.schema.fields.map(field => field.name);
   const out = [];
   for (const batch of result.batches) {
     for (let i = 0; i < batch.numRows; i++) {
       const row = {};
-      fields.forEach((name, j) => {
-        let v = batch.getChildAt(j).get(i);
-        if (typeof v === 'bigint') v = Number(v);
-        row[name] = v;
+      fields.forEach((name, index) => {
+        let value = batch.getChildAt(index).get(i);
+        if (typeof value === 'bigint') value = Number(value);
+        row[name] = value;
       });
       out.push(row);
     }
@@ -303,585 +332,353 @@ async function rows(sql) {
 }
 
 async function scalar(sql) {
-  const r = await rows(sql);
-  return r[0] ? Object.values(r[0])[0] : 0;
+  const result = await rows(sql);
+  return result[0] ? Object.values(result[0])[0] : 0;
 }
 
-// ── Download processed.db ─────────────────────────────────────────────────
-
-async function downloadDb() {
-  try {
-    // Export in-memory data to a fresh DuckDB file buffer
-    const exportName = '_processed_export.db';
-    await S.db.registerFileBuffer(exportName, new Uint8Array(0));
-    await S.conn.query(`ATTACH '${exportName}' AS proc_export`);
-    await S.conn.query(`CREATE TABLE proc_export.processed_rules AS SELECT * FROM processed_rules`);
-    await S.conn.query(`CHECKPOINT proc_export`);
-    const buf = await S.db.copyFileToBuffer(exportName);
-    await S.conn.query(`DETACH proc_export`);
-    await S.db.dropFile(exportName);
-
-    const blob = new Blob([buf], { type: 'application/octet-stream' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href = url; a.download = 'processed.db'; a.click();
-    URL.revokeObjectURL(url);
-    setDirty(false);
-    flashSaved();
-  } catch (e) {
-    console.error('Download failed:', e);
-  }
-}
-
-function setDirty(dirty) {
-  S.dirty = dirty;
-  const btn = document.getElementById('downloadBtn');
-  if (btn) btn.classList.toggle('pending', dirty);
-}
-
-function flashSaved() {
-  const el = document.getElementById('savingIndicator');
-  el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 1500);
-}
-
-// Mark dirty (called after each categorization instead of auto-saving)
-function markDirty() { setDirty(true); }
-
-// ── Tab / stats computation ───────────────────────────────────────────────
-
-async function computeTabs() {
-  const tabs = [];
-
-  if (S.loaded.has('processed')) {
-    // "All" tab + per-source-db tabs from processed
-    const sourceDbs = await rows(
-      `SELECT source_db, COUNT(*) AS n FROM processed_rules GROUP BY 1 ORDER BY 2 DESC`
-    );
-    const total = await scalar('SELECT COUNT(*) FROM processed_rules');
-    const det   = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE enforcement_category='deterministic'`);
-    const llm   = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE enforcement_category='llm'`);
-    const mix   = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE enforcement_category='mixed'`);
-    const unc   = total - det - llm - mix;
-    tabs.push({ key:'_all', label:'all (processed)', mode:'processed', total, det, llm, mix, unc });
-
-    for (const { source_db, n } of sourceDbs) {
-      const d = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='deterministic'`);
-      const l = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='llm'`);
-      const m = await scalar(`SELECT COUNT(*) FROM processed_rules WHERE source_db=${sqlStr(source_db)} AND enforcement_category='mixed'`);
-      tabs.push({ key: source_db, label: source_db, mode:'processed',
-                  total: n, det: d, llm: l, mix: m, unc: n - d - l - m });
-    }
-  }
-
-  // Raw tabs for source DBs
-  for (const slot of DB_SLOTS.filter(s => s.key !== 'processed')) {
-    if (!S.loaded.has(slot.key)) continue;
-    const total = await scalar(`SELECT COUNT(*) FROM ${slot.key}.rules`);
-    tabs.push({ key: `raw:${slot.key}`, label: `${slot.key} (raw)`, mode:'raw',
-                total, det:0, llm:0, mix:0, unc: total });
-  }
-
-  S.tabs = tabs;
-}
-
-// ── Query functions ───────────────────────────────────────────────────────
-
-function buildWhere(extra = [], {skipMechanism=false, skipSource=false, skipCategory=false} = {}) {
-  const w = [...extra];
-  if (S.tab.startsWith('raw:')) {
-    if (!skipSource && S.source) w.push(`source = ${sqlStr(S.source)}`);
-    if (S.search) w.push(`LOWER(content) LIKE ${sqlStr('%'+S.search.toLowerCase()+'%')}`);
-  } else {
-    if (S.tab !== '_all') w.push(`source_db = ${sqlStr(S.tab)}`);
-    if (!skipSource && S.source) w.push(`rule_source = ${sqlStr(S.source)}`);
-    if (!skipCategory) {
-      if (S.category === 'uncategorized') w.push(`enforcement_category IS NULL`);
-      else if (S.category !== 'all')      w.push(`enforcement_category = ${sqlStr(S.category)}`);
-    }
-    if (!skipMechanism && S.mechanism) w.push(`enforcement_mechanism = ${sqlStr(S.mechanism)}`);
-    if (S.search) w.push(`LOWER(rule_text) LIKE ${sqlStr('%'+S.search.toLowerCase()+'%')}`);
-  }
-  return w.length ? 'WHERE ' + w.join(' AND ') : '';
-}
-
-async function fetchRules() {
-  const where = buildWhere();
-  if (S.tab.startsWith('raw:')) {
-    const schema = S.tab.slice(4);
-    S.total = await scalar(`SELECT COUNT(*) FROM ${schema}.rules ${where}`);
-    return rows(`
-      SELECT id, content AS rule_text, source_url, repo_name,
-             NULL AS enforcement_category, NULL AS enforcement_mechanism, NULL AS enforcement_notes,
-             NULL AS rule_index, NULL AS source_db, source AS rule_source, file_type, source AS source_label
-      FROM ${schema}.rules ${where}
-      ORDER BY content_len DESC NULLS LAST
-      LIMIT ${PAGE} OFFSET ${S.offset}
-    `);
-  } else {
-    S.total = await scalar(`SELECT COUNT(*) FROM processed_rules ${where}`);
-    return rows(`
-      SELECT id, rule_text, source_url, repo_name,
-             enforcement_category, enforcement_mechanism, enforcement_notes,
-             rule_index, source_db, rule_source,
-             NULL AS file_type, NULL AS source_label
-      FROM processed_rules ${where}
-      ORDER BY source_db, rule_index ASC NULLS LAST, id
-      LIMIT ${PAGE} OFFSET ${S.offset}
-    `);
-  }
-}
-
-async function fetchSources() {
-  if (S.tab.startsWith('raw:')) {
-    const schema = S.tab.slice(4);
-    const w = buildWhere([], {skipSource: true});
-    return rows(`SELECT source, COUNT(*) AS n FROM ${schema}.rules ${w} GROUP BY 1 ORDER BY 2 DESC`);
-  } else {
-    const w = buildWhere([], {skipSource: true});
-    return rows(`SELECT rule_source AS source, COUNT(*) AS n FROM processed_rules ${w} GROUP BY 1 ORDER BY 2 DESC`);
-  }
-}
-
-async function fetchMechanisms() {
-  if (S.tab.startsWith('raw:') || !S.loaded.has('processed')) return [];
-  const w = buildWhere([], {skipMechanism: true});
-  return rows(`
-    SELECT COALESCE(enforcement_mechanism, '') AS mech, COUNT(*) AS n
-    FROM processed_rules ${w}
-    GROUP BY 1 ORDER BY 2 DESC
+async function ensureSchema() {
+  await S.conn.query(`
+    CREATE TABLE IF NOT EXISTS all_rules (
+      id VARCHAR PRIMARY KEY,
+      source_db VARCHAR,
+      source_id VARCHAR,
+      source_url VARCHAR,
+      repo_name VARCHAR,
+      rule_source VARCHAR,
+      rule_text TEXT NOT NULL,
+      rule_index INTEGER,
+      rule_type VARCHAR,
+      enforcement_mode VARCHAR,
+      mechanism VARCHAR,
+      labels_json TEXT,
+      confidence DOUBLE,
+      reasoning TEXT,
+      manual_reprocess BOOLEAN,
+      updated_at TIMESTAMP
+    )
   `);
 }
 
-// ── Render ────────────────────────────────────────────────────────────────
-
-function renderDbList() {
-  document.getElementById('dbList').innerHTML = S.tabs.map(t => `
-    <button class="db-btn ${t.key === S.tab ? 'active' : ''}" data-tab="${t.key}">
-      <span>${esc(t.label)}</span>
-      <span class="db-count">${t.total.toLocaleString()}</span>
-    </button>
-  `).join('');
-  document.querySelectorAll('.db-btn').forEach(btn =>
-    btn.addEventListener('click', () => selectTab(btn.dataset.tab))
-  );
+function renderStatuses(statuses) {
+  const status = statuses.v2 || 'waiting';
+  const label = status === 'loaded'
+    ? 'Loaded'
+    : status === 'missing'
+      ? 'Missing'
+      : status === 'error'
+        ? 'Error'
+        : 'Loading…';
+  document.getElementById('statusList').innerHTML = `
+    <div class="status-row">
+      <div>
+        <div>${esc(DB_FILE.file)}</div>
+        <div class="dim">${esc(DB_FILE.desc)}</div>
+      </div>
+      <div>${label}</div>
+    </div>
+  `;
 }
 
-function renderCatList() {
-  const t = S.tabs.find(x => x.key === S.tab) || {};
-  const cats = [
-    { key:'all',           label:'All',           color:'#9090c0', count: t.total },
-    { key:'uncategorized', label:'Uncategorized',  color:'#c0c0d0', count: t.unc },
-    { key:'deterministic', label:'Deterministic',  color:'#22c55e', count: t.det },
-    { key:'mixed',         label:'Mixed',          color:'#f59e0b', count: t.mix },
-    { key:'llm',           label:'LLM-only',       color:'#6366f1', count: t.llm },
+async function importV2(attachedSchema) {
+  await S.conn.query(`
+    INSERT INTO all_rules
+    SELECT
+      id,
+      source_db,
+      source_id,
+      source_url,
+      repo_name,
+      rule_source,
+      rule_text,
+      rule_index,
+      rule_type,
+      enforcement_mode,
+      mechanism,
+      labels_json,
+      confidence,
+      reasoning,
+      COALESCE(manual_reprocess, FALSE),
+      updated_at
+    FROM ${attachedSchema}.processed_rules_v2
+  `);
+}
+
+async function loadDatabase(statuses) {
+  try {
+    const response = await fetch(DB_FILE.file);
+    if (!response.ok) {
+      statuses.v2 = 'missing';
+      renderStatuses(statuses);
+      return;
+    }
+
+    const buffer = new Uint8Array(await response.arrayBuffer());
+    await S.db.registerFileBuffer(DB_FILE.file, buffer);
+    const schema = 'src_v2';
+    await S.conn.query(`ATTACH '${DB_FILE.file}' AS ${schema} (READ_ONLY)`);
+    await importV2(schema);
+
+    await S.conn.query(`DETACH ${schema}`);
+    S.loaded = true;
+    S.total = await scalar('SELECT COUNT(*) FROM all_rules');
+    statuses.v2 = 'loaded';
+  } catch (error) {
+    console.error(`Failed loading ${DB_FILE.file}:`, error);
+    statuses.v2 = 'error';
+  }
+  renderStatuses(statuses);
+}
+
+function buildWhere({ skipCategory = false, skipSecondary = false, skipSource = false } = {}) {
+  const wheres = ['1 = 1'];
+
+  if (S.search) {
+    wheres.push(`LOWER(rule_text) LIKE ${sqlStr('%' + S.search.toLowerCase() + '%')}`);
+  }
+  if (!skipSource && S.source) {
+    wheres.push(`rule_source = ${sqlStr(S.source)}`);
+  }
+
+  if (!skipCategory) {
+    if (S.category === 'uncategorized') wheres.push('rule_type IS NULL');
+    else if (S.category !== 'all') wheres.push(`rule_type = ${sqlStr(S.category)}`);
+  }
+  if (!skipSecondary && S.secondary) {
+    wheres.push(`enforcement_mode = ${sqlStr(S.secondary)}`);
+  }
+
+  return 'WHERE ' + wheres.join(' AND ');
+}
+
+async function renderTabs() {
+  document.getElementById('tabList').innerHTML = `
+    <button class="side-btn active" type="button" disabled>
+      <span>${esc(DB_FILE.file)}</span>
+      <span class="side-count">${Number(S.total).toLocaleString()}</span>
+    </button>
+  `;
+}
+
+async function renderCategoryList() {
+  const total = await scalar(`SELECT COUNT(*) FROM all_rules ${buildWhere({ skipCategory: true, skipSecondary: true, skipSource: true })}`);
+  const unc = await scalar(`SELECT COUNT(*) FROM all_rules ${buildWhere({ skipCategory: true, skipSecondary: true, skipSource: true })} AND rule_type IS NULL`);
+  const output = await scalar(`SELECT COUNT(*) FROM all_rules ${buildWhere({ skipCategory: true, skipSecondary: true, skipSource: true })} AND rule_type = 'output_rule'`);
+  const process = await scalar(`SELECT COUNT(*) FROM all_rules ${buildWhere({ skipCategory: true, skipSecondary: true, skipSource: true })} AND rule_type = 'process_rule'`);
+  const items = [
+    ['all', 'All', total],
+    ['uncategorized', 'Uncategorized', unc],
+    ['output_rule', 'Output Rule', output],
+    ['process_rule', 'Process Rule', process]
   ];
-  document.getElementById('catList').innerHTML = cats.map(c => `
-    <button class="cat-btn ${c.key === S.category ? 'active' : ''}" data-cat="${c.key}">
-      <span><span class="cat-dot" style="background:${c.color}"></span>${c.label}</span>
-      <span style="font-size:11px;color:#6060a0">${c.count != null ? c.count.toLocaleString() : ''}</span>
+
+  document.getElementById('categoryList').innerHTML = items.map(([key, label, count]) => `
+    <button class="side-btn ${S.category === key ? 'active' : ''}" data-category="${esc(key)}">
+      <span>${esc(label)}</span>
+      <span class="side-count">${Number(count).toLocaleString()}</span>
     </button>
   `).join('');
-  document.querySelectorAll('.cat-btn').forEach(btn =>
-    btn.addEventListener('click', () => selectCat(btn.dataset.cat))
-  );
+
+  document.querySelectorAll('[data-category]').forEach(button => {
+    button.addEventListener('click', async () => {
+      S.category = button.dataset.category;
+      await renderRules();
+      await renderCategoryList();
+      await renderSecondaryList();
+      await renderSourceList();
+      await renderHeader();
+    });
+  });
 }
 
-function renderProgress() {
-  const t = S.tabs.find(x => x.key === S.tab) || {};
-  const total = t.total || 1;
-  const done  = (t.det || 0) + (t.mix || 0) + (t.llm || 0);
-  const pct   = Math.round(done / total * 100);
-  document.getElementById('progressFill').style.width  = pct + '%';
-  document.getElementById('progressLabel').textContent = `${done.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`;
-  document.getElementById('statRows').innerHTML = [
-    ['Deterministic','#22c55e', t.det||0],
-    ['Mixed',        '#f59e0b', t.mix||0],
-    ['LLM-only',     '#6366f1', t.llm||0],
-    ['Uncategorized','#6060a0', t.unc||0],
-  ].map(([label,color,n]) => `
-    <div class="stat-row">
-      <span><span class="cat-dot" style="background:${color}"></span>${label}</span>
-      <span>${n.toLocaleString()}</span>
-    </div>`).join('');
+async function renderSecondaryList() {
+  const labelEl = document.getElementById('secondaryLabel');
+  labelEl.textContent = 'Enforcement';
+  const query = `
+    SELECT COALESCE(enforcement_mode, '(none)') AS key, COUNT(*) AS n
+    FROM all_rules ${buildWhere({ skipSecondary: true })}
+    GROUP BY 1 ORDER BY 2 DESC
+  `;
+  const data = await rows(query);
+  const buttons = [
+    `<button class="side-btn ${S.secondary === '' ? 'active' : ''}" data-secondary="">
+      <span>All</span><span class="side-count"></span>
+    </button>`,
+    ...data.map(row => `
+      <button class="side-btn ${S.secondary === (row.key === '(none)' ? '' : row.key) ? 'active' : ''}" data-secondary="${esc(row.key === '(none)' ? '' : row.key)}">
+        <span>${esc(row.key)}</span>
+        <span class="side-count">${Number(row.n).toLocaleString()}</span>
+      </button>
+    `)
+  ];
+  document.getElementById('secondaryList').innerHTML = buttons.join('');
+
+  document.querySelectorAll('[data-secondary]').forEach(button => {
+    button.addEventListener('click', async () => {
+      S.secondary = button.dataset.secondary;
+      await renderRules();
+      await renderSecondaryList();
+      await renderSourceList();
+      await renderHeader();
+    });
+  });
 }
 
-async function renderMechanisms() {
-  const data = await fetchMechanisms();
-  const el   = document.getElementById('mechList');
-  if (!data.length) { el.innerHTML = ''; return; }
-  el.innerHTML = [
-    `<button class="cat-btn ${S.mechanism==='' ? 'active':''}" data-mech="">
-       <span>All mechanisms</span><span></span></button>`,
-    ...data.map(d => `
-      <button class="cat-btn ${S.mechanism===d.mech ? 'active':''}" data-mech="${esc(d.mech)}">
-        <span style="word-break:break-all">${esc(d.mech||'(none)')}</span>
-        <span style="font-size:11px;color:#6060a0">${Number(d.n).toLocaleString()}</span>
-      </button>`)
-  ].join('');
-  el.querySelectorAll('.cat-btn').forEach(btn =>
-    btn.addEventListener('click', () => selectMechanism(btn.dataset.mech))
-  );
+async function renderSourceList() {
+  const data = await rows(`
+    SELECT COALESCE(rule_source, '(none)') AS source_key, COUNT(*) AS n
+    FROM all_rules ${buildWhere({ skipSource: true })}
+    GROUP BY 1 ORDER BY 2 DESC
+  `);
+  const buttons = [
+    `<button class="side-btn ${S.source === '' ? 'active' : ''}" data-source="">
+      <span>All sources</span><span class="side-count"></span>
+    </button>`,
+    ...data.map(row => `
+      <button class="side-btn ${S.source === (row.source_key === '(none)' ? '' : row.source_key) ? 'active' : ''}" data-source="${esc(row.source_key === '(none)' ? '' : row.source_key)}">
+        <span>${esc(row.source_key)}</span>
+        <span class="side-count">${Number(row.n).toLocaleString()}</span>
+      </button>
+    `)
+  ];
+  document.getElementById('sourceList').innerHTML = buttons.join('');
+
+  document.querySelectorAll('[data-source]').forEach(button => {
+    button.addEventListener('click', async () => {
+      S.source = button.dataset.source;
+      await renderRules();
+      await renderHeader();
+    });
+  });
 }
 
-async function renderSources() {
-  const data = await fetchSources();
-  const el   = document.getElementById('sourceList');
-  if (!data.length) { el.innerHTML = ''; return; }
-  el.innerHTML = [
-    `<button class="cat-btn ${S.source==='' ? 'active':''}" data-src="">
-       <span>All sources</span><span></span></button>`,
-    ...data.map(d => `
-      <button class="cat-btn ${S.source===d.source ? 'active':''}" data-src="${esc(d.source||'')}">
-        <span style="word-break:break-all">${esc(d.source||'(none)')}</span>
-        <span style="font-size:11px;color:#6060a0">${Number(d.n).toLocaleString()}</span>
-      </button>`)
-  ].join('');
-  el.querySelectorAll('.cat-btn').forEach(btn =>
-    btn.addEventListener('click', () => selectSource(btn.dataset.src))
-  );
+function enforcementTagClass(mode) {
+  if (mode === 'deterministic') return 'det';
+  if (mode === 'mixed') return 'mix';
+  if (mode === 'llm') return 'llm';
+  return '';
+}
+
+function parseLabels(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function makeCard(rule) {
-  const processed = S.mode === 'processed';
-  const card = document.createElement('div');
-  card.className = 'rule-card' + (rule.enforcement_category ? ' cat-' + rule.enforcement_category : '');
-  card.dataset.id  = rule.id;
-  card.dataset.cat = rule.enforcement_category || '';
-  card.tabIndex = 0;
-
-  const text = rule.rule_text || '';
-  const long = text.length > 300;
-
+  const labels = parseLabels(rule.labels_json);
+  const confidence = rule.confidence == null ? null : Number(rule.confidence);
   const meta = [];
-  if (rule.source_db)    meta.push(`<span class="tag">${esc(rule.source_db)}</span>`);
-  if (rule.rule_source)  meta.push(`<span class="tag source">${esc(rule.rule_source)}</span>`);
-  if (rule.source_label) meta.push(`<span class="tag source">${esc(rule.source_label)}</span>`);
-  if (rule.repo_name)    meta.push(`<span class="tag">${esc(rule.repo_name)}</span>`);
-  if (rule.file_type)    meta.push(`<span class="tag">${esc(rule.file_type)}</span>`);
-  if (rule.source_url)   meta.push(`<a href="${esc(rule.source_url)}" target="_blank">source ↗</a>`);
 
-  const mechOpts = MECHANISMS.map(m =>
-    `<option value="${m}" ${rule.enforcement_mechanism === m ? 'selected':''}>${m||'— mechanism —'}</option>`
-  ).join('');
+  meta.push('<span class="tag">V2</span>');
+  if (rule.source_db) meta.push(`<span class="tag">${esc(rule.source_db)}</span>`);
+  if (rule.rule_source) meta.push(`<span class="tag">${esc(rule.rule_source)}</span>`);
+  if (rule.rule_type) meta.push(`<span class="tag type">${esc(rule.rule_type)}</span>`);
+  if (rule.enforcement_mode) meta.push(`<span class="tag ${enforcementTagClass(rule.enforcement_mode)}">${esc(rule.enforcement_mode)}</span>`);
+  if (rule.mechanism) meta.push(`<span class="tag">${esc(rule.mechanism)}</span>`);
+  if (confidence != null) {
+    const cls = confidence < 0.7 ? 'low' : '';
+    meta.push(`<span class="tag ${cls}">confidence ${confidence.toFixed(2)}</span>`);
+  }
+  if (rule.manual_reprocess) meta.push(`<span class="tag marked">marked</span>`);
+  if (rule.repo_name) meta.push(`<span class="tag">${esc(rule.repo_name)}</span>`);
+  for (const label of labels) {
+    meta.push(`<span class="tag">${esc(label)}</span>`);
+  }
+  if (rule.source_url) {
+    meta.push(`<a class="source-link" href="${esc(rule.source_url)}" target="_blank">source ↗</a>`);
+  }
 
-  const actions = processed ? `
-    <div class="rule-actions">
-      <button class="action-btn det ${rule.enforcement_category==='deterministic'?'active':''}">Deterministic</button>
-      <button class="action-btn mix ${rule.enforcement_category==='mixed'?'active':''}">Mixed</button>
-      <button class="action-btn llm ${rule.enforcement_category==='llm'?'active':''}">LLM-only</button>
-      <select class="mech-select">${mechOpts}</select>
-      ${rule.enforcement_category ? '<button class="action-btn clr">✕</button>' : ''}
-    </div>` : '';
-
-  card.innerHTML = `
-    <div class="rule-text ${long ? '' : 'expanded'}">${esc(text)}</div>
-    ${long ? '<button class="expand-btn">Show more ▾</button>' : ''}
-    <div class="rule-meta">${meta.join('')}</div>
-    ${actions}
+  return `
+    <div class="card">
+      <div class="card-text">${esc(rule.rule_text)}</div>
+      <div class="meta">${meta.join('')}</div>
+      ${rule.reasoning ? `<div class="reasoning"><strong>Reasoning:</strong> ${esc(rule.reasoning)}</div>` : ''}
+    </div>
   `;
-
-  // Expand
-  card.querySelector('.expand-btn')?.addEventListener('click', function() {
-    card.querySelector('.rule-text').classList.add('expanded');
-    this.remove();
-  });
-
-  // Category buttons
-  card.querySelector('.action-btn.det')?.addEventListener('click', () => categorize(card, 'deterministic'));
-  card.querySelector('.action-btn.mix')?.addEventListener('click', () => categorize(card, 'mixed'));
-  card.querySelector('.action-btn.llm')?.addEventListener('click', () => categorize(card, 'llm'));
-  card.querySelector('.action-btn.clr')?.addEventListener('click', () => categorize(card, null));
-  card.querySelector('.mech-select')?.addEventListener('change', e => saveMech(card, e.target.value));
-
-  card.addEventListener('focus', () => { S.focusedCard = card; });
-  return card;
 }
 
-async function renderRules(reset = false) {
-  if (S.loading) return;
-  S.loading = true;
+async function renderHeader() {
+  const total = await scalar(`SELECT COUNT(*) FROM all_rules ${buildWhere()}`);
+  document.getElementById('totalInfo').textContent =
+    `${Number(total).toLocaleString()} rules · ${DB_FILE.file}`;
+}
 
+async function renderRules() {
   const list = document.getElementById('rulesList');
-  if (reset) { list.innerHTML = ''; S.offset = 0; S.focusedCard = null; }
-
   try {
-    const data = await fetchRules();
-    S.offset += data.length;
-    S.mode = S.tab.startsWith('raw:') ? 'raw' : 'processed';
-
-    const t = S.tabs.find(x => x.key === S.tab);
-    document.getElementById('totalInfo').textContent =
-      `${S.total.toLocaleString()} rules · ${t?.label || S.tab}`;
-
-    data.forEach(rule => list.appendChild(makeCard(rule)));
-    document.getElementById('loadMoreDiv').style.display =
-      S.offset < S.total ? 'block' : 'none';
-  } catch(e) {
-    list.insertAdjacentHTML('beforeend',
-      `<div class="error-banner">Query error: ${esc(e.message)}</div>`);
-  }
-
-  S.loading = false;
-}
-
-async function refreshAll(resetRules = true) {
-  await computeTabs();
-  renderDbList();
-  renderCatList();
-  renderProgress();
-  await renderMechanisms();
-  await renderSources();
-  await renderRules(resetRules);
-}
-
-// ── Categorization ────────────────────────────────────────────────────────
-
-async function categorize(card, category) {
-  const id   = card.dataset.id;
-  const mech = card.querySelector('.mech-select')?.value || null;
-
-  await S.conn.query(`
-    UPDATE processed_rules
-    SET enforcement_category  = ${sqlStr(category)},
-        enforcement_mechanism = ${sqlStr(mech)}
-    WHERE id = ${sqlStr(id)}
-  `);
-
-  card.className = 'rule-card' + (category ? ' cat-' + category : '');
-  card.dataset.cat = category || '';
-
-  // Update buttons
-  card.querySelectorAll('.action-btn').forEach(b => b.classList.remove('active'));
-  const cls = { deterministic:'det', mixed:'mix', llm:'llm' }[category];
-  if (cls) card.querySelector(`.action-btn.${cls}`)?.classList.add('active');
-
-  // Add/remove clear button
-  const actions = card.querySelector('.rule-actions');
-  const existing = card.querySelector('.action-btn.clr');
-  if (category && !existing && actions) {
-    const clr = document.createElement('button');
-    clr.className = 'action-btn clr';
-    clr.textContent = '✕';
-    clr.addEventListener('click', () => categorize(card, null));
-    actions.appendChild(clr);
-  } else if (!category && existing) {
-    existing.remove();
-  }
-
-  if (S.category === 'uncategorized') {
-    const all  = [...document.querySelectorAll('.rule-card')];
-    const next = all[all.indexOf(card) + 1];
-    card.remove();
-    next?.focus();
-  }
-
-  markDirty();
-  await computeTabs();
-  renderCatList();
-  renderProgress();
-}
-
-async function saveMech(card, mech) {
-  const id  = card.dataset.id;
-  const cat = card.dataset.cat || null;
-  if (!cat) return;
-  await S.conn.query(`
-    UPDATE processed_rules
-    SET enforcement_mechanism = ${sqlStr(mech)}
-    WHERE id = ${sqlStr(id)}
-  `);
-  markDirty();
-}
-
-
-// ── Navigation ────────────────────────────────────────────────────────────
-
-async function selectTab(key) {
-  S.tab = key; S.category = 'all'; S.mechanism = ''; S.source = ''; S.offset = 0;
-  renderDbList(); renderCatList(); renderProgress();
-  await renderMechanisms();
-  await renderSources();
-  await renderRules(true);
-}
-
-async function selectCat(cat) {
-  S.category = cat; S.mechanism = ''; S.offset = 0;
-  renderCatList();
-  await renderMechanisms();
-  await renderSources();
-  await renderRules(true);
-}
-
-async function selectMechanism(mech) {
-  S.mechanism = mech; S.offset = 0;
-  await renderMechanisms();
-  await renderSources();
-  await renderRules(true);
-}
-
-async function selectSource(src) {
-  S.source = src; S.offset = 0;
-  await renderSources();
-  await renderRules(true);
-}
-
-// ── Keyboard shortcuts ────────────────────────────────────────────────────
-
-document.addEventListener('keydown', e => {
-  if (e.target === document.getElementById('searchInput')) return;
-  const card = S.focusedCard || document.querySelector('.rule-card:hover');
-  if (!card || S.mode !== 'processed') return;
-  const key = e.key.toLowerCase();
-  if (key === 'd') { e.preventDefault(); categorize(card, 'deterministic'); }
-  if (key === 'm') { e.preventDefault(); categorize(card, 'mixed'); }
-  if (key === 'l') { e.preventDefault(); categorize(card, 'llm'); }
-  if (key === 'x') { e.preventDefault(); categorize(card, null); }
-  if (key === 'arrowdown' || key === 'j') {
-    e.preventDefault();
-    const all = [...document.querySelectorAll('.rule-card')];
-    all[all.indexOf(card) + 1]?.focus();
-  }
-  if (key === 'arrowup' || key === 'k') {
-    e.preventDefault();
-    const all = [...document.querySelectorAll('.rule-card')];
-    all[all.indexOf(card) - 1]?.focus();
-  }
-});
-
-// ── Splash rendering ──────────────────────────────────────────────────────
-
-function renderSlots(statuses) {
-  // statuses: { key: 'loading'|'loaded'|'failed'|'skipped' }
-  const icons = { loading: '⏳', loaded: '✓', failed: '✕', skipped: '—' };
-  const labels = { loading: 'Loading…', loaded: 'Loaded', failed: 'Not found', skipped: 'Optional' };
-  document.getElementById('fileSlots').innerHTML = DB_SLOTS.map(slot => {
-    const st = statuses[slot.key] || 'loading';
-    return `
-      <div class="file-slot ${st === 'loaded' ? 'loaded' : st === 'failed' ? 'failed' : 'loading'}">
-        <div class="slot-icon">${icons[st]}</div>
-        <div class="slot-info">
-          <div class="slot-name">${slot.file}</div>
-          <div class="slot-desc">${slot.desc}${slot.required ? ' (required)' : ' (optional)'}</div>
-        </div>
-        <div class="slot-action">${labels[st]}</div>
-      </div>
-    `;
-  }).join('');
-}
-
-// ── Boot ──────────────────────────────────────────────────────────────────
-
-async function boot() {
-  // Init DuckDB
-  S.db = await initDuckDB();
-
-  // Load each DB file from relative URL, update splash as we go
-  const statuses = {};
-  DB_SLOTS.forEach(s => { statuses[s.key] = 'loading'; });
-  renderSlots(statuses);
-
-  // Main DB stays :memory: (DuckDB WASM buffer files are read-only).
-  // processed.db is loaded read-only and imported into memory.
-  S.conn = await S.db.connect();
-
-  let requiredOk = false;
-  const processedSlot = DB_SLOTS.find(s => s.key === 'processed');
-  try {
-    const resp = await fetch(processedSlot.file);
-    if (resp.ok) {
-      const buffer = new Uint8Array(await resp.arrayBuffer());
-      await S.db.registerFileBuffer('processed.db', buffer);
-      await ensureProcessedTable();
-      // Import existing data from the read-only buffer
-      try {
-        await S.conn.query(`ATTACH 'processed.db' AS proc_src (READ_ONLY)`);
-        await S.conn.query(`INSERT INTO processed_rules BY NAME SELECT * FROM proc_src.processed_rules`);
-        await S.conn.query(`DETACH proc_src`);
-      } catch(importErr) {
-        // Source table may not exist yet (fresh db) — that's fine
-      }
-      S.loaded.add('processed');
-      statuses['processed'] = 'loaded';
-      requiredOk = true;
-    } else {
-      statuses['processed'] = 'failed';
+    const data = await rows(`
+      SELECT *
+      FROM all_rules ${buildWhere()}
+      ORDER BY source_db, rule_index ASC NULLS LAST, id
+      LIMIT 500
+    `);
+    if (!data.length) {
+      list.innerHTML = `<div class="empty">No rules matched the current filters.</div>`;
+      return;
     }
-  } catch(e) {
-    console.warn('Failed to load processed.db:', e);
-    statuses['processed'] = 'failed';
+    list.innerHTML = data.map(makeCard).join('');
+  } catch (error) {
+    console.error(error);
+    list.innerHTML = `<div class="error">Query error: ${esc(error.message)}</div>`;
   }
-  renderSlots(statuses);
-
-  for (const slot of DB_SLOTS.filter(s => s.key !== 'processed')) {
-    try {
-      const ok = await fetchDbFile(slot.key, slot.file);
-      if (ok) {
-        await attachDb(slot.key);
-        S.loaded.add(slot.key);
-        statuses[slot.key] = 'loaded';
-      } else {
-        statuses[slot.key] = slot.required ? 'failed' : 'skipped';
-      }
-    } catch(e) {
-      console.warn(`Failed to load ${slot.file}:`, e);
-      statuses[slot.key] = slot.required ? 'failed' : 'skipped';
-    }
-    renderSlots(statuses);
-  }
-
-  if (!requiredOk) {
-    const err = document.getElementById('splashError');
-    err.style.display = '';
-    err.textContent = 'Could not load processed.db — make sure it is in the same directory as index.html.';
-    return;
-  }
-
-  // Switch to main app
-  document.getElementById('splash').style.display = 'none';
-  document.getElementById('app').style.display    = 'flex';
-
-  renderLoadedFiles();
-  await refreshAll(true);
-
-  // Download button
-  document.getElementById('downloadBtn').addEventListener('click', downloadDb);
-
-  // Search (debounced)
-  let searchTimer;
-  document.getElementById('searchInput').addEventListener('input', e => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      S.search = e.target.value;
-      S.offset = 0;
-      renderSources();
-      renderRules(true);
-    }, 300);
-  });
-
-  // Load more / infinite scroll
-  document.getElementById('loadMoreBtn').addEventListener('click', () => renderRules(false));
-  document.getElementById('mainScroll').addEventListener('scroll', e => {
-    const el = e.target;
-    if (!S.loading && S.offset < S.total &&
-        el.scrollTop + el.clientHeight >= el.scrollHeight - 200) {
-      renderRules(false);
-    }
-  });
-
-  // "Open more" is not available in static mode — hide the button
-  document.getElementById('openMoreBtn').style.display = 'none';
 }
 
 function renderLoadedFiles() {
-  document.getElementById('loadedFiles').innerHTML = [...S.loaded].map(k => `
-    <div class="loaded-file"><span class="dot"></span>${k}.db</div>
-  `).join('');
+  document.getElementById('loadedFiles').innerHTML = S.loaded
+    ? `<div class="loaded-file">${esc(DB_FILE.file)}</div>`
+    : '';
 }
 
-boot().catch(e => {
-  document.getElementById('splash').innerHTML =
-    `<div class="splash-card"><h1>Error</h1><p style="color:#f66">${esc(e.message)}</p></div>`;
+async function refresh() {
+  await renderTabs();
+  await renderCategoryList();
+  await renderSecondaryList();
+  await renderSourceList();
+  await renderHeader();
+  await renderRules();
+}
+
+async function boot() {
+  S.db = await initDuckDB();
+  S.conn = await S.db.connect();
+  await ensureSchema();
+
+  const statuses = {};
+  renderStatuses(statuses);
+
+  statuses.v2 = 'loading';
+  renderStatuses(statuses);
+  await loadDatabase(statuses);
+
+  if (!S.loaded) {
+    const errorEl = document.getElementById('splashError');
+    errorEl.style.display = '';
+    errorEl.textContent = 'Could not find processed_v2.db in this directory.';
+    return;
+  }
+
+  document.getElementById('splash').style.display = 'none';
+  document.getElementById('app').style.display = 'flex';
+
+  renderLoadedFiles();
+  await refresh();
+
+  document.getElementById('searchInput').addEventListener('input', async event => {
+    S.search = event.target.value.trim();
+    await renderHeader();
+    await renderRules();
+  });
+}
+
+boot().catch(error => {
+  console.error(error);
+  const splashError = document.getElementById('splashError');
+  splashError.style.display = '';
+  splashError.textContent = error.message;
 });
 </script>
 </body>
