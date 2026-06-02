@@ -645,6 +645,12 @@ kbd {
   font-size: 10px; color: #9090b0; display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0;
 }
 .kb-bar span { white-space: nowrap; }
+.export-btn {
+  margin-left: auto; padding: 2px 8px; border-radius: 10px;
+  border: 1px solid #c0c0d8; background: white; color: #6060a0;
+  font-size: 10px; font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.export-btn:hover { border-color: #6366f1; color: #4338ca; }
 </style>
 </head>
 <body>
@@ -769,6 +775,7 @@ kbd {
       <span><kbd>x</kbd> select</span>
       <span><kbd>↵</kbd> save note</span>
       <span><kbd>Esc</kbd> cancel</span>
+      <button class="export-btn" onclick="exportCSV()" title="Export rules as CSV">⬇ CSV</button>
     </div>
   </div>
 </div>
@@ -1411,6 +1418,31 @@ rulesPanel.addEventListener('mouseout', e => {
   if (!card) return;
   document.querySelector(`mark.hl[data-rid="${card.id.replace('rc-','')}"]`)?.classList.remove('hover');
 });
+
+// ─── Export ──────────────────────────────────────────────────
+function exportCSV() {
+  if (!S.rules.length) return;
+  const cols = ['source_url', 'source', 'extracted_by', 'line_start', 'line_end', 'rule_text', 'notes'];
+  const csvCell = v => {
+    if (v == null) return '';
+    const s = String(v);
+    return (s.includes(',') || s.includes('"') || s.includes('\n')) ? `"${s.replace(/"/g,'""')}"` : s;
+  };
+  const rows = [cols.join(',')];
+  const url = S.currentFile?.source_url || '';
+  for (const r of S.rules) {
+    rows.push([url, r.source, r.extracted_by||'', r.line_start||'', r.line_end||'', r.rule_text, r.notes||'']
+      .map(csvCell).join(','));
+  }
+  const csv = rows.join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  const fname = (url.split('/').pop() || S.currentFile?.id || 'rules').replace(/[^a-z0-9._-]/gi,'_');
+  a.download = fname + '_rules.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────
 async function api(url, method='GET', body=null) {
