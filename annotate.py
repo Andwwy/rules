@@ -259,29 +259,53 @@ def run_llm():
     if not row: return jsonify({"error": "file not found"}), 404
     content = row[0] or ""
 
-    sys_msg = (
-        "You are a precise rule extractor. Extract all behavioral rules, constraints, "
-        "guidelines, and instructions from the given file. "
-        "Return ONLY a valid JSON array, no other text. "
-        'Each element: {"rule_text":"<exact or near-exact quote>","line_start":<int>,"line_end":<int>}'
-    )
-    usr_msg = (
-        f"{prompt}\n\nFile content:\n---\n{content[:30000]}\n---\n\nReturn ONLY a JSON array."
-    )
+    is_template = "{rule text}" in prompt
+    if is_template:
+        rule_id = b.get("rule_id", "").strip()
+        if not rule_id:
+            return jsonify({"error": "Focus a rule before running classification"}), 400
+        acon = annot_con()
+        rrow = acon.execute(
+            "SELECT rule_text, line_start, line_end FROM extracted_rules WHERE id=?", [rule_id]
+        ).fetchone()
+        acon.close()
+        if not rrow:
+            return jsonify({"error": "Rule not found"}), 404
+        rule_text_val, ls, le = rrow
+        lines = content.split("\n")
+        ctx_start = max(0, (ls or 1) - 1 - 20)
+        ctx_end   = min(len(lines), (le or ls or 1) + 20)
+        context_val = "\n".join(lines[ctx_start:ctx_end])
+        import re as _re
+        filled = prompt.replace("{rule text}", rule_text_val)
+        filled = _re.sub(r"\{insert surrounding[^}]*\}", context_val, filled)
+        sys_msg = ""
+        usr_msg = filled
+    else:
+        sys_msg = (
+            "You are a precise rule extractor. Extract all behavioral rules, constraints, "
+            "guidelines, and instructions from the given file. "
+            "Return ONLY a valid JSON array, no other text. "
+            'Each element: {"rule_text":"<exact or near-exact quote>","line_start":<int>,"line_end":<int>}'
+        )
+        usr_msg = (
+            f"{prompt}\n\nFile content:\n---\n{content[:30000]}\n---\n\nReturn ONLY a JSON array."
+        )
 
     # Third-party models (anthropic/*, openai/*) use the Agent API; native Sonar models use Chat API
     use_agent_api = "/" in model
     if use_agent_api:
-        payload = json.dumps({
-            "model": model,
-            "instructions": sys_msg,
-            "input": usr_msg,
-        }).encode()
+        payload_dict = {"model": model, "input": usr_msg}
+        if sys_msg:
+            payload_dict["instructions"] = sys_msg
+        payload = json.dumps(payload_dict).encode()
         url = PERPLEXITY_AGENT_URL
     else:
+        messages = [{"role": "user", "content": usr_msg}]
+        if sys_msg:
+            messages.insert(0, {"role": "system", "content": sys_msg})
         payload = json.dumps({
-            "model": model,
-            "messages": [{"role":"system","content":sys_msg},{"role":"user","content":usr_msg}],
+            "model": model, "messages": messages,
             "temperature": 0.1, "max_tokens": 4096,
         }).encode()
         url = PERPLEXITY_CHAT_URL
@@ -299,29 +323,65 @@ def run_llm():
         return jsonify({"error": str(e)}), 502
 
     if use_agent_api:
-        # Agent API: output[0].content[0].text
         try:
             raw = resp_data["output"][0]["content"][0]["text"]
         except (KeyError, IndexError):
             raw = ""
     else:
         raw = resp_data.get("choices",[{}])[0].get("message",{}).get("content","")
-    extracted = _parse_llm_rules(raw)
 
+    run_id = make_id(fid, prompt, datetime.now(timezone.utc).isoformat())
+    con = annot_con()
+
+    if is_template:
+        # Classification mode: store raw JSON, don't create extracted_rules rows
+        con.execute(
+            "INSERT INTO llm_runs(id,file_id,prompt,model,raw_response,rule_count) VALUES(?,?,?,?,?,?)",
+            [run_id, fid, prompt, model, raw, 0]
+        )
+        con.close()
+        # Parse classification JSON for the response
+        import re as _re2
+        try:
+            classification = json.loads(raw)
+        except Exception:
+            m = _re2.search(r"\{.*\}", raw, _re2.DOTALL)
+            try:
+                classification = json.loads(m.group()) if m else {}
+            except Exception:
+                classification = {}
+        return jsonify({"run_id": run_id, "classification": classification, "raw_response": raw})
+
+    # Extraction mode: parse rules array, save to DB
+    extracted = _parse_llm_rules(raw)
     cl = content.lower()
+    file_lines = content.split("\n")
     for rule in extracted:
         rt = rule.get("rule_text","")
         if not rt: continue
+        # 1. Exact match
         idx = content.find(rt)
+        # 2. Case-insensitive match
         if idx == -1: idx = cl.find(rt.lower())
         if idx >= 0:
             rule["char_start"] = idx
             rule["char_end"]   = idx + len(rt)
             rule["line_start"] = content[:idx].count("\n") + 1
             rule["line_end"]   = content[:idx+len(rt)].count("\n") + 1
+        elif not rule.get("line_start"):
+            # 3. Word-overlap fuzzy fallback: find line with most shared words
+            words = [w for w in re.split(r'\W+', rt.lower()) if len(w) > 3]
+            if words:
+                best_li, best_score = -1, 0
+                for li, line in enumerate(file_lines):
+                    ll = line.lower()
+                    score = sum(1 for w in words if w in ll)
+                    if score > best_score:
+                        best_score, best_li = score, li
+                if best_li >= 0 and best_score >= max(2, len(words) // 3):
+                    rule["line_start"] = best_li + 1
+                    rule["line_end"]   = best_li + 1
 
-    run_id = make_id(fid, prompt, datetime.now(timezone.utc).isoformat())
-    con = annot_con()
     con.execute(
         "INSERT INTO llm_runs(id,file_id,prompt,model,raw_response,rule_count) VALUES(?,?,?,?,?,?)",
         [run_id, fid, prompt, model, raw, len(extracted)]
@@ -723,6 +783,49 @@ kbd {
 .ph-del   { font-size: 13px; color: #ccc; background: none; border: none; cursor: pointer; flex-shrink: 0; padding: 0; }
 .ph-del:hover { color: #e53e3e; }
 
+/* collapsible sub-sections */
+.sub-head {
+  padding: 6px 12px; font-size: 11px; font-weight: 700; letter-spacing: 0.2px;
+  display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
+  background: #f0f0f8; border-bottom: 1px solid #e0e0ee; flex-shrink: 0;
+}
+.sub-head:hover { background: #e8e8f4; }
+.sub-arrow { font-size: 9px; color: #8080a0; transition: transform 0.15s; display: inline-block; }
+.sub-arrow.closed { transform: rotate(-90deg); }
+.sub-body { display: flex; flex-direction: column; overflow: hidden; }
+.sub-body.collapsed { display: none; }
+
+/* classification result */
+.classif-result {
+  border-top: 1px solid #e4e4f0; overflow-y: auto; max-height: 55vh;
+  font-size: 12px; flex-shrink: 0;
+}
+.cr-row {
+  display: flex; gap: 8px; padding: 5px 12px; border-bottom: 1px solid #f0f0f8;
+  align-items: flex-start; line-height: 1.4;
+}
+.cr-row:last-child { border-bottom: none; }
+.cr-label {
+  font-weight: 700; color: #6060a0; min-width: 80px; flex-shrink: 0; font-size: 11px;
+  padding-top: 1px;
+}
+.cr-val { color: #222; flex: 1; white-space: pre-wrap; word-break: break-word; }
+.cr-badge {
+  display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px;
+  font-weight: 700; white-space: nowrap;
+}
+.cr-badge.green  { background: #dcfce7; color: #15803d; }
+.cr-badge.yellow { background: #fef9c3; color: #854d0e; }
+.cr-badge.orange { background: #ffedd5; color: #c2410c; }
+.cr-badge.red    { background: #fee2e2; color: #b91c1c; }
+.cr-badge.blue   { background: #dbeafe; color: #1d4ed8; }
+.cr-badge.gray   { background: #f1f5f9; color: #475569; }
+.cr-toggle { cursor: pointer; color: #6366f1; font-size: 11px; padding: 4px 12px;
+             background: none; border: none; display: block; width: 100%; text-align: left; }
+.cr-json { display: none; padding: 8px 12px; background: #f8f8fc; }
+.cr-json.open { display: block; }
+.cr-json pre { margin: 0; font-size: 11px; white-space: pre-wrap; word-break: break-word; color: #333; }
+
 /* bulk selection */
 .rule-card.selected { outline: 2px solid #6366f1; outline-offset: -2px; }
 .rule-checkbox { display: flex; align-items: flex-start; padding: 2px 4px 0 0; flex-shrink: 0; cursor: pointer; }
@@ -819,18 +922,80 @@ kbd {
       </div>
     </div>
 
-    <!-- LLM extraction -->
+    <!-- LLM section (two collapsible sub-sections) -->
     <div class="rules-section llm-section">
-      <div class="section-head">
-        <span>LLM Extraction</span>
+
+      <!-- ── Extract Rules ── -->
+      <div class="sub-head" onclick="toggleSub('extractBody','extractArrow')">
+        <span class="sub-arrow" id="extractArrow">▾</span>
+        <span>Extract Rules</span>
         <span class="section-count" id="llmCount">0</span>
-        <button class="sel-all-btn" onclick="selectAll('llm')">select all</button>
+        <button class="sel-all-btn" onclick="event.stopPropagation();selectAll('llm')">select all</button>
       </div>
+      <div class="sub-body" id="extractBody">
+        <div class="llm-controls">
+          <div class="llm-row">
+            <select class="llm-model" id="extractModel">
+              <optgroup label="Perplexity">
+                <option value="sonar" selected>sonar</option>
+                <option value="sonar-pro">sonar-pro</option>
+                <option value="sonar-reasoning-pro">sonar-reasoning-pro</option>
+                <option value="sonar-deep-research">sonar-deep-research</option>
+              </optgroup>
+              <optgroup label="Anthropic (via Perplexity)">
+                <option value="anthropic/claude-haiku-4-5">claude-haiku-4-5</option>
+                <option value="anthropic/claude-sonnet-4-5">claude-sonnet-4-5</option>
+                <option value="anthropic/claude-sonnet-4-6">claude-sonnet-4-6</option>
+                <option value="anthropic/claude-opus-4-5">claude-opus-4-5</option>
+                <option value="anthropic/claude-opus-4-6">claude-opus-4-6</option>
+              </optgroup>
+              <optgroup label="OpenAI (via Perplexity)">
+                <option value="openai/gpt-5-mini">gpt-5-mini</option>
+                <option value="openai/gpt-5">gpt-5</option>
+                <option value="openai/gpt-5.1">gpt-5.1</option>
+                <option value="openai/gpt-5.4-mini">gpt-5.4-mini</option>
+                <option value="openai/gpt-5.4">gpt-5.4</option>
+                <option value="openai/gpt-5.5">gpt-5.5</option>
+              </optgroup>
+            </select>
+            <button class="run-btn" id="extractBtn" onclick="runExtraction()" disabled>Extract</button>
+          </div>
+          <textarea class="llm-prompt" id="extractPrompt"
+            placeholder="Describe what to extract…">Extract all rule-like spans from this file for enforceability analysis.
+
+A rule is any instruction, constraint, prohibition, or requirement given to an LLM or agent. Prefer rules that are specific and potentially checkable — for example:
+- version or toolchain requirements ("Python 3.13.2 or compatible")
+- file or artifact requirements ("log changes in CHANGELOG.md")
+- workflow ordering constraints ("always follow this chain, never skip layers")
+- code style or format mandates ("follow PEP 8")
+- procedural gates ("read all memory bank files at the start of every task")
+- naming, header, or metadata requirements ("bump @version in the userscript header")
+
+Prefer exact or near-exact quotes from the file. Extract each independently enforceable clause as its own rule — do not merge unrelated requirements. Skip purely motivational or explanatory text with no checkable obligation.
+
+Return only a valid JSON array. Each element:
+{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</textarea>
+          <div class="llm-row">
+            <span class="llm-status" id="extractStatus"></span>
+            <button class="icon-btn" id="clearExtractBtn" onclick="clearExtraction()" disabled style="margin-left:auto">Clear</button>
+          </div>
+        </div>
+        <div class="rules-list" id="llmRules">
+          <div class="empty-hint">Run extraction to find rules</div>
+        </div>
+      </div>
+
+      <!-- ── Classify Rule ── -->
+      <div class="sub-head" onclick="toggleSub('classifyBody','classifyArrow')">
+        <span class="sub-arrow" id="classifyArrow">▾</span>
+        <span>Classify Rule</span>
+      </div>
+      <div class="sub-body" id="classifyBody">
       <div class="llm-controls">
         <div class="llm-row">
           <select class="llm-model" id="llmModel">
             <optgroup label="Perplexity">
-              <option value="sonar" selected>sonar</option>
+              <option value="sonar">sonar</option>
               <option value="sonar-pro">sonar-pro</option>
               <option value="sonar-reasoning-pro">sonar-reasoning-pro</option>
               <option value="sonar-deep-research">sonar-deep-research</option>
@@ -838,7 +1003,7 @@ kbd {
             <optgroup label="Anthropic (via Perplexity)">
               <option value="anthropic/claude-haiku-4-5">claude-haiku-4-5</option>
               <option value="anthropic/claude-sonnet-4-5">claude-sonnet-4-5</option>
-              <option value="anthropic/claude-sonnet-4-6">claude-sonnet-4-6</option>
+              <option value="anthropic/claude-sonnet-4-6" selected>claude-sonnet-4-6</option>
               <option value="anthropic/claude-opus-4-5">claude-opus-4-5</option>
               <option value="anthropic/claude-opus-4-6">claude-opus-4-6</option>
               <option value="anthropic/claude-opus-4-7">claude-opus-4-7</option>
@@ -848,17 +1013,179 @@ kbd {
               <option value="openai/gpt-5-mini">gpt-5-mini</option>
               <option value="openai/gpt-5">gpt-5</option>
               <option value="openai/gpt-5.1">gpt-5.1</option>
-              <option value="openai/gpt-5.2">gpt-5.2</option>
-              <option value="openai/gpt-5.4-nano">gpt-5.4-nano</option>
               <option value="openai/gpt-5.4-mini">gpt-5.4-mini</option>
               <option value="openai/gpt-5.4">gpt-5.4</option>
               <option value="openai/gpt-5.5">gpt-5.5</option>
             </optgroup>
           </select>
-          <button class="run-btn" id="runBtn" onclick="runLLM()" disabled>Run</button>
+          <button class="run-btn" id="runBtn" onclick="runLLM()" disabled>Classify Rule</button>
         </div>
         <textarea class="llm-prompt" id="llmPrompt"
-          placeholder="Describe what to extract…">Extract all behavioral rules, constraints, and instructions from this file.</textarea>
+          placeholder="Describe what to extract…"
+          oninput="updateRunBtn()">You are classifying rules from LLM system prompts according to whether and how they can be deterministically enforced.
+
+A "rule" is a natural-language instruction, constraint, prohibition, or requirement given to an LLM or agent. Your task is not to judge whether the rule is good, but to determine what would be needed to enforce it outside the model.
+
+Classify each rule independently. Do not let surrounding rules make a vague rule enforceable unless the needed definition is explicitly present in the provided context.
+
+Classify the following rule:
+
+RULE: {rule text}
+
+OPTIONAL CONTEXT:
+{insert surrounding prompt, repo context, tool list, or project assumptions here}
+
+Use the taxonomy below.
+
+## 1. Prerequisite information
+
+Classify what information is needed to enforce the rule.
+
+Choose one or more:
+
+* `none`: The rule can be checked without external context.
+* `static_prompt_context`: The rule depends only on the prompt text or declared policy text.
+* `session_state`: The rule depends on current conversation/session state.
+* `repo_state`: The rule depends on files, directory structure, package configuration, git state, or project metadata.
+* `runtime_state`: The rule depends on process state, command results, environment variables, logs, network state, or tool outputs.
+* `external_policy_state`: The rule depends on settings outside the repo/session, such as GitHub branch protection, PR settings, deployment rules, organization policy, or access-control state.
+* `learned_project_knowledge`: The rule depends on project conventions, architecture, naming schemes, or "how this codebase works" knowledge that is not explicitly represented.
+* `user_defined_terms`: The rule contains terms that need user definition before enforcement, such as "important," "safe," "appropriate," "large," "production," "sensitive," or "simple."
+* `generated_information`: Enforcing the rule requires deriving or generating additional facts, summaries, plans, classifications, or semantic labels.
+* `pre_action_procedure`: Enforcing the rule requires running a procedure before an action, such as tests, search, dependency analysis, approval lookup, or impact analysis.
+* `self_referential_or_open_ended`: The rule refers to broad, evolving, or self-referential knowledge such as "follow all project conventions," "use best practices," or "respect prior decisions."
+
+For each selected prerequisite, explain briefly what information is required.
+
+## 2. Enforcement mechanism
+
+Classify what kind of checker could enforce the rule.
+
+Choose one primary mechanism and any secondary mechanisms:
+
+* `literal_match`: Exact string, token, filename, command, or value matching.
+* `regex`: Regular-expression matching.
+* `schema_or_type_check`: JSON schema, API schema, type system, config schema, or static structural validation.
+* `linter_or_static_analysis`: Code linter, AST check, dependency check, import check, or static program analysis.
+* `bash_or_script`: Shell command, script, grep, git command, filesystem inspection, test command, or CI check.
+* `unit_or_integration_test`: Deterministic test execution.
+* `policy_engine`: Declarative rule engine, access-control engine, Datalog, OPA/Rego, SQL query, or provenance/data-flow checker.
+* `runtime_monitor`: Post-execution monitor over logs, tool calls, filesystem changes, network calls, or process behavior.
+* `human_review_gate`: Requires human judgment or approval.
+* `llm_judge`: Requires semantic interpretation by an LLM or other learned model.
+* `other`: other system/software mechanism that could enforce this rule
+* `not_enforceable_deterministically`: Cannot be reliably enforced with deterministic machinery as stated.
+
+Explain why the chosen mechanism is sufficient or insufficient.
+
+## 3. Enforcement trigger / location
+
+Classify when or where enforcement should happen.
+
+Choose one or more:
+
+* `session_init`: Before the agent starts; e.g., load rules, check environment, read repo state.
+* `settings_or_config`: At configuration time; e.g., settings.json, policy file, repo config, CI config.
+* `pre_action_gate`: Before a tool call, shell command, file edit, API call, commit, PR, deployment, or message send.
+* `intermediate_output`: While the agent is producing plans, summaries, code patches, or partial results.
+* `post_exec`: After a command/tool/action executes, checking effects or logs.
+* `verify_gate`: Before declaring success, merging, submitting, deploying, or finalizing.
+* `final_output`: Before the final answer is shown to the user.
+
+Explain the earliest reliable trigger and the latest safe trigger.
+
+## 4. Ambiguity
+
+Assess the ambiguity of the rule.
+
+Choose one:
+
+* `none`: Fully specified and directly checkable.
+* `low`: Minor assumptions needed; likely enforceable after normalizing terms.
+* `medium`: Important terms or thresholds need definition.
+* `high`: Rule relies heavily on intent, judgment, project conventions, or unstated context.
+* `not_actionable`: Too vague to enforce as written.
+
+Then list:
+
+* ambiguous terms
+* missing thresholds or definitions
+* assumptions an enforcer would need
+* questions to ask the user to make the rule enforceable
+
+## 5. Deterministic enforceability
+
+Classify the rule's deterministic enforceability.
+
+Choose one:
+
+* `deterministically_enforceable_as_written`
+* `deterministically_enforceable_with_context`
+* `deterministically_enforceable_after_rewrite`
+* `partially_enforceable`
+* `requires_llm_or_human_judgment`
+* `not_enforceable`
+
+Explain the classification.
+
+## 6. Suggested enforceable rewrite
+
+Rewrite the rule into one or more enforceable rules.
+
+Prefer rules that are:
+
+* observable
+* checkable
+* scoped to a specific trigger
+* explicit about required inputs
+* explicit about pass/fail criteria
+
+If the original rule is vague, split it into:
+
+1. a deterministic core rule
+2. a semantic or human-review residual rule
+
+## Output format
+
+Return valid JSON with this structure:
+
+{
+"rule": "...",
+"summary": "...",
+"prerequisites": [
+{
+"type": "...",
+"details": "..."
+}
+],
+"enforcement_mechanism": {
+"primary": "...",
+"secondary": ["..."],
+"details": "..."
+},
+"trigger_location": {
+"recommended": ["..."],
+"earliest_reliable": "...",
+"latest_safe": "...",
+"details": "..."
+},
+"ambiguity": {
+"level": "...",
+"ambiguous_terms": ["..."],
+"missing_definitions": ["..."],
+"assumptions_needed": ["..."],
+"questions_for_user": ["..."]
+},
+"deterministic_enforceability": {
+"classification": "...",
+"details": "..."
+},
+"suggested_enforceable_rewrite": {
+"deterministic_core": ["..."],
+"semantic_or_review_residual": ["..."]
+},
+"confidence": "low | medium | high"
+}</textarea>
         <div class="llm-row" style="gap:5px">
           <button class="icon-btn" onclick="savePrompt()">💾 Save</button>
           <button class="icon-btn" id="historyBtn" onclick="toggleHistory()">🕑 History</button>
@@ -869,6 +1196,7 @@ kbd {
           <span class="llm-status" id="llmStatus"></span>
         </div>
       </div>
+      <div class="classif-result" id="classifResult" style="display:none"></div>
       <div class="rules-list" id="llmRules">
         <div class="empty-hint">Run the LLM to extract rules</div>
       </div>
@@ -896,7 +1224,8 @@ const S = {
   selection:     null,
   focusedRuleId: null,
   editingNoteId: null,
-  lastRunId:     null,
+  lastRunId:        null,
+  lastExtractRunId: null,
   userName:      localStorage.getItem('annotatorName') || '',
   selectedIds:   new Set(),
   lastSelectedId: null,
@@ -905,14 +1234,14 @@ const S = {
 // ─── Colour palette (per-extractor) ──────────────────────────
 // Each entry: bg, bdr (border), hov (hover bg), act (active bg), bg2 (tag bg)
 const COLORS = [
-  { bg:'rgba(245,158,11,.14)', bdr:'#f59e0b', hov:'rgba(245,158,11,.32)', act:'rgba(245,158,11,.50)', bg2:'rgba(245,158,11,.18)' },
-  { bg:'rgba(99,102,241,.12)', bdr:'#6366f1', hov:'rgba(99,102,241,.28)', act:'rgba(99,102,241,.44)', bg2:'rgba(99,102,241,.16)' },
-  { bg:'rgba(16,185,129,.12)', bdr:'#10b981', hov:'rgba(16,185,129,.28)', act:'rgba(16,185,129,.44)', bg2:'rgba(16,185,129,.16)' },
-  { bg:'rgba(239,68,68,.12)',  bdr:'#ef4444', hov:'rgba(239,68,68,.28)',  act:'rgba(239,68,68,.44)',  bg2:'rgba(239,68,68,.16)'  },
-  { bg:'rgba(236,72,153,.12)', bdr:'#ec4899', hov:'rgba(236,72,153,.28)', act:'rgba(236,72,153,.44)', bg2:'rgba(236,72,153,.16)' },
-  { bg:'rgba(14,165,233,.12)', bdr:'#0ea5e9', hov:'rgba(14,165,233,.28)', act:'rgba(14,165,233,.44)', bg2:'rgba(14,165,233,.16)' },
-  { bg:'rgba(168,85,247,.12)', bdr:'#a855f7', hov:'rgba(168,85,247,.28)', act:'rgba(168,85,247,.44)', bg2:'rgba(168,85,247,.16)' },
-  { bg:'rgba(251,146,60,.12)', bdr:'#fb923c', hov:'rgba(251,146,60,.28)', act:'rgba(251,146,60,.44)', bg2:'rgba(251,146,60,.16)' },
+  { bg:'rgba(245,158,11,.18)', bdr:'#f59e0b', hov:'rgba(245,158,11,.34)', act:'rgba(245,158,11,.52)', bg2:'rgba(245,158,11,.22)' },
+  { bg:'rgba(99,102,241,.17)', bdr:'#6366f1', hov:'rgba(99,102,241,.32)', act:'rgba(99,102,241,.48)', bg2:'rgba(99,102,241,.21)' },
+  { bg:'rgba(16,185,129,.17)', bdr:'#10b981', hov:'rgba(16,185,129,.32)', act:'rgba(16,185,129,.48)', bg2:'rgba(16,185,129,.21)' },
+  { bg:'rgba(239,68,68,.17)',  bdr:'#ef4444', hov:'rgba(239,68,68,.32)',  act:'rgba(239,68,68,.48)',  bg2:'rgba(239,68,68,.21)'  },
+  { bg:'rgba(236,72,153,.17)', bdr:'#ec4899', hov:'rgba(236,72,153,.32)', act:'rgba(236,72,153,.48)', bg2:'rgba(236,72,153,.21)' },
+  { bg:'rgba(14,165,233,.17)', bdr:'#0ea5e9', hov:'rgba(14,165,233,.32)', act:'rgba(14,165,233,.48)', bg2:'rgba(14,165,233,.21)' },
+  { bg:'rgba(168,85,247,.17)', bdr:'#a855f7', hov:'rgba(168,85,247,.32)', act:'rgba(168,85,247,.48)', bg2:'rgba(168,85,247,.21)' },
+  { bg:'rgba(251,146,60,.17)', bdr:'#fb923c', hov:'rgba(251,146,60,.32)', act:'rgba(251,146,60,.48)', bg2:'rgba(251,146,60,.21)' },
 ];
 const _cc = {};
 function colorFor(name) {
@@ -932,6 +1261,7 @@ function rcVars(col) {
 // ─── Boot ────────────────────────────────────────────────────
 async function init() {
   document.getElementById('annotatorName').value = S.userName;
+  updateRunBtn();
   loadPromptHistory();
   const files = await api('/api/files');
   if (files.error) { setStatus(files.error,'error'); return; }
@@ -997,6 +1327,7 @@ async function selectFile(id) {
   S.currentFile = file; S.rules = rules;
   S.selection = null; S.focusedRuleId = null; S.editingNoteId = null; S.selectedIds.clear();
   document.getElementById('runBtn').disabled = false;
+  document.getElementById('extractBtn').disabled = false;
   document.getElementById('addBtn').disabled = true;
   setSelInfo(null);
   renderFileList(S.allFiles);
@@ -1044,9 +1375,29 @@ function renderViewer() {
   });
 }
 
+// Parse "rgba(r,g,b,a)" → [r,g,b,a]
+function parseRgba(s) {
+  const m = s.match(/rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),?\s*(\d*\.?\d+)?\)/);
+  return m ? [+m[1], +m[2], +m[3], m[4] !== undefined ? +m[4] : 1] : [200, 200, 220, 0.18];
+}
+// Blend multiple rgba strings — higher overlap → more opaque
+function blendBgs(bgs) {
+  if (bgs.length === 1) return bgs[0];
+  const vals = bgs.map(parseRgba);
+  const r = Math.round(vals.reduce((s, v) => s + v[0], 0) / vals.length);
+  const g = Math.round(vals.reduce((s, v) => s + v[1], 0) / vals.length);
+  const b = Math.round(vals.reduce((s, v) => s + v[2], 0) / vals.length);
+  // opacity scales with sqrt of count so 2 overlaps ~= 1.4× opacity
+  const baseA = vals.reduce((s, v) => s + v[3], 0) / vals.length;
+  const a = Math.min(0.65, baseA * Math.sqrt(bgs.length));
+  return `rgba(${r},${g},${b},${a.toFixed(2)})`;
+}
+
 function renderLines(text, rules) {
   const lines = text.split('\n');
-  // Build map: 0-based line index -> [{rule, col}]
+  const withPos = rules.filter(r => r.line_start);
+  if (rules.length && !withPos.length)
+    console.warn('renderLines: have', rules.length, 'rules but none have line_start — no highlights');
   const lineMap = new Map();
   for (const r of rules) {
     if (!r.line_start) continue;
@@ -1062,10 +1413,16 @@ function renderLines(text, rules) {
     const entries = lineMap.get(idx);
     if (!entries || !entries.length) return escHtml(line) + '\n';
     const rids  = entries.map(e => e.r.id).join(',');
-    const { bg, hov, act } = entries[0].col;
-    const title = escAttr(entries.map(e => (e.r.extracted_by || '') + ': ' + e.r.rule_text.slice(0, 60)).join(' | '));
+    // blend backgrounds; each extractor's color contributes equally
+    const bg  = blendBgs(entries.map(e => e.col.bg));
+    const hov = blendBgs(entries.map(e => e.col.hov));
+    const act = blendBgs(entries.map(e => e.col.act));
+    // inset box-shadow: one 3px bar per unique extractor (max 4), no text shift
+    const uniq = [...new Map(entries.map(e => [e.col.bdr, e.col])).values()];
+    const shadow = uniq.slice(0, 4).map((c, i) => `inset ${(i + 1) * 3}px 0 0 ${c.bdr}`).join(',');
+    const title = escAttr(entries.map(e => (e.r.extracted_by || e.r.source || '?') + ': ' + e.r.rule_text.slice(0, 60)).join(' | '));
     return `<span class="line-hl" data-rids="${rids}" data-bg="${bg}" data-hov="${hov}" data-act="${act}"` +
-      ` style="background:${bg}"` +
+      ` style="background:${bg};box-shadow:${shadow}"` +
       ` onclick="focusRule('${entries[0].r.id}')" title="${title}">${escHtml(line)}</span>\n`;
   }).join('');
 }
@@ -1370,25 +1727,131 @@ async function deleteRule(evt, id) {
   refreshFileBadge(S.currentFile?.id);
 }
 
-// ─── LLM ─────────────────────────────────────────────────────
+// ─── Collapsible sub-sections ────────────────────────────────
+function toggleSub(bodyId, arrowId) {
+  const body  = document.getElementById(bodyId);
+  const arrow = document.getElementById(arrowId);
+  const collapsed = body.classList.toggle('collapsed');
+  arrow?.classList.toggle('closed', collapsed);
+}
+
+// ─── Extraction ──────────────────────────────────────────────
+async function runExtraction() {
+  if (!S.currentFile) return;
+  const prompt = document.getElementById('extractPrompt').value.trim();
+  const model  = document.getElementById('extractModel').value;
+  if (!prompt) { setExtractStatus('Enter a prompt', 'error'); return; }
+  document.getElementById('extractBtn').disabled = true;
+  setExtractStatus('Running…');
+  const res = await api('/api/llm', 'POST', { file_id: S.currentFile.id, prompt, model });
+  document.getElementById('extractBtn').disabled = false;
+  if (res.error) { setExtractStatus(res.error, 'error'); return; }
+  const rules = res.rules;
+  if (!Array.isArray(rules)) {
+    console.error('runExtraction: unexpected response', res);
+    setExtractStatus('Unexpected response — check console', 'error'); return;
+  }
+  console.log('runExtraction: received', rules.length, 'rules');
+  console.log('  with line_start:', rules.filter(r => r.line_start != null).length);
+  console.log('  sample:', rules.slice(0,3).map(r => ({id:r.id, line_start:r.line_start, text:r.rule_text?.slice(0,40)})));
+  S.lastExtractRunId = res.run_id;
+  document.getElementById('clearExtractBtn').disabled = false;
+  const existing = new Set(S.rules.map(r => r.id));
+  for (const r of rules) if (!existing.has(r.id)) S.rules.push(r);
+  const matched = rules.filter(r => r.line_start != null).length;
+  setExtractStatus(`${rules.length} rules extracted, ${matched} located`, matched > 0 ? 'ok' : 'error');
+  renderViewer(); renderRulesPanel();
+  refreshFileBadge(S.currentFile.id);
+}
+
+async function clearExtraction() {
+  if (!S.lastExtractRunId) return;
+  await api(`/api/llm-runs/${S.lastExtractRunId}`, 'DELETE');
+  S.rules = S.rules.filter(r => r.llm_run_id !== S.lastExtractRunId);
+  S.lastExtractRunId = null;
+  document.getElementById('clearExtractBtn').disabled = true;
+  setExtractStatus('Cleared');
+  renderViewer(); renderRulesPanel();
+  refreshFileBadge(S.currentFile?.id);
+}
+
+function setExtractStatus(msg, cls='') {
+  const el = document.getElementById('extractStatus');
+  el.textContent = msg; el.className = 'llm-status' + (cls ? ' ' + cls : '');
+}
+
+// ─── Classification LLM ──────────────────────────────────────
+function updateRunBtn() {
+  // button label is fixed; no-op kept for compat
+}
+
 async function runLLM() {
   if (!S.currentFile) return;
   const prompt = document.getElementById('llmPrompt').value.trim();
   const model  = document.getElementById('llmModel').value;
-  if (!prompt) { setStatus('Enter a prompt','error'); return; }
+  if (!prompt) { setStatus('Enter a prompt', 'error'); return; }
+  if (!S.focusedRuleId) { setStatus('Focus a rule first', 'error'); return; }
+
   document.getElementById('runBtn').disabled = true;
   setStatus('Running…');
-  const res = await api('/api/llm', 'POST', { file_id: S.currentFile.id, prompt, model });
+  const res = await api('/api/llm', 'POST', {
+    file_id: S.currentFile.id, prompt, model, rule_id: S.focusedRuleId
+  });
   document.getElementById('runBtn').disabled = false;
-  if (res.error) { setStatus(res.error,'error'); return; }
+  if (res.error) { setStatus(res.error, 'error'); return; }
+
   S.lastRunId = res.run_id;
   document.getElementById('clearRunBtn').disabled = false;
-  const existing = new Set(S.rules.map(r => r.id));
-  for (const r of res.rules) if (!existing.has(r.id)) S.rules.push(r);
-  const matched = res.rules.filter(r => r.char_start!=null||r.line_start!=null).length;
-  setStatus(`${res.rules.length} rules, ${matched} located`, 'ok');
-  renderViewer(); renderRulesPanel();
-  refreshFileBadge(S.currentFile.id);
+  showClassification(res.classification, res.raw_response);
+  setStatus('Classification complete', 'ok');
+}
+
+function showClassification(c, rawJson) {
+  const el = document.getElementById('classifResult');
+  if (!c || !Object.keys(c).length) {
+    el.style.display = 'none'; return;
+  }
+  el.style.display = 'block';
+
+  const enfClass = c.deterministic_enforceability?.classification || '';
+  const ambLevel = c.ambiguity?.level || '';
+  const conf     = c.confidence || '';
+
+  const enfColors = {
+    deterministically_enforceable_as_written: 'green',
+    deterministically_enforceable_with_context: 'blue',
+    deterministically_enforceable_after_rewrite: 'blue',
+    partially_enforceable: 'yellow',
+    requires_llm_or_human_judgment: 'orange',
+    not_enforceable: 'red',
+  };
+  const ambColors = { none:'green', low:'blue', medium:'yellow', high:'orange', not_actionable:'red' };
+  const confColors = { high:'green', medium:'yellow', low:'orange' };
+
+  const badge = (text, cls) => `<span class="cr-badge ${cls||'gray'}">${esc(text)}</span>`;
+  const row = (label, html) => `<div class="cr-row"><span class="cr-label">${label}</span><span class="cr-val">${html}</span></div>`;
+
+  const prereqs = (c.prerequisites||[]).map(p =>
+    `<b>${esc(p.type||'')}</b>: ${esc(p.details||'')}`).join('<br>');
+  const mech = c.enforcement_mechanism
+    ? `${badge(c.enforcement_mechanism.primary||'','gray')} ${esc(c.enforcement_mechanism.details||'')}` : '';
+  const triggers = (c.trigger_location?.recommended||[]).map(t => badge(t,'blue')).join(' ');
+  const rewrites = [...(c.suggested_enforceable_rewrite?.deterministic_core||[]),
+                   ...(c.suggested_enforceable_rewrite?.semantic_or_review_residual||[])]
+    .map((r,i) => `${i+1}. ${esc(r)}`).join('<br>');
+  const ambTerms = (c.ambiguity?.ambiguous_terms||[]).join(', ');
+
+  el.innerHTML =
+    row('Summary',   esc(c.summary||''))                                        +
+    row('Enforceability', badge(enfClass, enfColors[enfClass]||'gray') + ' ' + esc(c.deterministic_enforceability?.details||'')) +
+    row('Ambiguity', badge(ambLevel, ambColors[ambLevel]||'gray') + (ambTerms ? ` — ${esc(ambTerms)}` : '')) +
+    row('Mechanism', mech)                                                       +
+    row('Triggers',  triggers + ' ' + esc(c.trigger_location?.details||''))    +
+    (prereqs ? row('Prerequisites', prereqs) : '')                               +
+    (rewrites ? row('Rewrite', rewrites) : '')                                   +
+    row('Confidence', badge(conf, confColors[conf]||'gray'))                    +
+    `<button class="cr-toggle" onclick="this.nextSibling.classList.toggle('open')">▸ Raw JSON</button>` +
+    `<div class="cr-json"><pre>${esc(JSON.stringify(c, null, 2))}</pre></div>`;
 }
 
 async function clearLastRun() {
