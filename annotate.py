@@ -637,10 +637,20 @@ kbd {
   font-size: 13px; line-height: 1.6;
 }
 .line-nums {
-  white-space: pre; padding: 14px 10px 14px 12px; color: #bbbbd0;
+  white-space: normal; padding: 14px 10px 14px 12px; color: #bbbbd0;
   text-align: right; user-select: none; border-right: 1px solid #f0f0f8;
   flex-shrink: 0; min-width: 44px;
 }
+.line-num {
+  display: block;
+  min-height: 1.6em;
+  line-height: 1.6;
+  border-radius: 4px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.line-num:hover { background: #eef2ff; color: #6366f1; }
+.line-num.active { background: #e0e7ff; color: #4338ca; font-weight: 700; }
 .content-pre {
   flex: 1; padding: 14px 16px; margin: 0;
   white-space: pre-wrap; word-break: break-word;
@@ -759,6 +769,8 @@ kbd {
   border: 1px solid #d0d0e0; background: white; font-size: 12px; color: #333;
   resize: vertical; font-family: inherit; line-height: 1.4;
 }
+.extract-prompt-wrap { display: block; }
+.extract-prompt-wrap.collapsed { display: none; }
 .llm-prompt:focus, .llm-model:focus, .llm-label:focus { outline: none; border-color: #6366f1; }
 .run-btn {
   padding: 5px 14px; border-radius: 20px; border: none; background: #6366f1;
@@ -848,6 +860,36 @@ kbd {
 }
 .bulk-bar.visible { display: flex; }
 .bulk-count { color: #4338ca; font-weight: 600; flex: 1; }
+.rules-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: #f7f8ff;
+  border-bottom: 1px solid #e1e5ff;
+  flex-shrink: 0;
+}
+.rules-search {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid #cfd6ff;
+  background: white;
+  color: #2a2a3e;
+  font-size: 12px;
+}
+.rules-search:focus {
+  outline: none;
+  border-color: #6366f1;
+}
+.rules-tools-count {
+  font-size: 10px;
+  color: #7070a0;
+  min-width: 52px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 .bulk-btn {
   padding: 3px 10px; border-radius: 12px; border: 1px solid #a5b4fc; background: white;
   color: #4338ca; font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap;
@@ -923,6 +965,12 @@ kbd {
       <button class="bulk-btn" onclick="bulkMerge()">Merge</button>
       <button class="bulk-btn" onclick="clearRuleSelection()">Clear</button>
     </div>
+    <div class="rules-tools">
+      <input id="ruleSearch" class="rules-search" placeholder="Search hand + LLM rules or line:42"
+             oninput="onRuleSearchInput(this.value)">
+      <button class="bulk-btn" id="clearRuleSearchBtn" onclick="clearRuleSearch()" disabled>Clear</button>
+      <span class="rules-tools-count" id="rulesVisibleCount">0/0</span>
+    </div>
 
     <!-- hand rules -->
     <div class="rules-section hand-section">
@@ -974,6 +1022,10 @@ kbd {
             </select>
             <button class="run-btn" id="extractBtn" onclick="runExtraction()" disabled>Extract</button>
           </div>
+          <div class="llm-row" style="justify-content:flex-end">
+            <button class="icon-btn" id="extractPromptToggle" onclick="toggleExtractPrompt(event)">Hide prompt</button>
+          </div>
+          <div class="extract-prompt-wrap" id="extractPromptWrap">
           <textarea class="llm-prompt" id="extractPrompt"
             placeholder="Describe what to extract…">Extract all rule-like spans from this file for enforceability analysis.
 
@@ -989,6 +1041,7 @@ Prefer exact or near-exact quotes from the file. Extract each independently enfo
 
 Return only a valid JSON array. Each element:
 {"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</textarea>
+          </div>
           <div class="llm-row">
             <span class="llm-status" id="extractStatus"></span>
             <button class="icon-btn" id="clearExtractBtn" onclick="clearExtraction()" disabled style="margin-left:auto">Clear LLM</button>
@@ -1211,7 +1264,7 @@ Return valid JSON with this structure:
         </div>
       </div>
       <div class="classif-result" id="classifResult" style="display:none"></div>
-      <div class="rules-list" id="llmRules">
+      <div class="rules-list" id="classifyRulesHint">
         <div class="empty-hint">Run the LLM to extract rules</div>
       </div>
     </div>
@@ -1243,6 +1296,8 @@ const S = {
   userName:      localStorage.getItem('annotatorName') || '',
   selectedIds:   new Set(),
   lastSelectedId: null,
+  ruleSearchQuery: '',
+  extractPromptCollapsed: localStorage.getItem('extractPromptCollapsed') === '1',
 };
 const RULES_PANEL_WIDTH_KEY = 'annotator.rulesPanelWidth';
 const RULES_PANEL_MIN = 280;
@@ -1331,6 +1386,7 @@ async function init() {
   initResizableRulesPanel();
   updateRunBtn();
   loadPromptHistory();
+  updateExtractPromptUI();
   const files = await api('/api/files');
   if (files.error) { setStatus(files.error,'error'); return; }
   S.allFiles = files;
@@ -1342,6 +1398,21 @@ async function init() {
 function saveName(v) {
   S.userName = v.trim();
   localStorage.setItem('annotatorName', S.userName);
+}
+
+function updateExtractPromptUI() {
+  const wrap = document.getElementById('extractPromptWrap');
+  const btn = document.getElementById('extractPromptToggle');
+  if (!wrap || !btn) return;
+  wrap.classList.toggle('collapsed', S.extractPromptCollapsed);
+  btn.textContent = S.extractPromptCollapsed ? 'Show prompt' : 'Hide prompt';
+}
+
+function toggleExtractPrompt(evt) {
+  evt?.stopPropagation();
+  S.extractPromptCollapsed = !S.extractPromptCollapsed;
+  localStorage.setItem('extractPromptCollapsed', S.extractPromptCollapsed ? '1' : '0');
+  updateExtractPromptUI();
 }
 
 // ─── File list ───────────────────────────────────────────────
@@ -1386,6 +1457,98 @@ function filterFiles(q) {
     : S.allFiles);
 }
 
+function getRuleLineRange(rule) {
+  const lsRaw = rule.line_start;
+  const leRaw = rule.line_end != null ? rule.line_end : rule.line_start;
+  const hasLineRange = lsRaw != null && lsRaw !== '' && leRaw != null && leRaw !== '';
+  const ls = Number(lsRaw);
+  const le = Number(leRaw);
+  if (hasLineRange && Number.isFinite(ls) && Number.isFinite(le)) {
+    const start = Math.max(1, Math.min(ls, le));
+    const end = Math.max(start, Math.max(ls, le));
+    return [start, end];
+  }
+  if (rule.char_start == null || !S.currentFile?.content) return null;
+  const cs = Number(rule.char_start);
+  const ce = Number(rule.char_end != null ? rule.char_end : rule.char_start);
+  if (!Number.isFinite(cs) || !Number.isFinite(ce)) return null;
+  const content = S.currentFile.content;
+  const a = Math.max(0, Math.min(content.length, Math.min(cs, ce)));
+  const b = Math.max(0, Math.min(content.length, Math.max(cs, ce)));
+  const start = content.slice(0, a).split('\n').length;
+  const end = content.slice(0, b).split('\n').length;
+  return [start, Math.max(start, end)];
+}
+
+function lineRuleMatches(rule, lineNo) {
+  const range = getRuleLineRange(rule);
+  if (!range) return false;
+  return lineNo >= range[0] && lineNo <= range[1];
+}
+
+function parseLineQuery(q) {
+  const s = (q || '').trim().toLowerCase();
+  if (!s) return null;
+  const m = s.match(/^(?:line|l)\s*[:#]?\s*(\d+)$/) || s.match(/^#(\d+)$/) || s.match(/^(\d+)$/);
+  if (!m) return null;
+  const lineNo = parseInt(m[1], 10);
+  return Number.isFinite(lineNo) && lineNo > 0 ? lineNo : null;
+}
+
+function ruleMatchesSearch(rule, q) {
+  const needle = (q || '').trim().toLowerCase();
+  if (!needle) return true;
+  const lineNo = parseLineQuery(needle);
+  if (lineNo != null) return lineRuleMatches(rule, lineNo);
+  const hay = [
+    rule.rule_text || '',
+    rule.notes || '',
+    rule.extracted_by || '',
+    rule.source || '',
+  ].join('\n').toLowerCase();
+  return hay.includes(needle);
+}
+
+function getVisibleRules() {
+  const q = S.ruleSearchQuery;
+  if (!q || !q.trim()) return S.rules;
+  return S.rules.filter(r => ruleMatchesSearch(r, q));
+}
+
+function setRuleSearchQuery(value, focusInput=false) {
+  const q = value || '';
+  S.ruleSearchQuery = q;
+  const input = document.getElementById('ruleSearch');
+  if (input && input.value !== q) input.value = q;
+  if (focusInput && input) input.focus();
+}
+
+function applyLineSearch(lineNo) {
+  const n = Number(lineNo);
+  if (!Number.isFinite(n) || n < 1) return;
+  setRuleSearchQuery(`line:${n}`);
+  renderViewer();
+  renderRulesPanel();
+}
+
+function onRuleSearchInput(v) {
+  setRuleSearchQuery(v || '');
+  renderRulesPanel();
+  renderViewer();
+}
+
+function clearRuleSearch() {
+  setRuleSearchQuery('', true);
+  renderRulesPanel();
+  renderViewer();
+}
+
+function lineNumberClick(lineNo, evt) {
+  evt?.stopPropagation();
+  clearSelection();
+  applyLineSearch(lineNo);
+}
+
 // ─── Select file ─────────────────────────────────────────────
 async function selectFile(id) {
   const [file, rules] = await Promise.all([
@@ -1395,6 +1558,7 @@ async function selectFile(id) {
   S.currentFile = file; S.rules = rules;
   S.selection = null; S.focusedRuleId = null; S.editingNoteId = null; S.selectedIds.clear();
   S.lastExtractRunId = null;
+  setRuleSearchQuery('');
   document.getElementById('runBtn').disabled = false;
   document.getElementById('extractBtn').disabled = false;
   document.getElementById('addBtn').disabled = true;
@@ -1424,8 +1588,14 @@ function renderViewer() {
   }
   const content = S.currentFile.content;
   const lineCount = (content.match(/\n/g)||[]).length + 1;
+  const searchLine = parseLineQuery(S.ruleSearchQuery);
+  const lineNums = Array.from({length:lineCount}, (_,i) => {
+    const lineNo = i + 1;
+    const active = searchLine === lineNo ? ' active' : '';
+    return `<span class="line-num${active}" onclick="lineNumberClick(${lineNo}, event)">${lineNo}</span>`;
+  }).join('');
   body.innerHTML = `
-    <div class="line-nums">${Array.from({length:lineCount},(_,i)=>i+1).join('\n')}</div>
+    <div class="line-nums">${lineNums}</div>
     <pre class="content-pre" id="contentPre"></pre>
   `;
   document.getElementById('contentPre').innerHTML =
@@ -1464,15 +1634,16 @@ function blendBgs(bgs) {
 
 function renderLines(text, rules) {
   const lines = text.split('\n');
-  const withPos = rules.filter(r => r.line_start);
+  const withPos = rules.filter(r => getRuleLineRange(r));
   if (rules.length && !withPos.length)
     console.warn('renderLines: have', rules.length, 'rules but none have line_start — no highlights');
   const lineMap = new Map();
   for (const r of rules) {
-    if (!r.line_start) continue;
+    const range = getRuleLineRange(r);
+    if (!range) continue;
     const col = colorFor(r.extracted_by || (r.source === 'hand' ? S.userName : r.source) || '?');
-    const ls = r.line_start - 1;
-    const le = Math.min((r.line_end || r.line_start) - 1, lines.length - 1);
+    const ls = range[0] - 1;
+    const le = Math.min(range[1] - 1, lines.length - 1);
     for (let i = ls; i <= le; i++) {
       if (!lineMap.has(i)) lineMap.set(i, []);
       lineMap.get(i).push({ r, col });
@@ -1490,9 +1661,9 @@ function renderLines(text, rules) {
     const uniq = [...new Map(entries.map(e => [e.col.bdr, e.col])).values()];
     const shadow = uniq.slice(0, 4).map((c, i) => `inset ${(i + 1) * 3}px 0 0 ${c.bdr}`).join(',');
     const title = escAttr(entries.map(e => (e.r.extracted_by || e.r.source || '?') + ': ' + e.r.rule_text.slice(0, 60)).join(' | '));
-    return `<span class="line-hl" data-rids="${rids}" data-bg="${bg}" data-hov="${hov}" data-act="${act}"` +
+    return `<span class="line-hl" data-line="${idx+1}" data-rids="${rids}" data-bg="${bg}" data-hov="${hov}" data-act="${act}"` +
       ` style="background:${bg};box-shadow:${shadow}"` +
-      ` onclick="focusRule('${entries[0].r.id}')" title="${title}">${escHtml(line)}</span>\n`;
+      ` title="${title}">${escHtml(line)}</span>\n`;
   }).join('');
 }
 
@@ -1500,6 +1671,12 @@ function renderLines(text, rules) {
 function onViewerMouseUp() {
   const pre = document.getElementById('contentPre');
   if (!pre) return;
+  const lineNo = getCollapsedSelectionLineNo(pre);
+  if (lineNo != null) {
+    clearSelection();
+    applyLineSearch(lineNo);
+    return;
+  }
   const offsets = getSelectionOffsets(pre);
   if (!offsets) { clearSelection(); return; }
   S.selection = offsets;
@@ -1520,7 +1697,24 @@ function setSelInfo(html) {
     <kbd>j</kbd><kbd>k</kbd> nav &nbsp;·&nbsp; <kbd>n</kbd> note &nbsp;·&nbsp; <kbd>d</kbd> del</span>`;
 }
 
-// Robust offset using TreeWalker – handles marks/spans correctly
+function boundaryOffset(container, node, offset) {
+  const r = document.createRange();
+  r.selectNodeContents(container);
+  r.setEnd(node, offset);
+  return r.toString().length;
+}
+
+function getCollapsedSelectionLineNo(container) {
+  const sel = window.getSelection();
+  if (!sel || !sel.isCollapsed || !sel.rangeCount) return null;
+  const range = sel.getRangeAt(0);
+  if (!container.contains(range.startContainer)) return null;
+  const start = boundaryOffset(container, range.startContainer, range.startOffset);
+  if (!Number.isFinite(start) || !S.currentFile?.content) return null;
+  return S.currentFile.content.slice(0, start).split('\n').length;
+}
+
+// Robust offset using Range boundaries – handles mixed text/spans correctly
 function getSelectionOffsets(container) {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
@@ -1528,19 +1722,10 @@ function getSelectionOffsets(container) {
   if (!container.contains(range.commonAncestorContainer)) return null;
   const text = sel.toString();
   if (!text.trim()) return null;
-
-  function walkOffset(targetNode, targetOff) {
-    let n = 0;
-    const w = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-    while (w.nextNode()) {
-      if (w.currentNode === targetNode) return n + targetOff;
-      n += w.currentNode.length;
-    }
-    return n + targetOff;
-  }
-
-  const start = walkOffset(range.startContainer, range.startOffset);
-  return { start, end: start + text.length, text };
+  const start = boundaryOffset(container, range.startContainer, range.startOffset);
+  const end = boundaryOffset(container, range.endContainer, range.endOffset);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return { start, end: Math.max(start, end), text };
 }
 
 async function addHandRule() {
@@ -1569,18 +1754,47 @@ async function addHandRule() {
 
 // ─── Rules panel ─────────────────────────────────────────────
 function renderRulesPanel() {
-  const hand = S.rules.filter(r => r.source === 'hand');
-  const llm  = S.rules.filter(r => r.source === 'llm');
+  const visible = getVisibleRules();
+  const hasSearch = !!S.ruleSearchQuery.trim();
+  const searchLabel = hasSearch ? ` matching "${esc(S.ruleSearchQuery.trim())}"` : '';
+  const visibleIds = new Set(visible.map(r => r.id));
+  S.selectedIds = new Set([...S.selectedIds].filter(id => visibleIds.has(id)));
+  if (S.focusedRuleId && !visibleIds.has(S.focusedRuleId)) setFocusedRule(null);
+  if (S.lastSelectedId && !visibleIds.has(S.lastSelectedId)) S.lastSelectedId = null;
+  const hand = visible.filter(r => r.source === 'hand');
+  const llm  = visible.filter(r => r.source === 'llm');
   document.getElementById('handCount').textContent = hand.length;
   document.getElementById('llmCount').textContent  = llm.length;
   document.getElementById('handRules').innerHTML = hand.length
     ? hand.map(r => ruleCard(r)).join('')
-    : '<div class="empty-hint">Select text to add rules</div>';
+    : (hasSearch
+        ? `<div class="empty-hint">No hand rules${searchLabel}</div>`
+        : '<div class="empty-hint">Select text to add rules</div>');
   document.getElementById('llmRules').innerHTML = llm.length
     ? llm.map(r => ruleCard(r)).join('')
-    : '<div class="empty-hint">Run the LLM to extract rules</div>';
+    : (hasSearch
+        ? `<div class="empty-hint">No LLM rules${searchLabel}</div>`
+        : '<div class="empty-hint">Run the LLM to extract rules</div>');
+  document.getElementById('clearRuleSearchBtn').disabled = !S.ruleSearchQuery.trim();
+  document.getElementById('rulesVisibleCount').textContent = `${visible.length}/${S.rules.length}`;
   updateBulkBar();
   updateExtractClearButton();
+}
+
+function promoteRuleToSectionTop(id) {
+  const idx = S.rules.findIndex(r => r.id === id);
+  if (idx < 0) return false;
+  const src = S.rules[idx].source;
+  const firstInSection = S.rules.findIndex(r => r.source === src);
+  if (firstInSection < 0 || idx === firstInSection) return false;
+  const [rule] = S.rules.splice(idx, 1);
+  S.rules.splice(firstInSection, 0, rule);
+  return true;
+}
+
+function focusAndPromoteRule(id) {
+  if (promoteRuleToSectionTop(id)) renderRulesPanel();
+  focusRule(id);
 }
 
 function selectedLlmIds() {
@@ -1736,7 +1950,7 @@ function ruleCardClick(evt, id) {
     rangeSelect(S.lastSelectedId, id);
     return;
   }
-  focusRule(id);
+  focusAndPromoteRule(id);
   S.lastSelectedId = id;
 }
 
@@ -1762,7 +1976,7 @@ function toggleRuleSelect(id, checked, evt) {
 }
 
 function selectAll(source) {
-  S.rules.filter(r => r.source === source).forEach(r => S.selectedIds.add(r.id));
+  getVisibleRules().filter(r => r.source === source).forEach(r => S.selectedIds.add(r.id));
   renderRulesPanel();
 }
 
