@@ -1,0 +1,8 @@
+# Keep the build context small — the large .db files and history are bind-mounted
+# at runtime, not baked into the image.
+.git
+__pycache__/
+*.pyc
+*.db
+.venv/
+node_modules/

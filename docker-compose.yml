@@ -1,0 +1,19 @@
+services:
+  annotator:
+    build: .
+    image: rule-annotator
+    container_name: rule-annotator
+    ports:
+      - "5002:5002"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=5002
+      # set DEBUG=1 to enable Flask's reloader/debugger (dev only)
+      - DEBUG=
+    volumes:
+      # Bind-mount the project so sample.db is readable and annotations.db
+      # (the annotations you create) persists on the host across restarts.
+      # .env is picked up here too for PERPLEXITY_API_KEY.
+      - ./:/app
+    # Keep the app running across crashes / Docker restarts.
+    restart: unless-stopped

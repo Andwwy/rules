@@ -65,9 +65,17 @@ def annot_con():
             created_at   TIMESTAMP DEFAULT now()
         )
     """)
-    for col in ("notes VARCHAR", "extracted_by VARCHAR"):
+    # notes == user "Comment" in the inspector
+    for col in ("notes VARCHAR", "extracted_by VARCHAR",
+                "tag VARCHAR", "power_type VARCHAR", "llm_rationale TEXT"):
         try: con.execute(f"ALTER TABLE extracted_rules ADD COLUMN {col}")
         except Exception: pass
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key   VARCHAR PRIMARY KEY,
+            value TEXT
+        )
+    """)
     con.execute("""
         CREATE TABLE IF NOT EXISTS llm_runs (
             id           VARCHAR PRIMARY KEY,
@@ -155,6 +163,7 @@ def _rule_row(r):
         "source": r[6], "llm_run_id": r[7],
         "notes": r[8], "extracted_by": r[9],
         "created_at": str(r[10]),
+        "tag": r[11], "power_type": r[12], "llm_rationale": r[13],
     }
 
 @app.route("/api/all-rules")
@@ -177,7 +186,7 @@ def api_all_rules():
         url_map = {r[0]: r[1] for r in sc.execute(
             f"SELECT id, source_url FROM sample WHERE id IN ({placeholders})", fids
         ).fetchall()}
-    sc.close()
+    # NOTE: sample_con() is a cached, shared read-only connection — do NOT close it.
     return jsonify([{
         "id": r[0], "file_id": r[1],
         "source_url": url_map.get(r[1], ""),
@@ -190,7 +199,8 @@ def api_rules(fid):
     con = annot_con()
     rows = con.execute("""
         SELECT id, rule_text, char_start, char_end, line_start, line_end,
-               source, llm_run_id, notes, extracted_by, created_at
+               source, llm_run_id, notes, extracted_by, created_at,
+               tag, power_type, llm_rationale
         FROM extracted_rules WHERE file_id=?
         ORDER BY COALESCE(char_start,999999), created_at
     """, [fid]).fetchall()
@@ -222,14 +232,23 @@ def save_rule():
         "line_start": b.get("line_start"), "line_end": b.get("line_end"),
         "source": "hand", "llm_run_id": None, "notes": None,
         "extracted_by": by,
+        "tag": None, "power_type": None, "llm_rationale": None,
     })
 
 @app.route("/api/rules/<rid>", methods=["PATCH"])
 def patch_rule(rid):
+    """Update any of: notes (Comment), tag, power_type, llm_rationale."""
     b = request.json or {}
-    notes = b.get("notes") or None
+    updates, params = [], []
+    for k in ("notes", "tag", "power_type", "llm_rationale"):
+        if k in b:
+            updates.append(f"{k}=?")
+            params.append(b.get(k) or None)
+    if not updates:
+        return jsonify({"ok": True})
+    params.append(rid)
     con = annot_con()
-    con.execute("UPDATE extracted_rules SET notes=? WHERE id=?", [notes, rid])
+    con.execute(f"UPDATE extracted_rules SET {', '.join(updates)} WHERE id=?", params)
     con.close()
     return jsonify({"ok": True})
 
@@ -334,11 +353,16 @@ def run_llm():
     con = annot_con()
 
     if is_template:
-        # Classification mode: store raw JSON, don't create extracted_rules rows
+        # Classification mode: store raw JSON, attach rationale to the rule
         con.execute(
             "INSERT INTO llm_runs(id,file_id,prompt,model,raw_response,rule_count) VALUES(?,?,?,?,?,?)",
             [run_id, fid, prompt, model, raw, 0]
         )
+        rule_id = b.get("rule_id", "").strip()
+        if rule_id:
+            con.execute(
+                "UPDATE extracted_rules SET llm_rationale=? WHERE id=?", [raw, rule_id]
+            )
         con.close()
         # Parse classification JSON for the response
         import re as _re2
@@ -386,26 +410,45 @@ def run_llm():
         "INSERT INTO llm_runs(id,file_id,prompt,model,raw_response,rule_count) VALUES(?,?,?,?,?,?)",
         [run_id, fid, prompt, model, raw, len(extracted)]
     )
+    # The unified "LLM judge" run replaces the previously auto-extracted set so
+    # re-running doesn't pile up duplicates (hand-added rules are untouched).
+    if b.get("replace_llm"):
+        con.execute("DELETE FROM extracted_rules WHERE file_id=? AND source='llm'", [fid])
+
+    def _norm_tag(t):
+        t = (t or "").strip().upper()
+        return t if t in ("PROHIBIT", "OBLIGE", "PERMIT", "POWER") else None
+
+    def _norm_power(tag, pt):
+        if tag != "POWER":
+            return None
+        pt = (pt or "").strip().lower()
+        return pt if pt in ("norm", "strategy") else None
+
     saved = []
     for rule in extracted:
         rt = rule.get("rule_text","").strip()
         if not rt: continue
         eid = make_id(fid, "llm", run_id, rt)
+        tag = _norm_tag(rule.get("tag"))
+        power_type = _norm_power(tag, rule.get("power_type"))
+        rationale = rule.get("rationale") or rule.get("llm_rationale")
         con.execute("""
             INSERT OR IGNORE INTO extracted_rules
                 (id,file_id,rule_text,char_start,char_end,line_start,line_end,
-                 source,llm_run_id,notes,extracted_by)
-            VALUES(?,?,?,?,?,?,?,'llm',?,NULL,?)
+                 source,llm_run_id,notes,extracted_by,tag,power_type,llm_rationale)
+            VALUES(?,?,?,?,?,?,?,'llm',?,NULL,?,?,?,?)
         """, [eid, fid, rt,
               rule.get("char_start"), rule.get("char_end"),
               rule.get("line_start"), rule.get("line_end"),
-              run_id, model])
+              run_id, model, tag, power_type, rationale])
         saved.append({
             "id": eid, "rule_text": rt,
             "char_start": rule.get("char_start"), "char_end": rule.get("char_end"),
             "line_start": rule.get("line_start"), "line_end": rule.get("line_end"),
             "source": "llm", "llm_run_id": run_id, "notes": None,
             "extracted_by": model,
+            "tag": tag, "power_type": power_type, "llm_rationale": rationale,
         })
     con.close()
     return jsonify({"run_id": run_id, "rules": saved, "raw_response": raw})
@@ -426,7 +469,8 @@ def export_page():
     acon = annot_con()
     rows = acon.execute("""
         SELECT r.file_id, r.rule_text, r.line_start, r.line_end,
-               r.source, r.extracted_by, r.notes, r.created_at
+               r.source, r.extracted_by, r.notes, r.created_at,
+               r.tag, r.power_type, r.llm_rationale
         FROM extracted_rules r
         ORDER BY r.file_id, COALESCE(r.line_start, 999999), r.created_at
     """).fetchall()
@@ -439,15 +483,21 @@ def export_page():
         url_map = {r[0]: r[1] for r in sc.execute(
             f"SELECT id, source_url FROM sample WHERE id IN ({placeholders})", fids
         ).fetchall()}
-    sc.close()
+    # NOTE: sample_con() is a cached, shared read-only connection — do NOT close it.
+
+    def _power(tag, ptype):
+        if tag == "POWER" and ptype:
+            return f"POWER:{ptype}"
+        return tag or ""
 
     import csv, io
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["source_url","source","extracted_by","line_start","line_end","rule_text","notes","created_at"])
+    writer.writerow(["source_url","source","extracted_by","line_start","line_end",
+                     "rule_text","tag","user_comment","llm_rationale","created_at"])
     for r in rows:
         writer.writerow([url_map.get(r[0],""), r[4], r[5] or "", r[2] or "", r[3] or "",
-                         r[1], r[6] or "", str(r[7] or "")])
+                         r[1], _power(r[8], r[9]), r[6] or "", r[10] or "", str(r[7] or "")])
     csv_text = buf.getvalue()
     row_count = len(rows)
 
@@ -531,6 +581,29 @@ def delete_prompt(pid):
     return jsonify({"ok": True})
 
 # ---------------------------------------------------------------------------
+# Routes – app settings (persisted, editable judge/extract prompts + models)
+# ---------------------------------------------------------------------------
+@app.route("/api/settings")
+def get_settings():
+    con = annot_con()
+    rows = con.execute("SELECT key, value FROM app_settings").fetchall()
+    con.close()
+    return jsonify({k: v for k, v in rows})
+
+@app.route("/api/settings", methods=["POST"])
+def set_settings():
+    b = request.json or {}
+    con = annot_con()
+    for k, v in b.items():
+        con.execute(
+            "INSERT INTO app_settings(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [k, v]
+        )
+    con.close()
+    return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _parse_llm_rules(text):
@@ -559,7 +632,7 @@ HTML = r"""<!DOCTYPE html>
 <title>Rule Annotator</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root { --rules-panel-width: 420px; }
+:root { --insp-panel-width: 420px; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   background: #f0f0f6; height: 100vh; overflow: hidden; color: #1a1a2e;
@@ -604,7 +677,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 /* ── Viewer ── */
 .viewer-panel {
   flex: 1; display: flex; flex-direction: column; overflow: hidden;
-  background: #fff;
+  background: #fff; min-width: 340px;
 }
 .viewer-head {
   padding: 9px 14px; background: #fafafa; border-bottom: 1px solid #eaeaf0;
@@ -631,6 +704,13 @@ kbd {
 }
 .add-btn:hover:not(:disabled) { background: #f59e0b; color: #fff; }
 .add-btn:disabled { opacity: 0.32; cursor: default; }
+.judge-btn {
+  padding: 3px 12px; border-radius: 20px; border: 1.5px solid #6366f1;
+  color: #6366f1; background: transparent; font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: all 0.12s; white-space: nowrap;
+}
+.judge-btn:hover { background: #6366f1; color: #fff; }
+.judge-btn.active { background: #6366f1; color: #fff; }
 .viewer-body {
   flex: 1; display: flex; overflow: auto;
   font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
@@ -641,283 +721,273 @@ kbd {
   text-align: right; user-select: none; border-right: 1px solid #f0f0f8;
   flex-shrink: 0; min-width: 44px;
 }
-.line-num {
-  display: block;
-  min-height: 1.6em;
-  line-height: 1.6;
-  border-radius: 4px;
-  cursor: pointer;
-  padding: 0 2px;
-}
-.line-num:hover { background: #eef2ff; color: #6366f1; }
-.line-num.active { background: #e0e7ff; color: #4338ca; font-weight: 700; }
+.line-num { display: block; min-height: 1.6em; line-height: 1.6; padding: 0 2px; font-variant-numeric: tabular-nums; }
 .content-pre {
   flex: 1; padding: 14px 16px; margin: 0;
   white-space: pre-wrap; word-break: break-word;
   overflow: visible; background: transparent; cursor: text;
 }
 
-/* ── Line highlights ── */
-.line-hl {
-  display: inline;
-  cursor: pointer;
-  border-radius: 0 3px 3px 0;
+/* ── Letter-based highlights ── */
+.rule-hl {
+  cursor: pointer; border-radius: 2px;
+  box-shadow: inset 0 -2px 0 0 rgba(0,0,0,0.12);
   transition: background 0.1s;
 }
-.line-hl:hover { filter: brightness(0.92); }
+.rule-hl.focused { box-shadow: inset 0 -2px 0 0 rgba(0,0,0,0.35); }
 
+/* ── Tool (editable prompt) view in the middle ── */
+.tool-view { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: #fff; }
+.tool-tabs { display: flex; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid #eaeaf0; flex-shrink: 0; }
+.tool-tab {
+  padding: 6px 14px; border: 1px solid #e0e0ee; border-bottom: none;
+  border-radius: 7px 7px 0 0; background: #f4f4fc; color: #6060a0;
+  font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.tool-tab.active { background: #fff; color: #4338ca; border-color: #c7d2fe; }
+.tool-title { padding: 6px 4px 10px; font-size: 13px; font-weight: 700; color: #4338ca; align-self: center; }
+.tool-pane { flex: 1; display: none; flex-direction: column; overflow: hidden; padding: 10px 12px; gap: 8px; }
+.tool-pane.active { display: flex; }
+
+/* judge run lock / spinner */
+.judge-loading { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
+.spinner {
+  width: 52px; height: 52px; border: 5px solid #e4e4f4; border-top-color: #6366f1;
+  border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.judge-loading-text { color: #6060a0; font-size: 13px; font-weight: 500; }
+
+/* ── LLM judge pop-up modal ── */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(22, 22, 44, 0.45);
+  display: flex; align-items: center; justify-content: center;
+  padding: 40px;
+  animation: modal-fade 0.12s ease-out;
+}
+@keyframes modal-fade { from { opacity: 0; } to { opacity: 1; } }
+.modal-card {
+  width: min(1000px, 92vw); height: min(820px, 88vh);
+  background: #fff; border-radius: 14px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 16px; border-bottom: 1px solid #eaeaf2; flex-shrink: 0;
+}
+.modal-body {
+  flex: 1; display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 16px; overflow: hidden;
+}
+.modal-foot {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 16px; border-top: 1px solid #eaeaf2; flex-shrink: 0;
+}
+.modal-card .judge-loading { min-height: 320px; padding: 40px; }
+.tool-row { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.tool-row .lbl { font-size: 11px; color: #7a7aaa; font-weight: 600; }
+.tool-model {
+  flex: 1; padding: 5px 7px; border-radius: 6px; border: 1px solid #d0d0e0;
+  background: white; font-size: 12px; color: #333;
+}
+.tool-prompt {
+  flex: 1; width: 100%; padding: 10px 12px; border-radius: 8px;
+  border: 1px solid #d0d0e0; background: #fcfcff; font-size: 12px; color: #222;
+  resize: none; font-family: 'SFMono-Regular', Consolas, Menlo, monospace; line-height: 1.5;
+}
+.tool-prompt:focus, .tool-model:focus { outline: none; border-color: #6366f1; }
+.tool-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+.tool-status { font-size: 11px; color: #7070a0; flex: 1; }
+.tool-status.error { color: #e53e3e; }
+.tool-status.ok { color: #16a34a; }
+.btn {
+  padding: 6px 16px; border-radius: 18px; border: none; font-size: 12px;
+  font-weight: 600; cursor: pointer; white-space: nowrap;
+}
+.btn.primary { background: #6366f1; color: #fff; }
+.btn.primary:hover:not(:disabled) { background: #4f46e5; }
+.btn.primary:disabled { opacity: 0.5; cursor: default; }
+.btn.ghost { background: white; color: #6060a0; border: 1px solid #d0d0e0; }
+.btn.ghost:hover { border-color: #6366f1; color: #4338ca; }
+
+/* ── Resizer ── */
 .panel-resizer {
   width: 8px; flex-shrink: 0; cursor: col-resize;
   background: linear-gradient(to right, #e6e6f3 0, #f2f2fa 100%);
-  border-left: 1px solid #e0e0ea;
-  border-right: 1px solid #e0e0ea;
+  border-left: 1px solid #e0e0ea; border-right: 1px solid #e0e0ea;
 }
-.panel-resizer:hover,
-.panel-resizer.active { background: linear-gradient(to right, #c7d2fe 0, #e0e7ff 100%); }
+.panel-resizer:hover, .panel-resizer.active { background: linear-gradient(to right, #c7d2fe 0, #e0e7ff 100%); }
 
-/* ── Rules panel ── */
-.rules-panel {
-  width: var(--rules-panel-width); min-width: 280px; max-width: 760px;
+/* ── Inspector panel ── */
+.insp-panel {
+  width: var(--insp-panel-width); min-width: 300px; max-width: 720px;
   flex-shrink: 0; display: flex; flex-direction: column;
   overflow: hidden; background: #fafafd;
 }
-
-/* annotator name bar */
 .name-bar {
-  padding: 7px 12px; background: #f0f0fa; border-bottom: 1px solid #e0e0f0;
+  padding: 9px 12px; background: #f0f0fa; border-bottom: 1px solid #e0e0f0;
   display: flex; align-items: center; gap: 8px; flex-shrink: 0;
 }
 .name-bar label { font-size: 11px; color: #7a7aaa; white-space: nowrap; }
 .name-input {
-  flex: 1; padding: 3px 7px; border-radius: 5px; border: 1px solid #d0d0e8;
+  flex: 1; padding: 4px 8px; border-radius: 5px; border: 1px solid #d0d0e8;
   background: white; font-size: 12px; color: #333;
 }
 .name-input:focus { outline: none; border-color: #6366f1; }
+.csv-btn {
+  padding: 4px 10px; border-radius: 14px; border: 1px solid #c0c0d8;
+  background: white; color: #6060a0; font-size: 11px; font-weight: 600;
+  cursor: pointer; white-space: nowrap;
+}
+.csv-btn:hover { border-color: #6366f1; color: #4338ca; }
 
-.rules-section { display: flex; flex-direction: column; overflow: hidden; }
-.rules-section.hand-section { flex: 0 0 auto; max-height: 44%; border-bottom: 2px solid #e8e8f4; }
-.rules-section.llm-section  { flex: 1; overflow: hidden; }
-.section-head {
-  padding: 7px 12px; font-size: 12px; font-weight: 700; letter-spacing: 0.2px;
-  display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
-  background: #f4f4fc; border-bottom: 1px solid #e4e4f0;
-}
-.section-count {
-  font-size: 11px; font-weight: 700; padding: 1px 7px; border-radius: 10px;
-  background: #e8e8f8; color: #6060a0;
-}
-.rules-list { overflow-y: auto; flex: 1; padding: 5px; }
+.inspector { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.insp-empty { color: #b0b0c8; font-size: 13px; text-align: center; padding: 40px 12px; line-height: 1.6; }
 
-/* rule card – border/bg via CSS variables */
-.rule-card {
-  padding: 7px 9px; border-radius: 6px;
-  border-left: 3px solid var(--rc-bdr, #d0d0e8);
-  background: var(--rc-bg, #f8f8fc);
-  margin-bottom: 4px; cursor: pointer; font-size: 12px; line-height: 1.5;
-  display: flex; align-items: flex-start; gap: 6px;
-  transition: background 0.1s; word-break: break-word;
+/* ── Rule list ── */
+.rl-head { font-size: 11px; font-weight: 700; color: #8080a8; text-transform: uppercase; letter-spacing: 0.3px; padding: 2px 2px 4px; flex-shrink: 0; }
+.rl-item {
+  display: flex; gap: 9px; align-items: stretch; cursor: pointer;
+  background: #fff; border: 1px solid #ececf4; border-radius: 8px;
+  padding: 0; overflow: hidden; transition: border-color 0.1s, box-shadow 0.1s;
+  flex-shrink: 0;   /* don't let the column flex container squash list rows */
 }
-.rule-card:hover  { background: var(--rc-hov, #f0f0f8); }
-.rule-card.focused {
-  background: var(--rc-act, #e8e8f4);
-  box-shadow: 0 0 0 1.5px var(--rc-bdr, #9090c0);
+.rl-item:hover { border-color: #c7c7e0; }
+.rl-item.active { border-color: var(--rc-bdr, #6366f1); box-shadow: 0 0 0 1px var(--rc-bdr, #6366f1); }
+.rl-bar { width: 4px; flex-shrink: 0; background: var(--rc-bdr, #c0c0d8); }
+.rl-body { flex: 1; min-width: 0; padding: 8px 10px 8px 4px; }
+.rl-top { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
+.rl-pos { font-size: 10px; color: #9090b0; }
+.rl-flags { margin-left: auto; display: flex; gap: 4px; }
+.rl-flag { font-size: 11px; color: #8080b0; }
+.rl-text { font-size: 12px; line-height: 1.45; color: #2a2a3e; word-break: break-word; }
+.rl-tag {
+  display: inline-block; font-size: 9px; font-weight: 800; letter-spacing: 0.4px;
+  padding: 1px 6px; border-radius: 7px; background: #ececf6; color: #6060a0;
 }
-.rule-card.no-pos { opacity: 0.75; }
-.extractor-tag {
-  display: inline-block; font-size: 9px; font-weight: 700; padding: 1px 5px;
-  border-radius: 8px; background: var(--rc-bg2, #e8e8f4); color: var(--rc-bdr, #6060a0);
-  margin-bottom: 3px; letter-spacing: 0.2px; vertical-align: middle;
-}
-.rule-body { flex: 1; min-width: 0; }
-.rule-preview { color: #2a2a3e; margin-bottom: 2px; }
-.rule-pos { font-size: 10px; color: #9090b0; }
-.rule-note-text { margin-top: 4px; font-size: 11px; color: #6060a0; font-style: italic; white-space: pre-wrap; }
-.rule-note-editor { display: none; margin-top: 5px; }
-.rule-note-editor.open { display: block; }
-.rule-note-input {
-  width: 100%; padding: 4px 7px; border-radius: 5px;
-  border: 1.5px solid #6366f1; background: white; font-size: 11px;
-  font-family: inherit; color: #333; resize: none; line-height: 1.4;
-}
-.rule-note-input:focus { outline: none; }
-.note-hint { font-size: 10px; color: #aaa; margin-top: 2px; }
-.rule-actions { display: flex; flex-direction: column; gap: 2px; flex-shrink: 0; }
-.rule-btn {
-  background: none; border: none; cursor: pointer; padding: 2px 3px;
-  border-radius: 3px; font-size: 13px; line-height: 1; color: #c0c0d8;
-}
-.rule-btn:hover { background: rgba(0,0,0,.07); color: #555; }
-.rule-btn.del:hover { color: #e53e3e; background: rgba(229,62,62,.1); }
-.rule-btn.note-btn.has-note { color: #6366f1; }
+.rl-tag.prohibit { background: #fee2e2; color: #b91c1c; }
+.rl-tag.oblige   { background: #dbeafe; color: #1d4ed8; }
+.rl-tag.permit   { background: #dcfce7; color: #15803d; }
+.rl-tag.power    { background: #f3e8ff; color: #7e22ce; }
 
-/* empty states */
-.empty-hint { color: #b0b0c8; font-size: 12px; text-align: center; padding: 14px 8px; }
-.viewer-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: #b0b0c8; font-size: 14px; }
+/* ── Inspector top bar (exit) ── */
+.insp-top { display: flex; align-items: center; justify-content: space-between; }
+.insp-top-label { font-size: 11px; font-weight: 700; color: #8080a8; text-transform: uppercase; letter-spacing: 0.3px; }
+.insp-exit {
+  width: 26px; height: 26px; flex-shrink: 0; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; border: 1px solid #fca5a5;
+  background: #fff; color: #dc2626; font-size: 14px; line-height: 1; cursor: pointer;
+  transition: all 0.1s;
+}
+.insp-exit:hover { background: #ef4444; border-color: #ef4444; color: #fff; }
+.insp-rule {
+  font-size: 13px; line-height: 1.5; color: #1a1a2e; background: #fff;
+  border: 1px solid #e6e6f2; border-left: 3px solid var(--rc-bdr, #6366f1);
+  border-radius: 7px; padding: 9px 11px; white-space: pre-wrap; word-break: break-word;
+  max-height: 200px; overflow-y: auto;
+}
+.insp-pos { font-size: 11px; color: #9090b0; margin-top: -6px; }
+.insp-label { font-size: 11px; font-weight: 700; color: #6060a0; letter-spacing: 0.3px; text-transform: uppercase; }
 
-/* LLM controls */
-.llm-controls {
-  padding: 8px 11px; border-bottom: 1px solid #e8e8f4;
-  flex-shrink: 0; display: flex; flex-direction: column; gap: 6px;
+/* tag toggle */
+.tag-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.tag-btn {
+  padding: 7px 14px; border-radius: 9px; border: 1.5px solid #d4d4e4;
+  background: #fff; color: #6b6b85; font-size: 12px; font-weight: 700;
+  letter-spacing: 0.4px; cursor: pointer; transition: all 0.1s; flex: 1; min-width: 72px;
 }
-.llm-row { display: flex; gap: 6px; align-items: center; }
-.llm-model {
-  flex: 1; padding: 5px 7px; border-radius: 6px; border: 1px solid #d0d0e0;
-  background: white; font-size: 12px; color: #333;
+.tag-btn:hover { border-color: #b0b0c8; }
+.tag-btn.active.prohibit { background: #fee2e2; border-color: #ef4444; color: #b91c1c; }
+.tag-btn.active.oblige   { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
+.tag-btn.active.permit   { background: #dcfce7; border-color: #22c55e; color: #15803d; }
+.tag-btn.active.power    { background: #f3e8ff; border-color: #a855f7; color: #7e22ce; }
+.power-row { display: flex; gap: 6px; padding-left: 2px; }
+.sub-btn {
+  padding: 5px 14px; border-radius: 8px; border: 1.5px solid #e0d4f0;
+  background: #fff; color: #8a6bb0; font-size: 12px; font-weight: 600;
+  cursor: pointer; flex: 1;
 }
-.llm-prompt {
-  width: 100%; min-height: 60px; padding: 6px 8px; border-radius: 6px;
-  border: 1px solid #d0d0e0; background: white; font-size: 12px; color: #333;
-  resize: vertical; font-family: inherit; line-height: 1.4;
-}
-.extract-prompt-wrap { display: block; }
-.extract-prompt-wrap.collapsed { display: none; }
-.llm-prompt:focus, .llm-model:focus, .llm-label:focus { outline: none; border-color: #6366f1; }
-.run-btn {
-  padding: 5px 14px; border-radius: 20px; border: none; background: #6366f1;
-  color: white; font-size: 12px; font-weight: 600; cursor: pointer; flex-shrink: 0;
-}
-.run-btn:hover:not(:disabled) { background: #4f46e5; }
-.run-btn:disabled { opacity: 0.5; cursor: default; }
-.icon-btn {
-  padding: 4px 8px; border-radius: 6px; border: 1px solid #d0d0e0;
-  background: transparent; color: #7070a0; font-size: 11px; cursor: pointer;
-  white-space: nowrap;
-}
-.icon-btn:hover { border-color: #6366f1; color: #4338ca; }
-.icon-btn:disabled { opacity: 0.4; cursor: default; }
-.llm-status { font-size: 11px; color: #7070a0; min-height: 15px; flex: 1; }
-.llm-status.error { color: #e53e3e; }
-.llm-status.ok    { color: #22c55e; }
+.sub-btn:hover { border-color: #c9b0e8; }
+.sub-btn.active { background: #f3e8ff; border-color: #a855f7; color: #7e22ce; }
+.power-hint { font-size: 11px; color: #9090b0; align-self: center; margin-right: 4px; }
 
-/* prompt history */
-.prompt-history {
-  border: 1px solid #e0e0f0; border-radius: 6px; background: white;
-  max-height: 120px; overflow-y: auto; display: none;
+.insp-rationale {
+  width: 100%; min-height: 56px; max-height: 320px; padding: 9px 11px; border-radius: 8px;
+  border: 1px solid #e0e0ee; background: #f6f6fb; color: #333; font-size: 12px;
+  line-height: 1.5; resize: none; overflow-y: hidden;
+  font-family: 'SFMono-Regular', Consolas, Menlo, monospace;
 }
-.prompt-history.open { display: block; }
-.ph-item {
-  padding: 5px 9px; font-size: 11px; color: #444; cursor: pointer;
-  border-bottom: 1px solid #f0f0f8; display: flex; gap: 6px; align-items: flex-start;
+.insp-rationale[readonly] { cursor: default; }
+.insp-comment {
+  width: 100%; min-height: 56px; max-height: 240px; padding: 9px 11px; border-radius: 8px;
+  border: 1.5px solid #c7d2fe; background: #fff; color: #222; font-size: 13px;
+  line-height: 1.5; resize: none; overflow-y: hidden; font-family: inherit;
 }
-.ph-item:last-child { border-bottom: none; }
-.ph-item:hover { background: #f4f4fc; }
-.ph-text { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.ph-label { font-size: 10px; font-weight: 600; color: #6366f1; flex-shrink: 0; }
-.ph-date  { font-size: 10px; color: #aaa; flex-shrink: 0; }
-.ph-del   { font-size: 13px; color: #ccc; background: none; border: none; cursor: pointer; flex-shrink: 0; padding: 0; }
-.ph-del:hover { color: #e53e3e; }
+.insp-comment:focus { outline: none; border-color: #6366f1; }
+.run-judge-btn {
+  padding: 7px 14px; border-radius: 18px; border: 1.5px solid #6366f1;
+  background: #fff; color: #4338ca; font-size: 12px; font-weight: 600;
+  cursor: pointer; align-self: flex-start;
+}
+.run-judge-btn:hover:not(:disabled) { background: #eef2ff; }
+.run-judge-btn:disabled { opacity: 0.5; cursor: default; }
+.insp-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 4px; }
+.insp-del {
+  padding: 5px 12px; border-radius: 12px; border: 1px solid #fca5a5;
+  background: white; color: #dc2626; font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.insp-del:hover { background: #fff1f1; border-color: #f87171; }
+.insp-status { font-size: 11px; color: #7070a0; }
+.insp-status.error { color: #e53e3e; }
+.insp-status.ok { color: #16a34a; }
 
-/* collapsible sub-sections */
-.sub-head {
-  padding: 6px 12px; font-size: 11px; font-weight: 700; letter-spacing: 0.2px;
-  display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none;
-  background: #f0f0f8; border-bottom: 1px solid #e0e0ee; flex-shrink: 0;
-}
-.sub-head:hover { background: #e8e8f4; }
-.sub-arrow { font-size: 9px; color: #8080a0; transition: transform 0.15s; display: inline-block; }
-.sub-arrow.closed { transform: rotate(-90deg); }
-.sub-body { display: flex; flex-direction: column; overflow: hidden; }
-.sub-body.collapsed { display: none; }
-
-/* classification result */
-.classif-result {
-  border-top: 1px solid #e4e4f0; overflow-y: auto; max-height: 55vh;
-  font-size: 12px; flex-shrink: 0;
-}
-.cr-row {
-  display: flex; gap: 8px; padding: 5px 12px; border-bottom: 1px solid #f0f0f8;
-  align-items: flex-start; line-height: 1.4;
-}
-.cr-row:last-child { border-bottom: none; }
-.cr-label {
-  font-weight: 700; color: #6060a0; min-width: 80px; flex-shrink: 0; font-size: 11px;
-  padding-top: 1px;
-}
-.cr-val { color: #222; flex: 1; white-space: pre-wrap; word-break: break-word; }
-.cr-badge {
-  display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px;
-  font-weight: 700; white-space: nowrap;
-}
-.cr-badge.green  { background: #dcfce7; color: #15803d; }
-.cr-badge.yellow { background: #fef9c3; color: #854d0e; }
-.cr-badge.orange { background: #ffedd5; color: #c2410c; }
-.cr-badge.red    { background: #fee2e2; color: #b91c1c; }
-.cr-badge.blue   { background: #dbeafe; color: #1d4ed8; }
-.cr-badge.gray   { background: #f1f5f9; color: #475569; }
-.cr-toggle { cursor: pointer; color: #6366f1; font-size: 11px; padding: 4px 12px;
-             background: none; border: none; display: block; width: 100%; text-align: left; }
-.cr-json { display: none; padding: 8px 12px; background: #f8f8fc; }
-.cr-json.open { display: block; }
-.cr-json pre { margin: 0; font-size: 11px; white-space: pre-wrap; word-break: break-word; color: #333; }
-
-/* bulk selection */
-.rule-card.selected { outline: 2px solid #6366f1; outline-offset: -2px; }
-.rule-checkbox { display: flex; align-items: flex-start; padding: 2px 4px 0 0; flex-shrink: 0; cursor: pointer; }
-.rule-checkbox input { cursor: pointer; accent-color: #6366f1; }
-.bulk-bar {
-  display: none; align-items: center; gap: 6px; padding: 6px 11px;
-  background: #eef2ff; border-bottom: 1px solid #c7d2fe; flex-shrink: 0; font-size: 12px;
-}
-.bulk-bar.visible { display: flex; }
-.bulk-count { color: #4338ca; font-weight: 600; flex: 1; }
-.rules-tools {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  background: #f7f8ff;
-  border-bottom: 1px solid #e1e5ff;
-  flex-shrink: 0;
-}
-.rules-search {
-  flex: 1;
-  min-width: 0;
-  padding: 5px 8px;
-  border-radius: 6px;
-  border: 1px solid #cfd6ff;
-  background: white;
-  color: #2a2a3e;
-  font-size: 12px;
-}
-.rules-search:focus {
-  outline: none;
-  border-color: #6366f1;
-}
-.rules-tools-count {
-  font-size: 10px;
-  color: #7070a0;
-  min-width: 52px;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-.bulk-btn {
-  padding: 3px 10px; border-radius: 12px; border: 1px solid #a5b4fc; background: white;
-  color: #4338ca; font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap;
-}
-.bulk-btn:hover { background: #eef2ff; border-color: #6366f1; }
-.bulk-btn.danger { border-color: #fca5a5; color: #dc2626; }
-.bulk-btn.danger:hover { background: #fff1f1; border-color: #f87171; }
-.sel-all-btn {
-  font-size: 10px; font-weight: 500; color: #8080b0; background: none; border: none;
-  cursor: pointer; padding: 0 2px; text-decoration: underline dotted;
-}
-.sel-all-btn:hover { color: #4338ca; }
-
-/* keyboard bar */
 .kb-bar {
-  padding: 5px 10px; background: #f0f0f8; border-top: 1px solid #e0e0ee;
-  font-size: 10px; color: #9090b0; display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0;
+  padding: 6px 12px; background: #f0f0f8; border-top: 1px solid #e0e0ee;
+  font-size: 10px; color: #9090b0; display: flex; gap: 10px; flex-wrap: wrap; flex-shrink: 0;
 }
 .kb-bar span { white-space: nowrap; }
-.export-btn {
-  margin-left: auto; padding: 2px 8px; border-radius: 10px;
-  border: 1px solid #c0c0d8; background: white; color: #6060a0;
-  font-size: 10px; font-weight: 600; cursor: pointer; white-space: nowrap;
-}
-.export-btn:hover { border-color: #6366f1; color: #4338ca; }
+.viewer-empty { flex: 1; display: flex; align-items: center; justify-content: center; color: #b0b0c8; font-size: 14px; }
 </style>
 </head>
 <body>
+
+<!-- default prompts (raw text, not rendered) -->
+<script type="text/plain" id="defaultExtractPrompt">Extract all rule-like spans from this file for enforceability analysis.
+
+A rule is any instruction, constraint, prohibition, or requirement given to an LLM or agent. Prefer rules that are specific and potentially checkable — for example:
+- version or toolchain requirements ("Python 3.13.2 or compatible")
+- file or artifact requirements ("log changes in CHANGELOG.md")
+- workflow ordering constraints ("always follow this chain, never skip layers")
+- code style or format mandates ("follow PEP 8")
+- procedural gates ("read all memory bank files at the start of every task")
+- naming, header, or metadata requirements ("bump @version in the userscript header")
+
+Prefer exact or near-exact quotes from the file. Extract each independently enforceable clause as its own rule — do not merge unrelated requirements. Skip purely motivational or explanatory text with no checkable obligation.
+
+Return only a valid JSON array. Each element:
+{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</script>
+<script type="text/plain" id="defaultJudgePrompt">You are the LLM judge. Read the document below and extract every rule, classifying each one with a deontic tag.
+
+A "rule" is any natural-language instruction, constraint, prohibition, requirement, permission, or grant of authority given to an LLM or agent. Prefer exact or near-exact quotes from the document. Extract each independently meaningful clause as its own rule — do not merge unrelated requirements, and skip purely motivational or explanatory text with no directive force.
+
+For each rule, assign exactly ONE tag:
+
+- PROHIBIT: forbids an action. Cues: "never", "do not", "must not", "avoid", "don't".
+- OBLIGE: requires an action. Cues: "must", "always", "shall", "is required to", "ensure".
+- PERMIT: allows an action without requiring it. Cues: "may", "can", "is allowed to", "feel free to".
+- POWER: confers authority or capability to change what is permitted/obliged, or prescribes how such authority is exercised. For POWER, also set "power_type":
+    - "norm": establishes, changes, overrides, or governs a rule/policy itself (e.g. "this file takes precedence", "you may update the conventions").
+    - "strategy": prescribes an approach, method, ordering, or procedure for achieving a goal (e.g. "follow this chain", "read all memory files first").
+  For PROHIBIT, OBLIGE, and PERMIT, set "power_type" to null.
+
+For each rule, write a short "rationale" (1-3 sentences) explaining why the tag fits and what would be needed to enforce the rule deterministically outside the model.
+
+Return ONLY a valid JSON array, no other text. Each element:
+{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>, "tag": "PROHIBIT|OBLIGE|PERMIT|POWER", "power_type": "norm|strategy|null", "rationale": "<why this tag + how to enforce>"}</script>
+
 <div class="layout">
 
   <!-- ── File list ── -->
@@ -937,8 +1007,9 @@ kbd {
     <div class="sel-bar">
       <span class="sel-info" id="selInfo">
         <span class="kb">Select text then <kbd>⌘↵</kbd> to add &nbsp;·&nbsp;
-        <kbd>j</kbd><kbd>k</kbd> nav &nbsp;·&nbsp; <kbd>n</kbd> note &nbsp;·&nbsp; <kbd>d</kbd> del</span>
+        <kbd>j</kbd><kbd>k</kbd> nav &nbsp;·&nbsp; <kbd>d</kbd> del</span>
       </span>
+      <button class="judge-btn" id="judgeBtn" onclick="toggleTool()">LLM judge</button>
       <button class="add-btn" id="addBtn" disabled onclick="addHandRule()">+ Add Rule</button>
     </div>
     <div class="viewer-body" id="viewerBody">
@@ -946,343 +1017,33 @@ kbd {
     </div>
   </div>
 
-  <div class="panel-resizer" id="panelResizer" title="Drag to resize rules panel"></div>
+  <div class="panel-resizer" id="panelResizer" title="Drag to resize inspector"></div>
 
-  <!-- ── Rules panel ── -->
-  <div class="rules-panel">
-
-    <!-- annotator name -->
+  <!-- ── Inspector ── -->
+  <div class="insp-panel">
     <div class="name-bar">
       <label for="annotatorName">Annotator:</label>
-      <input id="annotatorName" class="name-input" placeholder="Your name"
-             oninput="saveName(this.value)">
+      <input id="annotatorName" class="name-input" placeholder="Your name" oninput="saveName(this.value)">
+      <button class="csv-btn" onclick="exportCSV()" title="Export rules as CSV">⬇ CSV</button>
     </div>
-
-    <!-- bulk action bar -->
-    <div class="bulk-bar" id="bulkBar">
-      <span class="bulk-count" id="bulkCount">0 selected</span>
-      <button class="bulk-btn danger" onclick="bulkDelete()">Delete</button>
-      <button class="bulk-btn" onclick="bulkMerge()">Merge</button>
-      <button class="bulk-btn" onclick="clearRuleSelection()">Clear</button>
+    <div class="inspector" id="inspector">
+      <div class="insp-empty">Select a file, then click a highlight or select text and press <b>+ Add Rule</b>.</div>
     </div>
-    <div class="rules-tools">
-      <input id="ruleSearch" class="rules-search" placeholder="Search hand + LLM rules or line:42"
-             oninput="onRuleSearchInput(this.value)">
-      <button class="bulk-btn" id="clearRuleSearchBtn" onclick="clearRuleSearch()" disabled>Clear</button>
-      <span class="rules-tools-count" id="rulesVisibleCount">0/0</span>
-    </div>
-
-    <!-- hand rules -->
-    <div class="rules-section hand-section">
-      <div class="section-head">
-        <span>Hand Rules</span>
-        <span class="section-count" id="handCount">0</span>
-        <button class="sel-all-btn" onclick="selectAll('hand')">select all</button>
-      </div>
-      <div class="rules-list" id="handRules">
-        <div class="empty-hint">Select text to add rules</div>
-      </div>
-    </div>
-
-    <!-- LLM section (two collapsible sub-sections) -->
-    <div class="rules-section llm-section">
-
-      <!-- ── Extract Rules ── -->
-      <div class="sub-head" onclick="toggleSub('extractBody','extractArrow')">
-        <span class="sub-arrow" id="extractArrow">▾</span>
-        <span>Extract Rules</span>
-        <span class="section-count" id="llmCount">0</span>
-        <button class="sel-all-btn" onclick="event.stopPropagation();selectAll('llm')">select all</button>
-      </div>
-      <div class="sub-body" id="extractBody">
-        <div class="llm-controls">
-          <div class="llm-row">
-            <select class="llm-model" id="extractModel">
-              <optgroup label="Perplexity">
-                <option value="sonar" selected>sonar</option>
-                <option value="sonar-pro">sonar-pro</option>
-                <option value="sonar-reasoning-pro">sonar-reasoning-pro</option>
-                <option value="sonar-deep-research">sonar-deep-research</option>
-              </optgroup>
-              <optgroup label="Anthropic (via Perplexity)">
-                <option value="anthropic/claude-haiku-4-5">claude-haiku-4-5</option>
-                <option value="anthropic/claude-sonnet-4-5">claude-sonnet-4-5</option>
-                <option value="anthropic/claude-sonnet-4-6">claude-sonnet-4-6</option>
-                <option value="anthropic/claude-opus-4-5">claude-opus-4-5</option>
-                <option value="anthropic/claude-opus-4-6">claude-opus-4-6</option>
-              </optgroup>
-              <optgroup label="OpenAI (via Perplexity)">
-                <option value="openai/gpt-5-mini">gpt-5-mini</option>
-                <option value="openai/gpt-5">gpt-5</option>
-                <option value="openai/gpt-5.1">gpt-5.1</option>
-                <option value="openai/gpt-5.4-mini">gpt-5.4-mini</option>
-                <option value="openai/gpt-5.4">gpt-5.4</option>
-                <option value="openai/gpt-5.5">gpt-5.5</option>
-              </optgroup>
-            </select>
-            <button class="run-btn" id="extractBtn" onclick="runExtraction()" disabled>Extract</button>
-          </div>
-          <div class="llm-row" style="justify-content:flex-end">
-            <button class="icon-btn" id="extractPromptToggle" onclick="toggleExtractPrompt(event)">Hide prompt</button>
-          </div>
-          <div class="extract-prompt-wrap" id="extractPromptWrap">
-          <textarea class="llm-prompt" id="extractPrompt"
-            placeholder="Describe what to extract…">Extract all rule-like spans from this file for enforceability analysis.
-
-A rule is any instruction, constraint, prohibition, or requirement given to an LLM or agent. Prefer rules that are specific and potentially checkable — for example:
-- version or toolchain requirements ("Python 3.13.2 or compatible")
-- file or artifact requirements ("log changes in CHANGELOG.md")
-- workflow ordering constraints ("always follow this chain, never skip layers")
-- code style or format mandates ("follow PEP 8")
-- procedural gates ("read all memory bank files at the start of every task")
-- naming, header, or metadata requirements ("bump @version in the userscript header")
-
-Prefer exact or near-exact quotes from the file. Extract each independently enforceable clause as its own rule — do not merge unrelated requirements. Skip purely motivational or explanatory text with no checkable obligation.
-
-Return only a valid JSON array. Each element:
-{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</textarea>
-          </div>
-          <div class="llm-row">
-            <span class="llm-status" id="extractStatus"></span>
-            <button class="icon-btn" id="clearExtractBtn" onclick="clearExtraction()" disabled style="margin-left:auto">Clear LLM</button>
-          </div>
-        </div>
-        <div class="rules-list" id="llmRules">
-          <div class="empty-hint">Run extraction to find rules</div>
-        </div>
-      </div>
-
-      <!-- ── Classify Rule ── -->
-      <div class="sub-head" onclick="toggleSub('classifyBody','classifyArrow')">
-        <span class="sub-arrow" id="classifyArrow">▾</span>
-        <span>Classify Rule</span>
-      </div>
-      <div class="sub-body" id="classifyBody">
-      <div class="llm-controls">
-        <div class="llm-row">
-          <select class="llm-model" id="llmModel">
-            <optgroup label="Perplexity">
-              <option value="sonar">sonar</option>
-              <option value="sonar-pro">sonar-pro</option>
-              <option value="sonar-reasoning-pro">sonar-reasoning-pro</option>
-              <option value="sonar-deep-research">sonar-deep-research</option>
-            </optgroup>
-            <optgroup label="Anthropic (via Perplexity)">
-              <option value="anthropic/claude-haiku-4-5">claude-haiku-4-5</option>
-              <option value="anthropic/claude-sonnet-4-5">claude-sonnet-4-5</option>
-              <option value="anthropic/claude-sonnet-4-6" selected>claude-sonnet-4-6</option>
-              <option value="anthropic/claude-opus-4-5">claude-opus-4-5</option>
-              <option value="anthropic/claude-opus-4-6">claude-opus-4-6</option>
-              <option value="anthropic/claude-opus-4-7">claude-opus-4-7</option>
-              <option value="anthropic/claude-opus-4-8">claude-opus-4-8</option>
-            </optgroup>
-            <optgroup label="OpenAI (via Perplexity)">
-              <option value="openai/gpt-5-mini">gpt-5-mini</option>
-              <option value="openai/gpt-5">gpt-5</option>
-              <option value="openai/gpt-5.1">gpt-5.1</option>
-              <option value="openai/gpt-5.4-mini">gpt-5.4-mini</option>
-              <option value="openai/gpt-5.4">gpt-5.4</option>
-              <option value="openai/gpt-5.5">gpt-5.5</option>
-            </optgroup>
-          </select>
-          <button class="run-btn" id="runBtn" onclick="runLLM()" disabled>Classify Rule</button>
-        </div>
-        <textarea class="llm-prompt" id="llmPrompt"
-          placeholder="Describe what to extract…"
-          oninput="updateRunBtn()">You are classifying rules from LLM system prompts according to whether and how they can be deterministically enforced.
-
-A "rule" is a natural-language instruction, constraint, prohibition, or requirement given to an LLM or agent. Your task is not to judge whether the rule is good, but to determine what would be needed to enforce it outside the model.
-
-Classify each rule independently. Do not let surrounding rules make a vague rule enforceable unless the needed definition is explicitly present in the provided context.
-
-Classify the following rule:
-
-RULE: {rule text}
-
-OPTIONAL CONTEXT:
-{insert surrounding prompt, repo context, tool list, or project assumptions here}
-
-Use the taxonomy below.
-
-## 1. Prerequisite information
-
-Classify what information is needed to enforce the rule.
-
-Choose one or more:
-
-* `none`: The rule can be checked without external context.
-* `static_prompt_context`: The rule depends only on the prompt text or declared policy text.
-* `session_state`: The rule depends on current conversation/session state.
-* `repo_state`: The rule depends on files, directory structure, package configuration, git state, or project metadata.
-* `runtime_state`: The rule depends on process state, command results, environment variables, logs, network state, or tool outputs.
-* `external_policy_state`: The rule depends on settings outside the repo/session, such as GitHub branch protection, PR settings, deployment rules, organization policy, or access-control state.
-* `learned_project_knowledge`: The rule depends on project conventions, architecture, naming schemes, or "how this codebase works" knowledge that is not explicitly represented.
-* `user_defined_terms`: The rule contains terms that need user definition before enforcement, such as "important," "safe," "appropriate," "large," "production," "sensitive," or "simple."
-* `generated_information`: Enforcing the rule requires deriving or generating additional facts, summaries, plans, classifications, or semantic labels.
-* `pre_action_procedure`: Enforcing the rule requires running a procedure before an action, such as tests, search, dependency analysis, approval lookup, or impact analysis.
-* `self_referential_or_open_ended`: The rule refers to broad, evolving, or self-referential knowledge such as "follow all project conventions," "use best practices," or "respect prior decisions."
-
-For each selected prerequisite, explain briefly what information is required.
-
-## 2. Enforcement mechanism
-
-Classify what kind of checker could enforce the rule.
-
-Choose one primary mechanism and any secondary mechanisms:
-
-* `literal_match`: Exact string, token, filename, command, or value matching.
-* `regex`: Regular-expression matching.
-* `schema_or_type_check`: JSON schema, API schema, type system, config schema, or static structural validation.
-* `linter_or_static_analysis`: Code linter, AST check, dependency check, import check, or static program analysis.
-* `bash_or_script`: Shell command, script, grep, git command, filesystem inspection, test command, or CI check.
-* `unit_or_integration_test`: Deterministic test execution.
-* `policy_engine`: Declarative rule engine, access-control engine, Datalog, OPA/Rego, SQL query, or provenance/data-flow checker.
-* `runtime_monitor`: Post-execution monitor over logs, tool calls, filesystem changes, network calls, or process behavior.
-* `human_review_gate`: Requires human judgment or approval.
-* `llm_judge`: Requires semantic interpretation by an LLM or other learned model.
-* `other`: other system/software mechanism that could enforce this rule
-* `not_enforceable_deterministically`: Cannot be reliably enforced with deterministic machinery as stated.
-
-Explain why the chosen mechanism is sufficient or insufficient.
-
-## 3. Enforcement trigger / location
-
-Classify when or where enforcement should happen.
-
-Choose one or more:
-
-* `session_init`: Before the agent starts; e.g., load rules, check environment, read repo state.
-* `settings_or_config`: At configuration time; e.g., settings.json, policy file, repo config, CI config.
-* `pre_action_gate`: Before a tool call, shell command, file edit, API call, commit, PR, deployment, or message send.
-* `intermediate_output`: While the agent is producing plans, summaries, code patches, or partial results.
-* `post_exec`: After a command/tool/action executes, checking effects or logs.
-* `verify_gate`: Before declaring success, merging, submitting, deploying, or finalizing.
-* `final_output`: Before the final answer is shown to the user.
-
-Explain the earliest reliable trigger and the latest safe trigger.
-
-## 4. Ambiguity
-
-Assess the ambiguity of the rule.
-
-Choose one:
-
-* `none`: Fully specified and directly checkable.
-* `low`: Minor assumptions needed; likely enforceable after normalizing terms.
-* `medium`: Important terms or thresholds need definition.
-* `high`: Rule relies heavily on intent, judgment, project conventions, or unstated context.
-* `not_actionable`: Too vague to enforce as written.
-
-Then list:
-
-* ambiguous terms
-* missing thresholds or definitions
-* assumptions an enforcer would need
-* questions to ask the user to make the rule enforceable
-
-## 5. Deterministic enforceability
-
-Classify the rule's deterministic enforceability.
-
-Choose one:
-
-* `deterministically_enforceable_as_written`
-* `deterministically_enforceable_with_context`
-* `deterministically_enforceable_after_rewrite`
-* `partially_enforceable`
-* `requires_llm_or_human_judgment`
-* `not_enforceable`
-
-Explain the classification.
-
-## 6. Suggested enforceable rewrite
-
-Rewrite the rule into one or more enforceable rules.
-
-Prefer rules that are:
-
-* observable
-* checkable
-* scoped to a specific trigger
-* explicit about required inputs
-* explicit about pass/fail criteria
-
-If the original rule is vague, split it into:
-
-1. a deterministic core rule
-2. a semantic or human-review residual rule
-
-## Output format
-
-Return valid JSON with this structure:
-
-{
-"rule": "...",
-"summary": "...",
-"prerequisites": [
-{
-"type": "...",
-"details": "..."
-}
-],
-"enforcement_mechanism": {
-"primary": "...",
-"secondary": ["..."],
-"details": "..."
-},
-"trigger_location": {
-"recommended": ["..."],
-"earliest_reliable": "...",
-"latest_safe": "...",
-"details": "..."
-},
-"ambiguity": {
-"level": "...",
-"ambiguous_terms": ["..."],
-"missing_definitions": ["..."],
-"assumptions_needed": ["..."],
-"questions_for_user": ["..."]
-},
-"deterministic_enforceability": {
-"classification": "...",
-"details": "..."
-},
-"suggested_enforceable_rewrite": {
-"deterministic_core": ["..."],
-"semantic_or_review_residual": ["..."]
-},
-"confidence": "low | medium | high"
-}</textarea>
-        <div class="llm-row" style="gap:5px">
-          <button class="icon-btn" onclick="savePrompt()">💾 Save</button>
-          <button class="icon-btn" id="historyBtn" onclick="toggleHistory()">🕑 History</button>
-          <button class="icon-btn" id="clearRunBtn" onclick="clearLastRun()" disabled style="margin-left:auto">Clear run</button>
-        </div>
-        <div class="prompt-history" id="promptHistory"></div>
-        <div class="llm-row">
-          <span class="llm-status" id="llmStatus"></span>
-        </div>
-      </div>
-      <div class="classif-result" id="classifResult" style="display:none"></div>
-      <div class="rules-list" id="classifyRulesHint">
-        <div class="empty-hint">Run the LLM to extract rules</div>
-      </div>
-    </div>
-
     <div class="kb-bar">
       <span><kbd>⌘↵</kbd> add</span>
       <span><kbd>j</kbd><kbd>k</kbd> nav</span>
-      <span><kbd>n</kbd> note</span>
       <span><kbd>d</kbd> del</span>
-      <span><kbd>x</kbd> select</span>
-      <span><kbd>↵</kbd> save note</span>
-      <span><kbd>Esc</kbd> cancel</span>
-      <button class="export-btn" onclick="exportCSV()" title="Export rules as CSV">⬇ CSV</button>
+      <span><kbd>Esc</kbd> clear</span>
     </div>
   </div>
 </div>
 
 <script>
+// ─── Constants ───────────────────────────────────────────────
+const DEFAULT_JUDGE = document.getElementById('defaultJudgePrompt').textContent.trim();
+const TAGS = ['PROHIBIT', 'OBLIGE', 'PERMIT', 'POWER'];
+const POWER_TYPES = ['norm', 'strategy'];
+
 // ─── State ───────────────────────────────────────────────────
 const S = {
   allFiles:      [],
@@ -1290,30 +1051,25 @@ const S = {
   rules:         [],
   selection:     null,
   focusedRuleId: null,
-  editingNoteId: null,
-  lastRunId:        null,
-  lastExtractRunId: null,
+  inspectorOpen: false,
   userName:      localStorage.getItem('annotatorName') || '',
-  selectedIds:   new Set(),
-  lastSelectedId: null,
-  ruleSearchQuery: '',
-  extractPromptCollapsed: localStorage.getItem('extractPromptCollapsed') === '1',
+  toolMode:      false,
+  judgeRunning:  false,
+  judgePrompt:   DEFAULT_JUDGE,
+  judgeModel:    'anthropic/claude-sonnet-4-6',
 };
-const RULES_PANEL_WIDTH_KEY = 'annotator.rulesPanelWidth';
-const RULES_PANEL_MIN = 280;
-const RULES_PANEL_MAX = 760;
+const INSP_WIDTH_KEY = 'annotator.inspPanelWidth';
+const INSP_MIN = 300, INSP_MAX = 720;
 
 // ─── Colour palette (per-extractor) ──────────────────────────
-// Each entry: bg, bdr (border), hov (hover bg), act (active bg), bg2 (tag bg)
 const COLORS = [
-  { bg:'rgba(245,158,11,.18)', bdr:'#f59e0b', hov:'rgba(245,158,11,.34)', act:'rgba(245,158,11,.52)', bg2:'rgba(245,158,11,.22)' },
-  { bg:'rgba(99,102,241,.17)', bdr:'#6366f1', hov:'rgba(99,102,241,.32)', act:'rgba(99,102,241,.48)', bg2:'rgba(99,102,241,.21)' },
-  { bg:'rgba(16,185,129,.17)', bdr:'#10b981', hov:'rgba(16,185,129,.32)', act:'rgba(16,185,129,.48)', bg2:'rgba(16,185,129,.21)' },
-  { bg:'rgba(239,68,68,.17)',  bdr:'#ef4444', hov:'rgba(239,68,68,.32)',  act:'rgba(239,68,68,.48)',  bg2:'rgba(239,68,68,.21)'  },
-  { bg:'rgba(236,72,153,.17)', bdr:'#ec4899', hov:'rgba(236,72,153,.32)', act:'rgba(236,72,153,.48)', bg2:'rgba(236,72,153,.21)' },
-  { bg:'rgba(14,165,233,.17)', bdr:'#0ea5e9', hov:'rgba(14,165,233,.32)', act:'rgba(14,165,233,.48)', bg2:'rgba(14,165,233,.21)' },
-  { bg:'rgba(168,85,247,.17)', bdr:'#a855f7', hov:'rgba(168,85,247,.32)', act:'rgba(168,85,247,.48)', bg2:'rgba(168,85,247,.21)' },
-  { bg:'rgba(251,146,60,.17)', bdr:'#fb923c', hov:'rgba(251,146,60,.32)', act:'rgba(251,146,60,.48)', bg2:'rgba(251,146,60,.21)' },
+  { bg:'rgba(245,158,11,.20)', bdr:'#f59e0b', hov:'rgba(245,158,11,.36)', act:'rgba(245,158,11,.54)' },
+  { bg:'rgba(99,102,241,.19)', bdr:'#6366f1', hov:'rgba(99,102,241,.34)', act:'rgba(99,102,241,.50)' },
+  { bg:'rgba(16,185,129,.19)', bdr:'#10b981', hov:'rgba(16,185,129,.34)', act:'rgba(16,185,129,.50)' },
+  { bg:'rgba(239,68,68,.19)',  bdr:'#ef4444', hov:'rgba(239,68,68,.34)',  act:'rgba(239,68,68,.50)'  },
+  { bg:'rgba(236,72,153,.19)', bdr:'#ec4899', hov:'rgba(236,72,153,.34)', act:'rgba(236,72,153,.50)' },
+  { bg:'rgba(14,165,233,.19)', bdr:'#0ea5e9', hov:'rgba(14,165,233,.34)', act:'rgba(14,165,233,.50)' },
+  { bg:'rgba(168,85,247,.19)', bdr:'#a855f7', hov:'rgba(168,85,247,.34)', act:'rgba(168,85,247,.50)' },
 ];
 const _cc = {};
 function colorFor(name) {
@@ -1323,124 +1079,98 @@ function colorFor(name) {
   for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return (_cc[name] = COLORS[h % COLORS.length]);
 }
-function cssVars(col) {
-  return `--hl-bg:${col.bg};--hl-bdr:${col.bdr};--hl-hov:${col.hov};--hl-act:${col.act}`;
-}
-function rcVars(col) {
-  return `--rc-bdr:${col.bdr};--rc-bg:${col.bg};--rc-hov:${col.hov};--rc-act:${col.act};--rc-bg2:${col.bg2}`;
-}
-
+function rcVars(col) { return `--rc-bdr:${col.bdr};--rc-bg:${col.bg}`; }
+function extractorOf(r) { return r.extracted_by || (r.source === 'hand' ? S.userName : r.source) || '?'; }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
-function maxRulesWidth() {
+// blend rgba backgrounds — more overlap → more opaque
+function parseRgba(s) {
+  const m = s.match(/rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),?\s*(\d*\.?\d+)?\)/);
+  return m ? [+m[1], +m[2], +m[3], m[4] !== undefined ? +m[4] : 1] : [200, 200, 220, 0.18];
+}
+function blendBgs(bgs) {
+  if (bgs.length === 1) return bgs[0];
+  const vals = bgs.map(parseRgba);
+  const r = Math.round(vals.reduce((s, v) => s + v[0], 0) / vals.length);
+  const g = Math.round(vals.reduce((s, v) => s + v[1], 0) / vals.length);
+  const b = Math.round(vals.reduce((s, v) => s + v[2], 0) / vals.length);
+  const baseA = vals.reduce((s, v) => s + v[3], 0) / vals.length;
+  const a = Math.min(0.7, baseA * Math.sqrt(bgs.length));
+  return `rgba(${r},${g},${b},${a.toFixed(2)})`;
+}
+
+// ─── Resizable inspector panel ───────────────────────────────
+function setInspWidth(px, save=true) {
   const layout = document.querySelector('.layout');
   const filePanel = document.querySelector('.file-panel');
-  if (!layout || !filePanel) return RULES_PANEL_MAX;
-  const minViewerWidth = 340;
-  const resizerWidth = 8;
-  const available = Math.floor(layout.clientWidth - filePanel.clientWidth - minViewerWidth - resizerWidth);
-  return Math.max(RULES_PANEL_MIN, Math.min(RULES_PANEL_MAX, available));
+  const maxW = layout && filePanel
+    ? Math.max(INSP_MIN, Math.min(INSP_MAX, layout.clientWidth - filePanel.clientWidth - 340 - 8))
+    : INSP_MAX;
+  const width = clamp(Math.round(px), INSP_MIN, maxW);
+  document.documentElement.style.setProperty('--insp-panel-width', `${width}px`);
+  if (save) localStorage.setItem(INSP_WIDTH_KEY, String(width));
 }
-
-function setRulesPanelWidth(px, save=true) {
-  const width = clamp(Math.round(px), RULES_PANEL_MIN, maxRulesWidth());
-  document.documentElement.style.setProperty('--rules-panel-width', `${width}px`);
-  if (save) localStorage.setItem(RULES_PANEL_WIDTH_KEY, String(width));
-}
-
-function initResizableRulesPanel() {
-  const saved = parseInt(localStorage.getItem(RULES_PANEL_WIDTH_KEY) || '', 10);
-  if (!Number.isNaN(saved)) setRulesPanelWidth(saved, false);
-  else setRulesPanelWidth(420, false);
-
+function initResizablePanel() {
+  const saved = parseInt(localStorage.getItem(INSP_WIDTH_KEY) || '', 10);
+  setInspWidth(Number.isNaN(saved) ? 420 : saved, false);
   const resizer = document.getElementById('panelResizer');
   const layout = document.querySelector('.layout');
   if (!resizer || !layout) return;
-
-  function onMove(e) {
-    const rect = layout.getBoundingClientRect();
-    setRulesPanelWidth(rect.right - e.clientX);
+  function onMove(e) { setInspWidth(layout.getBoundingClientRect().right - e.clientX); }
+  function stop() {
+    document.body.classList.remove('resizing'); resizer.classList.remove('active');
+    window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', stop);
   }
-  function stopResize() {
-    document.body.classList.remove('resizing');
-    resizer.classList.remove('active');
-    window.removeEventListener('mousemove', onMove);
-    window.removeEventListener('mouseup', stopResize);
-  }
-  resizer.addEventListener('mousedown', (e) => {
-    e.preventDefault();
-    document.body.classList.add('resizing');
-    resizer.classList.add('active');
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', stopResize);
-  });
-  window.addEventListener('resize', () => {
-    const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--rules-panel-width') || '', 10);
-    if (!Number.isNaN(current)) setRulesPanelWidth(current, false);
+  resizer.addEventListener('mousedown', e => {
+    e.preventDefault(); document.body.classList.add('resizing'); resizer.classList.add('active');
+    window.addEventListener('mousemove', onMove); window.addEventListener('mouseup', stop);
   });
 }
 
 // ─── Boot ────────────────────────────────────────────────────
 async function init() {
   document.getElementById('annotatorName').value = S.userName;
-  initResizableRulesPanel();
-  updateRunBtn();
-  loadPromptHistory();
-  updateExtractPromptUI();
+  initResizablePanel();
+  const settings = await api('/api/settings');
+  if (settings && !settings.error) {
+    // llm_judge_prompt is the unified extract+tag+rationale prompt (new key so
+    // the older standalone judge/extract prompts don't override the default).
+    if (settings.llm_judge_prompt) S.judgePrompt = settings.llm_judge_prompt;
+    if (settings.judge_model)      S.judgeModel  = settings.judge_model;
+  }
   const files = await api('/api/files');
-  if (files.error) { setStatus(files.error,'error'); return; }
+  if (files.error) { return; }
   S.allFiles = files;
   document.getElementById('fileCountLabel').textContent = files.length;
   renderFileList(files);
 }
 
-// ─── Name ────────────────────────────────────────────────────
 function saveName(v) {
   S.userName = v.trim();
   localStorage.setItem('annotatorName', S.userName);
 }
 
-function updateExtractPromptUI() {
-  const wrap = document.getElementById('extractPromptWrap');
-  const btn = document.getElementById('extractPromptToggle');
-  if (!wrap || !btn) return;
-  wrap.classList.toggle('collapsed', S.extractPromptCollapsed);
-  btn.textContent = S.extractPromptCollapsed ? 'Show prompt' : 'Hide prompt';
-}
-
-function toggleExtractPrompt(evt) {
-  evt?.stopPropagation();
-  S.extractPromptCollapsed = !S.extractPromptCollapsed;
-  localStorage.setItem('extractPromptCollapsed', S.extractPromptCollapsed ? '1' : '0');
-  updateExtractPromptUI();
-}
-
 // ─── File list ───────────────────────────────────────────────
 function renderFileList(files) {
   const el = document.getElementById('fileList');
-  if (!files.length) { el.innerHTML = '<div class="empty-hint">No files</div>'; return; }
-  // Get global index by id
+  if (!files.length) { el.innerHTML = '<div class="insp-empty">No files</div>'; return; }
   const idxMap = {};
-  S.allFiles.forEach((f,i) => idxMap[f.id] = i+1);
+  S.allFiles.forEach((f, i) => idxMap[f.id] = i + 1);
   el.innerHTML = files.map(f => {
-    const name = f.repo_name
-      ? f.repo_name.split('/').pop()
-      : (f.source_url||f.id).split('/').pop() || f.id;
-    const hCol = f.hand_count ? colorFor(S.userName || 'hand') : null;
-    const lCol = f.llm_count  ? colorFor(document.getElementById('llmModel').value) : null;
-    const badges = [
-      hCol ? `<span class="badge" style="background:${hCol.bg2};color:${hCol.bdr}">✎ ${f.hand_count}</span>` : '',
-      lCol ? `<span class="badge" style="background:${lCol.bg2};color:${lCol.bdr}">⚡ ${f.llm_count}</span>`  : '',
-    ].filter(Boolean).join('');
+    const name = f.repo_name ? f.repo_name.split('/').pop()
+      : (f.source_url || f.id).split('/').pop() || f.id;
+    const total = (f.hand_count || 0) + (f.llm_count || 0);
+    const col = total ? colorFor(S.userName || 'hand') : null;
+    const badge = col ? `<span class="badge" style="background:${col.bg};color:${col.bdr}">✎ ${total}</span>` : '';
     const active = S.currentFile?.id === f.id ? ' active' : '';
     return `<div class="file-item${active}" id="fi-${f.id}" onclick="selectFile('${f.id}')">
-      <div class="file-idx">${idxMap[f.id]||'?'}</div>
+      <div class="file-idx">${idxMap[f.id] || '?'}</div>
       <div class="file-info">
-        <div class="file-name" title="${esc(f.source_url||f.id)}">${esc(name)}</div>
+        <div class="file-name" title="${esc(f.source_url || f.id)}">${esc(name)}</div>
         <div class="file-meta">
-          <span>${esc(f.file_type||'—')}</span>
+          <span>${esc(f.file_type || '—')}</span>
           <span>${fmtSize(f.content_len)}</span>
-          ${badges}
+          ${badge}
         </div>
       </div>
     </div>`;
@@ -1448,241 +1178,160 @@ function renderFileList(files) {
 }
 
 function filterFiles(q) {
-  q = q.toLowerCase();
+  q = (q || '').toLowerCase();
   renderFileList(q
     ? S.allFiles.filter(f =>
-        (f.repo_name||'').toLowerCase().includes(q) ||
-        (f.source_url||'').toLowerCase().includes(q) ||
-        (f.file_type||'').toLowerCase().includes(q))
+        (f.repo_name || '').toLowerCase().includes(q) ||
+        (f.source_url || '').toLowerCase().includes(q) ||
+        (f.file_type || '').toLowerCase().includes(q))
     : S.allFiles);
-}
-
-function getRuleLineRange(rule) {
-  const lsRaw = rule.line_start;
-  const leRaw = rule.line_end != null ? rule.line_end : rule.line_start;
-  const hasLineRange = lsRaw != null && lsRaw !== '' && leRaw != null && leRaw !== '';
-  const ls = Number(lsRaw);
-  const le = Number(leRaw);
-  if (hasLineRange && Number.isFinite(ls) && Number.isFinite(le)) {
-    const start = Math.max(1, Math.min(ls, le));
-    const end = Math.max(start, Math.max(ls, le));
-    return [start, end];
-  }
-  if (rule.char_start == null || !S.currentFile?.content) return null;
-  const cs = Number(rule.char_start);
-  const ce = Number(rule.char_end != null ? rule.char_end : rule.char_start);
-  if (!Number.isFinite(cs) || !Number.isFinite(ce)) return null;
-  const content = S.currentFile.content;
-  const a = Math.max(0, Math.min(content.length, Math.min(cs, ce)));
-  const b = Math.max(0, Math.min(content.length, Math.max(cs, ce)));
-  const start = content.slice(0, a).split('\n').length;
-  const end = content.slice(0, b).split('\n').length;
-  return [start, Math.max(start, end)];
-}
-
-function lineRuleMatches(rule, lineNo) {
-  const range = getRuleLineRange(rule);
-  if (!range) return false;
-  return lineNo >= range[0] && lineNo <= range[1];
-}
-
-function parseLineQuery(q) {
-  const s = (q || '').trim().toLowerCase();
-  if (!s) return null;
-  const m = s.match(/^(?:line|l)\s*[:#]?\s*(\d+)$/) || s.match(/^#(\d+)$/) || s.match(/^(\d+)$/);
-  if (!m) return null;
-  const lineNo = parseInt(m[1], 10);
-  return Number.isFinite(lineNo) && lineNo > 0 ? lineNo : null;
-}
-
-function ruleMatchesSearch(rule, q) {
-  const needle = (q || '').trim().toLowerCase();
-  if (!needle) return true;
-  const lineNo = parseLineQuery(needle);
-  if (lineNo != null) return lineRuleMatches(rule, lineNo);
-  const hay = [
-    rule.rule_text || '',
-    rule.notes || '',
-    rule.extracted_by || '',
-    rule.source || '',
-  ].join('\n').toLowerCase();
-  return hay.includes(needle);
-}
-
-function getVisibleRules() {
-  const q = S.ruleSearchQuery;
-  if (!q || !q.trim()) return S.rules;
-  return S.rules.filter(r => ruleMatchesSearch(r, q));
-}
-
-function setRuleSearchQuery(value, focusInput=false) {
-  const q = value || '';
-  S.ruleSearchQuery = q;
-  const input = document.getElementById('ruleSearch');
-  if (input && input.value !== q) input.value = q;
-  if (focusInput && input) input.focus();
-}
-
-function applyLineSearch(lineNo) {
-  const n = Number(lineNo);
-  if (!Number.isFinite(n) || n < 1) return;
-  setRuleSearchQuery(`line:${n}`);
-  renderViewer();
-  renderRulesPanel();
-}
-
-function onRuleSearchInput(v) {
-  setRuleSearchQuery(v || '');
-  renderRulesPanel();
-  renderViewer();
-}
-
-function clearRuleSearch() {
-  setRuleSearchQuery('', true);
-  renderRulesPanel();
-  renderViewer();
-}
-
-function lineNumberClick(lineNo, evt) {
-  evt?.stopPropagation();
-  clearSelection();
-  applyLineSearch(lineNo);
 }
 
 // ─── Select file ─────────────────────────────────────────────
 async function selectFile(id) {
+  if (S.judgeRunning) return;   // locked while a judge run is in flight
   const [file, rules] = await Promise.all([
     api(`/api/file/${id}`), api(`/api/rules/${id}`),
   ]);
-  if (file.error) { setStatus(file.error,'error'); return; }
+  if (file.error) return;
   S.currentFile = file; S.rules = rules;
-  S.selection = null; S.focusedRuleId = null; S.editingNoteId = null; S.selectedIds.clear();
-  S.lastExtractRunId = null;
-  setRuleSearchQuery('');
-  document.getElementById('runBtn').disabled = false;
-  document.getElementById('extractBtn').disabled = false;
+  S.selection = null; S.focusedRuleId = null; S.toolMode = false; S.inspectorOpen = false;
   document.getElementById('addBtn').disabled = true;
+  document.getElementById('judgeBtn').classList.remove('active');
   setSelInfo(null);
   renderFileList(S.allFiles);
   renderViewerHead(file);
   renderViewer();
-  renderRulesPanel();
+  renderRightPanel();
+  renderJudgeModal();   // close the judge modal if it was open
 }
 
-// ─── Viewer ──────────────────────────────────────────────────
 function renderViewerHead(file) {
   const title = file.repo_name
-    ? `${file.repo_name}  /  ${(file.source_url||'').split('/').pop()}`
-    : (file.source_url||file.id).split('/').pop();
+    ? `${file.repo_name}  /  ${(file.source_url || '').split('/').pop()}`
+    : (file.source_url || file.id).split('/').pop();
   document.getElementById('viewerHead').innerHTML = `
-    <span class="viewer-title" title="${esc(file.source_url||'')}">${esc(title)}</span>
+    <span class="viewer-title" title="${esc(file.source_url || '')}">${esc(title)}</span>
     ${file.source_url ? `<a href="${esc(file.source_url)}" target="_blank">↗ source</a>` : ''}
     <span style="font-size:11px;color:#aaa;flex-shrink:0">${fmtSize(file.content_len)}</span>
   `;
 }
 
+// ─── Char ranges ─────────────────────────────────────────────
+function getRuleCharRange(rule) {
+  const content = S.currentFile?.content;
+  if (!content) return null;
+  const cs = rule.char_start, ce = rule.char_end;
+  if (cs != null && cs !== '' && ce != null && ce !== '') {
+    const a = Number(cs), b = Number(ce);
+    if (Number.isFinite(a) && Number.isFinite(b) && b > a)
+      return [clamp(Math.min(a, b), 0, content.length), clamp(Math.max(a, b), 0, content.length)];
+  }
+  // fallback: derive from line range
+  const lsRaw = rule.line_start;
+  if (lsRaw == null || lsRaw === '') return null;
+  const leRaw = rule.line_end != null && rule.line_end !== '' ? rule.line_end : lsRaw;
+  const ls = Math.max(1, Number(lsRaw)), le = Math.max(ls, Number(leRaw));
+  if (!Number.isFinite(ls) || !Number.isFinite(le)) return null;
+  const lines = content.split('\n');
+  let off = 0;
+  for (let i = 0; i < ls - 1 && i < lines.length; i++) off += lines[i].length + 1;
+  const start = off;
+  let end = off;
+  for (let i = ls - 1; i < le && i < lines.length; i++) end += lines[i].length + 1;
+  end = Math.min(end, content.length);
+  return [start, Math.max(start, end)];
+}
+
+// ─── Viewer (document or tool) ───────────────────────────────
 function renderViewer() {
   const body = document.getElementById('viewerBody');
-  if (!S.currentFile) {
-    body.innerHTML = '<div class="viewer-empty">← pick a file</div>'; return;
-  }
+  if (!S.currentFile) { body.innerHTML = '<div class="viewer-empty">← pick a file</div>'; return; }
+
   const content = S.currentFile.content;
-  const lineCount = (content.match(/\n/g)||[]).length + 1;
-  const searchLine = parseLineQuery(S.ruleSearchQuery);
-  const lineNums = Array.from({length:lineCount}, (_,i) => {
-    const lineNo = i + 1;
-    const active = searchLine === lineNo ? ' active' : '';
-    return `<span class="line-num${active}" onclick="lineNumberClick(${lineNo}, event)">${lineNo}</span>`;
-  }).join('');
+  const lineCount = (content.match(/\n/g) || []).length + 1;
+  const lineNums = Array.from({ length: lineCount }, (_, i) =>
+    `<span class="line-num">${i + 1}</span>`).join('');
   body.innerHTML = `
     <div class="line-nums">${lineNums}</div>
-    <pre class="content-pre" id="contentPre"></pre>
-  `;
-  document.getElementById('contentPre').innerHTML =
-    renderLines(content, S.rules);
+    <pre class="content-pre" id="contentPre"></pre>`;
+  document.getElementById('contentPre').innerHTML = renderContent(content, S.rules);
   const pre = document.getElementById('contentPre');
   pre.addEventListener('mouseup', onViewerMouseUp);
+  pre.addEventListener('click', e => {
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;   // text selection handled on mouseup
+    const span = e.target.closest?.('.rule-hl');
+    if (span) focusSpan(span);
+  });
   pre.addEventListener('mouseover', e => {
-    const el = e.target.closest?.('.line-hl[data-rids]');
-    if (el && el.dataset.rids.split(',').every(id => id !== S.focusedRuleId))
-      el.style.background = el.dataset.hov;
+    const el = e.target.closest?.('.rule-hl');
+    if (el && !el.dataset.rids.split(',').includes(S.focusedRuleId)) el.style.background = el.dataset.hov;
   });
   pre.addEventListener('mouseout', e => {
-    const el = e.target.closest?.('.line-hl[data-rids]');
-    if (el && el.dataset.rids.split(',').every(id => id !== S.focusedRuleId))
-      el.style.background = el.dataset.bg;
+    const el = e.target.closest?.('.rule-hl');
+    if (el && !el.dataset.rids.split(',').includes(S.focusedRuleId)) el.style.background = el.dataset.bg;
   });
 }
 
-// Parse "rgba(r,g,b,a)" → [r,g,b,a]
-function parseRgba(s) {
-  const m = s.match(/rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),?\s*(\d*\.?\d+)?\)/);
-  return m ? [+m[1], +m[2], +m[3], m[4] !== undefined ? +m[4] : 1] : [200, 200, 220, 0.18];
-}
-// Blend multiple rgba strings — higher overlap → more opaque
-function blendBgs(bgs) {
-  if (bgs.length === 1) return bgs[0];
-  const vals = bgs.map(parseRgba);
-  const r = Math.round(vals.reduce((s, v) => s + v[0], 0) / vals.length);
-  const g = Math.round(vals.reduce((s, v) => s + v[1], 0) / vals.length);
-  const b = Math.round(vals.reduce((s, v) => s + v[2], 0) / vals.length);
-  // opacity scales with sqrt of count so 2 overlaps ~= 1.4× opacity
-  const baseA = vals.reduce((s, v) => s + v[3], 0) / vals.length;
-  const a = Math.min(0.65, baseA * Math.sqrt(bgs.length));
-  return `rgba(${r},${g},${b},${a.toFixed(2)})`;
-}
-
-function renderLines(text, rules) {
-  const lines = text.split('\n');
-  const withPos = rules.filter(r => getRuleLineRange(r));
-  if (rules.length && !withPos.length)
-    console.warn('renderLines: have', rules.length, 'rules but none have line_start — no highlights');
-  const lineMap = new Map();
+// letter-based highlighting: segment text on every rule boundary
+function renderContent(content, rules) {
+  const ivs = [];
   for (const r of rules) {
-    const range = getRuleLineRange(r);
-    if (!range) continue;
-    const col = colorFor(r.extracted_by || (r.source === 'hand' ? S.userName : r.source) || '?');
-    const ls = range[0] - 1;
-    const le = Math.min(range[1] - 1, lines.length - 1);
-    for (let i = ls; i <= le; i++) {
-      if (!lineMap.has(i)) lineMap.set(i, []);
-      lineMap.get(i).push({ r, col });
-    }
+    const cr = getRuleCharRange(r);
+    if (!cr) continue;
+    ivs.push({ a: cr[0], b: cr[1], r, col: colorFor(extractorOf(r)) });
   }
-  return lines.map((line, idx) => {
-    const entries = lineMap.get(idx);
-    if (!entries || !entries.length) return escHtml(line) + '\n';
-    const rids  = entries.map(e => e.r.id).join(',');
-    // blend backgrounds; each extractor's color contributes equally
-    const bg  = blendBgs(entries.map(e => e.col.bg));
-    const hov = blendBgs(entries.map(e => e.col.hov));
-    const act = blendBgs(entries.map(e => e.col.act));
-    // inset box-shadow: one 3px bar per unique extractor (max 4), no text shift
-    const uniq = [...new Map(entries.map(e => [e.col.bdr, e.col])).values()];
-    const shadow = uniq.slice(0, 4).map((c, i) => `inset ${(i + 1) * 3}px 0 0 ${c.bdr}`).join(',');
-    const title = escAttr(entries.map(e => (e.r.extracted_by || e.r.source || '?') + ': ' + e.r.rule_text.slice(0, 60)).join(' | '));
-    return `<span class="line-hl" data-line="${idx+1}" data-rids="${rids}" data-bg="${bg}" data-hov="${hov}" data-act="${act}"` +
-      ` style="background:${bg};box-shadow:${shadow}"` +
-      ` title="${title}">${escHtml(line)}</span>\n`;
-  }).join('');
+  if (!ivs.length) return escHtml(content);
+  const pts = new Set([0, content.length]);
+  for (const iv of ivs) { pts.add(iv.a); pts.add(iv.b); }
+  const sorted = [...pts].filter(p => p >= 0 && p <= content.length).sort((x, y) => x - y);
+  let html = '';
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const p = sorted[i], q = sorted[i + 1];
+    if (q <= p) continue;
+    const seg = content.slice(p, q);
+    const cover = ivs.filter(iv => iv.a <= p && iv.b >= q);
+    if (!cover.length) { html += escHtml(seg); continue; }
+    const rids = cover.map(c => c.r.id);
+    const bg = blendBgs(cover.map(c => c.col.bg));
+    const hov = blendBgs(cover.map(c => c.col.hov));
+    const act = blendBgs(cover.map(c => c.col.act));
+    const focused = rids.includes(S.focusedRuleId);
+    const title = escAttr(cover.map(c => extractorOf(c.r) + ': ' + c.r.rule_text.slice(0, 60)).join(' | '));
+    html += `<span class="rule-hl${focused ? ' focused' : ''}" data-rids="${rids.join(',')}"`
+      + ` data-bg="${bg}" data-hov="${hov}" data-act="${act}"`
+      + ` style="background:${focused ? act : bg}" title="${title}">${escHtml(seg)}</span>`;
+  }
+  return html;
 }
 
-// ─── Text selection ──────────────────────────────────────────
-function onViewerMouseUp() {
+// ─── Text selection / click-to-focus ─────────────────────────
+function onViewerMouseUp(e) {
   const pre = document.getElementById('contentPre');
   if (!pre) return;
-  const lineNo = getCollapsedSelectionLineNo(pre);
-  if (lineNo != null) {
-    clearSelection();
-    applyLineSearch(lineNo);
+  const sel = window.getSelection();
+  if (sel && sel.isCollapsed) {
+    const span = e.target.closest?.('.rule-hl');
+    if (span) focusSpan(span);
+    else clearSelection();
     return;
   }
   const offsets = getSelectionOffsets(pre);
   if (!offsets) { clearSelection(); return; }
   S.selection = offsets;
-  const preview = offsets.text.slice(0,55).replace(/\s+/g,' ');
-  setSelInfo(`"${preview}${offsets.text.length>55?'…':''}" (${offsets.end-offsets.start} chars) — <kbd>⌘↵</kbd>`);
+  const preview = offsets.text.slice(0, 55).replace(/\s+/g, ' ');
+  setSelInfo(`"${preview}${offsets.text.length > 55 ? '…' : ''}" (${offsets.end - offsets.start} chars) — <kbd>⌘↵</kbd>`);
   document.getElementById('addBtn').disabled = false;
+}
+
+function focusSpan(span) {
+  const rids = span.dataset.rids.split(',');
+  let id = rids[0];
+  const cur = rids.indexOf(S.focusedRuleId);
+  if (cur >= 0 && rids.length > 1) id = rids[(cur + 1) % rids.length];
+  clearSelection();
+  setFocusedRule(id);
 }
 
 function clearSelection() {
@@ -1694,7 +1343,7 @@ function clearSelection() {
 function setSelInfo(html) {
   const el = document.getElementById('selInfo');
   el.innerHTML = html || `<span class="kb">Select text then <kbd>⌘↵</kbd> to add &nbsp;·&nbsp;
-    <kbd>j</kbd><kbd>k</kbd> nav &nbsp;·&nbsp; <kbd>n</kbd> note &nbsp;·&nbsp; <kbd>d</kbd> del</span>`;
+    <kbd>j</kbd><kbd>k</kbd> nav &nbsp;·&nbsp; <kbd>d</kbd> del</span>`;
 }
 
 function boundaryOffset(container, node, offset) {
@@ -1703,18 +1352,6 @@ function boundaryOffset(container, node, offset) {
   r.setEnd(node, offset);
   return r.toString().length;
 }
-
-function getCollapsedSelectionLineNo(container) {
-  const sel = window.getSelection();
-  if (!sel || !sel.isCollapsed || !sel.rangeCount) return null;
-  const range = sel.getRangeAt(0);
-  if (!container.contains(range.startContainer)) return null;
-  const start = boundaryOffset(container, range.startContainer, range.startOffset);
-  if (!Number.isFinite(start) || !S.currentFile?.content) return null;
-  return S.currentFile.content.slice(0, start).split('\n').length;
-}
-
-// Robust offset using Range boundaries – handles mixed text/spans correctly
 function getSelectionOffsets(container) {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
@@ -1734,641 +1371,414 @@ async function addHandRule() {
   const content = S.currentFile.content;
   const line_start = content.slice(0, start).split('\n').length;
   const line_end   = content.slice(0, end).split('\n').length;
-
   const saved = await api('/api/rules', 'POST', {
     file_id: S.currentFile.id, rule_text: text.trim(),
     char_start: start, char_end: end, line_start, line_end,
     extracted_by: S.userName || 'unknown',
   });
-  if (saved.error) { setStatus(saved.error,'error'); return; }
-
+  if (saved.error) return;
   S.rules.push(saved);
   clearSelection();
   window.getSelection()?.removeAllRanges();
   renderViewer();
-  renderRulesPanel();
   refreshFileBadge(S.currentFile.id);
   setFocusedRule(saved.id);
-  setTimeout(() => openNoteEditor(saved.id), 60);
-}
-
-// ─── Rules panel ─────────────────────────────────────────────
-function renderRulesPanel() {
-  const visible = getVisibleRules();
-  const hasSearch = !!S.ruleSearchQuery.trim();
-  const searchLabel = hasSearch ? ` matching "${esc(S.ruleSearchQuery.trim())}"` : '';
-  const visibleIds = new Set(visible.map(r => r.id));
-  S.selectedIds = new Set([...S.selectedIds].filter(id => visibleIds.has(id)));
-  if (S.focusedRuleId && !visibleIds.has(S.focusedRuleId)) setFocusedRule(null);
-  if (S.lastSelectedId && !visibleIds.has(S.lastSelectedId)) S.lastSelectedId = null;
-  const hand = visible.filter(r => r.source === 'hand');
-  const llm  = visible.filter(r => r.source === 'llm');
-  document.getElementById('handCount').textContent = hand.length;
-  document.getElementById('llmCount').textContent  = llm.length;
-  document.getElementById('handRules').innerHTML = hand.length
-    ? hand.map(r => ruleCard(r)).join('')
-    : (hasSearch
-        ? `<div class="empty-hint">No hand rules${searchLabel}</div>`
-        : '<div class="empty-hint">Select text to add rules</div>');
-  document.getElementById('llmRules').innerHTML = llm.length
-    ? llm.map(r => ruleCard(r)).join('')
-    : (hasSearch
-        ? `<div class="empty-hint">No LLM rules${searchLabel}</div>`
-        : '<div class="empty-hint">Run the LLM to extract rules</div>');
-  document.getElementById('clearRuleSearchBtn').disabled = !S.ruleSearchQuery.trim();
-  document.getElementById('rulesVisibleCount').textContent = `${visible.length}/${S.rules.length}`;
-  updateBulkBar();
-  updateExtractClearButton();
-}
-
-function promoteRuleToSectionTop(id) {
-  const idx = S.rules.findIndex(r => r.id === id);
-  if (idx < 0) return false;
-  const src = S.rules[idx].source;
-  const firstInSection = S.rules.findIndex(r => r.source === src);
-  if (firstInSection < 0 || idx === firstInSection) return false;
-  const [rule] = S.rules.splice(idx, 1);
-  S.rules.splice(firstInSection, 0, rule);
-  return true;
-}
-
-function focusAndPromoteRule(id) {
-  if (promoteRuleToSectionTop(id)) renderRulesPanel();
-  focusRule(id);
-}
-
-function selectedLlmIds() {
-  const selected = new Set(S.selectedIds);
-  return S.rules
-    .filter(r => r.source === 'llm' && selected.has(r.id))
-    .map(r => r.id);
-}
-
-function focusedLlmId() {
-  const focused = S.rules.find(r => r.id === S.focusedRuleId);
-  return focused?.source === 'llm' ? focused.id : null;
-}
-
-function updateExtractClearButton() {
-  const btn = document.getElementById('clearExtractBtn');
-  if (!btn) return;
-  const selected = selectedLlmIds();
-  if (selected.length) {
-    btn.disabled = false;
-    btn.textContent = `Clear selected (${selected.length})`;
-    return;
-  }
-  const focusedId = focusedLlmId();
-  if (focusedId) {
-    btn.disabled = false;
-    btn.textContent = 'Clear focused';
-    return;
-  }
-  btn.disabled = !S.lastExtractRunId;
-  btn.textContent = 'Clear last run';
-}
-
-function ruleCard(r) {
-  const extractor = r.extracted_by || (r.source==='hand' ? S.userName : r.source) || '?';
-  const col    = colorFor(extractor);
-  const hasPos = r.char_start != null || r.line_start != null;
-  const pos    = r.line_start ? `L${r.line_start}${r.line_end&&r.line_end!==r.line_start?'–'+r.line_end:''}` : 'no position';
-  const preview = r.rule_text.slice(0,110).replace(/\s+/g,' ');
-  const focused = S.focusedRuleId === r.id ? ' focused' : '';
-  const hasNote = r.notes ? ' has-note' : '';
-  const sel = S.selectedIds.has(r.id) ? ' selected' : '';
-  return `<div class="rule-card${focused}${sel}${hasPos?'':' no-pos'}" id="rc-${r.id}"
-               style="${rcVars(col)}" onclick="ruleCardClick(event,'${r.id}')">
-    <label class="rule-checkbox" onclick="event.stopPropagation()">
-      <input type="checkbox" ${S.selectedIds.has(r.id)?'checked':''} onchange="toggleRuleSelect('${r.id}',this.checked,event)">
-    </label>
-    <div class="rule-body">
-      <div><span class="extractor-tag" style="${rcVars(col)}">${esc(extractor)}</span></div>
-      <div class="rule-preview">${esc(preview)}${r.rule_text.length>110?'…':''}</div>
-      <div class="rule-pos">${pos}</div>
-      ${r.notes ? `<div class="rule-note-text">${esc(r.notes)}</div>` : ''}
-      <div class="rule-note-editor" id="rne-${r.id}">
-        <textarea class="rule-note-input" id="rni-${r.id}" rows="2"
-          placeholder="Add a note… (Enter save, Esc cancel)"
-          onkeydown="noteKeyDown(event,'${r.id}')"
-        >${esc(r.notes||'')}</textarea>
-        <div class="note-hint"><kbd>↵</kbd> save &nbsp; <kbd>Esc</kbd> cancel</div>
-      </div>
-    </div>
-    <div class="rule-actions">
-      <button class="rule-btn note-btn${hasNote}" onclick="toggleNote(event,'${r.id}')" title="Note (n)">✎</button>
-      <button class="rule-btn del" onclick="deleteRule(event,'${r.id}')" title="Delete (d)">×</button>
-    </div>
-  </div>`;
 }
 
 // ─── Focus / navigation ──────────────────────────────────────
+function paintFocus() {
+  document.querySelectorAll('.rule-hl').forEach(el => {
+    const ids = el.dataset.rids.split(',');
+    const on = ids.includes(S.focusedRuleId);
+    el.style.background = on ? el.dataset.act : el.dataset.bg;
+    el.classList.toggle('focused', on);
+  });
+}
+
 function setFocusedRule(id) {
-  // Restore previous focused line highlights
-  if (S.focusedRuleId) {
-    document.querySelectorAll(`.line-hl[data-rids]`).forEach(el => {
-      if (el.dataset.rids.split(',').includes(S.focusedRuleId))
-        el.style.background = el.dataset.bg;
-    });
-  }
   S.focusedRuleId = id;
-  document.querySelectorAll('.rule-card').forEach(el => el.classList.remove('focused'));
+  if (id) S.inspectorOpen = true;     // selecting a rule opens its inspector
+  paintFocus();
+  renderRightPanel();
   if (id) {
-    const card = document.getElementById('rc-'+id);
-    card?.classList.add('focused');
-    card?.scrollIntoView({ behavior:'smooth', block:'nearest' });
-    document.querySelectorAll(`.line-hl[data-rids]`).forEach(el => {
-      if (el.dataset.rids.split(',').includes(id))
-        el.style.background = el.dataset.act;
-    });
-  }
-  updateExtractClearButton();
-}
-
-function focusRule(id) {
-  setFocusedRule(id);
-  const first = [...document.querySelectorAll('.line-hl[data-rids]')]
-    .find(el => el.dataset.rids.split(',').includes(id));
-  if (first) first.scrollIntoView({ behavior:'smooth', block:'center' });
-}
-
-function allRuleCards() { return [...document.querySelectorAll('.rule-card')]; }
-
-function moveFocus(delta) {
-  const cards = allRuleCards();
-  if (!cards.length) return;
-  const idx  = cards.findIndex(c => c.id === 'rc-'+S.focusedRuleId);
-  const next = cards[Math.max(0, Math.min(cards.length-1, idx+delta))];
-  if (next) focusRule(next.id.replace('rc-',''));
-}
-
-// ─── Notes ───────────────────────────────────────────────────
-function toggleNote(evt, id) {
-  evt.stopPropagation();
-  S.editingNoteId === id ? closeNoteEditor(id, false) : openNoteEditor(id);
-}
-function openNoteEditor(id) {
-  if (S.editingNoteId && S.editingNoteId !== id) closeNoteEditor(S.editingNoteId, false);
-  setFocusedRule(id); S.editingNoteId = id;
-  const ed = document.getElementById('rne-'+id);
-  const inp = document.getElementById('rni-'+id);
-  if (!ed||!inp) return;
-  ed.classList.add('open'); inp.focus();
-  inp.setSelectionRange(inp.value.length, inp.value.length);
-}
-function closeNoteEditor(id, save) {
-  const ed = document.getElementById('rne-'+id);
-  const inp = document.getElementById('rni-'+id);
-  if (!ed) return;
-  if (save && inp) saveNote(id, inp.value);
-  ed.classList.remove('open'); S.editingNoteId = null;
-}
-async function saveNote(id, text) {
-  const notes = text.trim() || null;
-  await api(`/api/rules/${id}`, 'PATCH', { notes });
-  const rule = S.rules.find(r => r.id === id);
-  if (rule) rule.notes = notes;
-  const card = document.getElementById('rc-'+id);
-  if (card) {
-    const wasOpen = S.editingNoteId === id;
-    const prevFocused = S.focusedRuleId;
-    card.outerHTML = ruleCard(rule);
-    S.focusedRuleId = prevFocused;
-    document.getElementById('rc-'+id)?.classList.toggle('focused', prevFocused === id);
-    if (wasOpen) S.editingNoteId = null;
+    const span = [...document.querySelectorAll('.rule-hl')]
+      .find(el => el.dataset.rids.split(',').includes(id));
+    span?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 }
-function noteKeyDown(evt, id) {
-  if (evt.key === 'Enter' && !evt.shiftKey) { evt.preventDefault(); closeNoteEditor(id, true); }
-  if (evt.key === 'Escape') { evt.preventDefault(); closeNoteEditor(id, false); }
-  evt.stopPropagation();
+
+// Right panel shows the rule LIST by default, or the single-rule inspector
+// once a rule is selected. The inspector's exit button returns to the list.
+function renderRightPanel() {
+  const r = S.rules.find(x => x.id === S.focusedRuleId);
+  if (S.inspectorOpen && r) renderInspector();
+  else renderRuleList();
 }
 
-// ─── Bulk selection ──────────────────────────────────────────
-function ruleCardClick(evt, id) {
-  if (evt.shiftKey && S.lastSelectedId) {
-    rangeSelect(S.lastSelectedId, id);
+function exitInspector() {
+  S.inspectorOpen = false;
+  paintFocus();
+  renderRuleList();
+}
+
+function renderRuleList() {
+  const el = document.getElementById('inspector');
+  if (!S.currentFile) {
+    el.innerHTML = `<div class="insp-empty">Select a file, then click a highlight or select text and press <b>+ Add Rule</b>.</div>`;
     return;
   }
-  focusAndPromoteRule(id);
-  S.lastSelectedId = id;
-}
-
-function rangeSelect(fromId, toId) {
-  const ids = allRuleCards().map(c => c.id.replace('rc-', ''));
-  const a = ids.indexOf(fromId), b = ids.indexOf(toId);
-  if (a === -1 || b === -1) return;
-  const [lo, hi] = a < b ? [a, b] : [b, a];
-  ids.slice(lo, hi + 1).forEach(rid => S.selectedIds.add(rid));
-  S.lastSelectedId = toId;
-  renderRulesPanel();
-}
-
-function toggleRuleSelect(id, checked, evt) {
-  if (evt?.shiftKey && S.lastSelectedId && checked) {
-    rangeSelect(S.lastSelectedId, id);
+  if (!S.rules.length) {
+    el.innerHTML = `<div class="insp-empty">No rules yet.<br><br>Select text in the document and press <b>+ Add Rule</b>, or open <b>LLM judge</b> and press <b>Run</b> to extract &amp; tag every rule.</div>`;
     return;
   }
-  checked ? S.selectedIds.add(id) : S.selectedIds.delete(id);
-  document.getElementById('rc-'+id)?.classList.toggle('selected', checked);
-  if (checked) S.lastSelectedId = id;
-  updateBulkBar();
-}
-
-function selectAll(source) {
-  getVisibleRules().filter(r => r.source === source).forEach(r => S.selectedIds.add(r.id));
-  renderRulesPanel();
-}
-
-function clearRuleSelection() {
-  S.selectedIds.clear();
-  renderRulesPanel();
-}
-
-function updateBulkBar() {
-  const n = S.selectedIds.size;
-  const bar = document.getElementById('bulkBar');
-  bar.classList.toggle('visible', n > 0);
-  document.getElementById('bulkCount').textContent = `${n} selected`;
-  updateExtractClearButton();
-}
-
-async function bulkDelete() {
-  if (!S.selectedIds.size) return;
-  const ids = [...S.selectedIds];
-  for (const id of ids) await api(`/api/rules/${id}`, 'DELETE');
-  S.rules = S.rules.filter(r => !ids.includes(r.id));
-  if (ids.includes(S.focusedRuleId)) S.focusedRuleId = null;
-  S.selectedIds.clear();
-  renderViewer(); renderRulesPanel();
-  refreshFileBadge(S.currentFile?.id);
-}
-
-async function bulkMerge() {
-  if (S.selectedIds.size < 2) return;
-  const ids = [...S.selectedIds];
-  const selected = S.rules.filter(r => ids.includes(r.id))
-    .sort((a, b) => (a.line_start||0) - (b.line_start||0));
-  const line_start = Math.min(...selected.map(r => r.line_start || 0).filter(Boolean));
-  const line_end   = Math.max(...selected.map(r => r.line_end   || 0).filter(Boolean));
-  const rule_text  = selected.map(r => r.rule_text).join('\n');
-  const saved = await api('/api/rules', 'POST', {
-    file_id: S.currentFile.id, rule_text,
-    char_start: null, char_end: null,
-    line_start: line_start || null, line_end: line_end || null,
-    extracted_by: S.userName || 'merged',
-  });
-  if (saved.error) { alert(saved.error); return; }
-  for (const id of ids) await api(`/api/rules/${id}`, 'DELETE');
-  S.rules = S.rules.filter(r => !ids.includes(r.id));
-  S.rules.push(saved);
-  S.selectedIds.clear();
-  renderViewer(); renderRulesPanel();
-  refreshFileBadge(S.currentFile?.id);
-  setFocusedRule(saved.id);
-}
-
-// ─── Delete ──────────────────────────────────────────────────
-async function deleteRule(evt, id) {
-  evt.stopPropagation();
-  const cards = allRuleCards();
-  const idx   = cards.findIndex(c => c.id === 'rc-'+id);
-  const nextId = (cards[idx+1]||cards[idx-1])?.id.replace('rc-','') || null;
-  await api(`/api/rules/${id}`, 'DELETE');
-  S.rules = S.rules.filter(r => r.id !== id);
-  S.selectedIds.delete(id);
-  if (S.focusedRuleId === id) S.focusedRuleId = nextId;
-  if (S.editingNoteId === id) S.editingNoteId = null;
-  renderViewer(); renderRulesPanel();
-  if (nextId) setFocusedRule(nextId);
-  refreshFileBadge(S.currentFile?.id);
-}
-
-// ─── Collapsible sub-sections ────────────────────────────────
-function toggleSub(bodyId, arrowId) {
-  const body  = document.getElementById(bodyId);
-  const arrow = document.getElementById(arrowId);
-  const collapsed = body.classList.toggle('collapsed');
-  arrow?.classList.toggle('closed', collapsed);
-}
-
-// ─── Extraction ──────────────────────────────────────────────
-async function runExtraction() {
-  if (!S.currentFile) return;
-  const prompt = document.getElementById('extractPrompt').value.trim();
-  const model  = document.getElementById('extractModel').value;
-  if (!prompt) { setExtractStatus('Enter a prompt', 'error'); return; }
-  document.getElementById('extractBtn').disabled = true;
-  setExtractStatus('Running…');
-  const res = await api('/api/llm', 'POST', { file_id: S.currentFile.id, prompt, model });
-  document.getElementById('extractBtn').disabled = false;
-  if (res.error) { setExtractStatus(res.error, 'error'); return; }
-  const rules = res.rules;
-  if (!Array.isArray(rules)) {
-    console.error('runExtraction: unexpected response', res);
-    setExtractStatus('Unexpected response — check console', 'error'); return;
-  }
-  console.log('runExtraction: received', rules.length, 'rules');
-  console.log('  with line_start:', rules.filter(r => r.line_start != null).length);
-  console.log('  sample:', rules.slice(0,3).map(r => ({id:r.id, line_start:r.line_start, text:r.rule_text?.slice(0,40)})));
-  S.lastExtractRunId = res.run_id;
-  const existing = new Set(S.rules.map(r => r.id));
-  for (const r of rules) if (!existing.has(r.id)) S.rules.push(r);
-  const matched = rules.filter(r => r.line_start != null).length;
-  setExtractStatus(`${rules.length} rules extracted, ${matched} located`, matched > 0 ? 'ok' : 'error');
-  renderViewer(); renderRulesPanel();
-  refreshFileBadge(S.currentFile.id);
-}
-
-async function clearExtraction() {
-  const selected = selectedLlmIds();
-  if (selected.length) {
-    for (const id of selected) await api(`/api/rules/${id}`, 'DELETE');
-    S.rules = S.rules.filter(r => !(r.source === 'llm' && selected.includes(r.id)));
-    selected.forEach(id => S.selectedIds.delete(id));
-    if (selected.includes(S.focusedRuleId)) S.focusedRuleId = null;
-    setExtractStatus(`Cleared ${selected.length} selected rule${selected.length===1?'':'s'}`, 'ok');
-    renderViewer(); renderRulesPanel();
-    refreshFileBadge(S.currentFile?.id);
-    return;
-  }
-  const focusedId = focusedLlmId();
-  if (focusedId) {
-    await api(`/api/rules/${focusedId}`, 'DELETE');
-    S.rules = S.rules.filter(r => r.id !== focusedId);
-    S.selectedIds.delete(focusedId);
-    if (S.focusedRuleId === focusedId) S.focusedRuleId = null;
-    setExtractStatus('Cleared focused rule', 'ok');
-    renderViewer(); renderRulesPanel();
-    refreshFileBadge(S.currentFile?.id);
-    return;
-  }
-  if (!S.lastExtractRunId) return;
-  await api(`/api/llm-runs/${S.lastExtractRunId}`, 'DELETE');
-  S.rules = S.rules.filter(r => r.llm_run_id !== S.lastExtractRunId);
-  S.lastExtractRunId = null;
-  setExtractStatus('Cleared last run', 'ok');
-  renderViewer(); renderRulesPanel();
-  refreshFileBadge(S.currentFile?.id);
-}
-
-function setExtractStatus(msg, cls='') {
-  const el = document.getElementById('extractStatus');
-  el.textContent = msg; el.className = 'llm-status' + (cls ? ' ' + cls : '');
-}
-
-// ─── Classification LLM ──────────────────────────────────────
-function updateRunBtn() {
-  // button label is fixed; no-op kept for compat
-}
-
-async function runLLM() {
-  if (!S.currentFile) return;
-  const prompt = document.getElementById('llmPrompt').value.trim();
-  const model  = document.getElementById('llmModel').value;
-  if (!prompt) { setStatus('Enter a prompt', 'error'); return; }
-  if (!S.focusedRuleId) { setStatus('Focus a rule first', 'error'); return; }
-
-  document.getElementById('runBtn').disabled = true;
-  setStatus('Running…');
-  const res = await api('/api/llm', 'POST', {
-    file_id: S.currentFile.id, prompt, model, rule_id: S.focusedRuleId
-  });
-  document.getElementById('runBtn').disabled = false;
-  if (res.error) { setStatus(res.error, 'error'); return; }
-
-  S.lastRunId = res.run_id;
-  document.getElementById('clearRunBtn').disabled = false;
-  showClassification(res.classification, res.raw_response);
-  setStatus('Classification complete', 'ok');
-}
-
-function showClassification(c, rawJson) {
-  const el = document.getElementById('classifResult');
-  if (!c || !Object.keys(c).length) {
-    el.style.display = 'none'; return;
-  }
-  el.style.display = 'block';
-
-  const enfClass = c.deterministic_enforceability?.classification || '';
-  const ambLevel = c.ambiguity?.level || '';
-  const conf     = c.confidence || '';
-
-  const enfColors = {
-    deterministically_enforceable_as_written: 'green',
-    deterministically_enforceable_with_context: 'blue',
-    deterministically_enforceable_after_rewrite: 'blue',
-    partially_enforceable: 'yellow',
-    requires_llm_or_human_judgment: 'orange',
-    not_enforceable: 'red',
-  };
-  const ambColors = { none:'green', low:'blue', medium:'yellow', high:'orange', not_actionable:'red' };
-  const confColors = { high:'green', medium:'yellow', low:'orange' };
-
-  const badge = (text, cls) => `<span class="cr-badge ${cls||'gray'}">${esc(text)}</span>`;
-  const row = (label, html) => `<div class="cr-row"><span class="cr-label">${label}</span><span class="cr-val">${html}</span></div>`;
-
-  const prereqs = (c.prerequisites||[]).map(p =>
-    `<b>${esc(p.type||'')}</b>: ${esc(p.details||'')}`).join('<br>');
-  const mech = c.enforcement_mechanism
-    ? `${badge(c.enforcement_mechanism.primary||'','gray')} ${esc(c.enforcement_mechanism.details||'')}` : '';
-  const triggers = (c.trigger_location?.recommended||[]).map(t => badge(t,'blue')).join(' ');
-  const rewrites = [...(c.suggested_enforceable_rewrite?.deterministic_core||[]),
-                   ...(c.suggested_enforceable_rewrite?.semantic_or_review_residual||[])]
-    .map((r,i) => `${i+1}. ${esc(r)}`).join('<br>');
-  const ambTerms = (c.ambiguity?.ambiguous_terms||[]).join(', ');
-
-  el.innerHTML =
-    row('Summary',   esc(c.summary||''))                                        +
-    row('Enforceability', badge(enfClass, enfColors[enfClass]||'gray') + ' ' + esc(c.deterministic_enforceability?.details||'')) +
-    row('Ambiguity', badge(ambLevel, ambColors[ambLevel]||'gray') + (ambTerms ? ` — ${esc(ambTerms)}` : '')) +
-    row('Mechanism', mech)                                                       +
-    row('Triggers',  triggers + ' ' + esc(c.trigger_location?.details||''))    +
-    (prereqs ? row('Prerequisites', prereqs) : '')                               +
-    (rewrites ? row('Rewrite', rewrites) : '')                                   +
-    row('Confidence', badge(conf, confColors[conf]||'gray'))                    +
-    `<button class="cr-toggle" onclick="this.nextSibling.classList.toggle('open')">▸ Raw JSON</button>` +
-    `<div class="cr-json"><pre>${esc(JSON.stringify(c, null, 2))}</pre></div>`;
-}
-
-async function clearLastRun() {
-  if (!S.lastRunId) return;
-  await api(`/api/llm-runs/${S.lastRunId}`, 'DELETE');
-  S.rules = S.rules.filter(r => r.llm_run_id !== S.lastRunId);
-  S.lastRunId = null;
-  document.getElementById('clearRunBtn').disabled = true;
-  setStatus('Last run cleared');
-  renderViewer(); renderRulesPanel();
-  refreshFileBadge(S.currentFile?.id);
-}
-
-function setStatus(msg, cls='') {
-  const el = document.getElementById('llmStatus');
-  el.textContent = msg; el.className = 'llm-status'+(cls?' '+cls:'');
-}
-
-// ─── Prompt history ──────────────────────────────────────────
-function getPromptHistory() {
-  try { return JSON.parse(localStorage.getItem('promptHistory')||'[]'); }
-  catch { return []; }
-}
-
-async function savePrompt() {
-  const text = document.getElementById('llmPrompt').value.trim();
-  if (!text) return;
-  // Save to server
-  const res = await api('/api/prompts', 'POST', { prompt: text });
-  if (res.error) { setStatus(res.error,'error'); return; }
-  // Also cache locally
-  const history = getPromptHistory();
-  history.unshift({ id: res.id, text, saved_at: res.saved_at || new Date().toISOString() });
-  localStorage.setItem('promptHistory', JSON.stringify(history.slice(0,30)));
-  renderPromptHistoryPanel(history);
-  setStatus('Prompt saved','ok');
-}
-
-function toggleHistory() {
-  const el = document.getElementById('promptHistory');
-  el.classList.toggle('open');
-  if (el.classList.contains('open')) loadPromptHistory();
-}
-
-async function loadPromptHistory() {
-  // Try server first
-  const res = await api('/api/prompts');
-  if (Array.isArray(res)) {
-    const history = res.map(r => ({ id:r.id, text:r.prompt, label:r.label, saved_at:r.saved_at }));
-    localStorage.setItem('promptHistory', JSON.stringify(history));
-    renderPromptHistoryPanel(history);
-  } else {
-    renderPromptHistoryPanel(getPromptHistory());
-  }
-}
-
-function renderPromptHistoryPanel(history) {
-  const el = document.getElementById('promptHistory');
-  if (!history.length) {
-    el.innerHTML = '<div class="ph-item" style="color:#aaa">No saved prompts</div>';
-    return;
-  }
-  el.innerHTML = history.map(h => {
-    const d = h.saved_at ? new Date(h.saved_at).toLocaleDateString() : '';
-    const label = h.label ? `<span class="ph-label">${esc(h.label)}</span>` : '';
-    return `<div class="ph-item">
-      ${label}
-      <span class="ph-text" onclick="loadPrompt(${JSON.stringify(h.text)})"
-            title="${escAttr(h.text)}">${esc(h.text.slice(0,70))}${h.text.length>70?'…':''}</span>
-      <span class="ph-date">${d}</span>
-      <button class="ph-del" onclick="deletePrompt(event,'${h.id}')" title="Delete">×</button>
+  const items = S.rules.map((r, i) => {
+    const col = colorFor(extractorOf(r));
+    const tag = r.tag
+      ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}${r.tag === 'POWER' && r.power_type ? ':' + r.power_type : ''}</span>`
+      : '';
+    const flags = [
+      r.llm_rationale ? '<span class="rl-flag" title="Has LLM rationale">⚖</span>' : '',
+      r.notes ? '<span class="rl-flag" title="Has comment">✎</span>' : '',
+    ].join('');
+    const preview = r.rule_text.replace(/\s+/g, ' ').slice(0, 90);
+    return `<div class="rl-item${r.id === S.focusedRuleId ? ' active' : ''}" style="${rcVars(col)}"
+                 onclick="setFocusedRule('${r.id}')">
+      <div class="rl-bar"></div>
+      <div class="rl-body">
+        <div class="rl-top">${tag}<span class="rl-pos">${posLabel(r)}</span><span class="rl-flags">${flags}</span></div>
+        <div class="rl-text">${esc(preview)}${r.rule_text.length > 90 ? '…' : ''}</div>
+      </div>
     </div>`;
   }).join('');
+  el.innerHTML = `<div class="rl-head">${S.rules.length} rule${S.rules.length === 1 ? '' : 's'} in this file</div>${items}`;
 }
 
-function loadPrompt(text) {
-  document.getElementById('llmPrompt').value = text;
-  document.getElementById('promptHistory').classList.remove('open');
+function moveFocus(delta) {
+  if (!S.rules.length) return;
+  const idx = S.rules.findIndex(r => r.id === S.focusedRuleId);
+  const next = idx < 0
+    ? (delta > 0 ? 0 : S.rules.length - 1)
+    : clamp(idx + delta, 0, S.rules.length - 1);
+  setFocusedRule(S.rules[next].id);
 }
 
-async function deletePrompt(evt, id) {
-  evt.stopPropagation();
-  await api(`/api/prompts/${id}`, 'DELETE');
-  await loadPromptHistory();
+// ─── Inspector ───────────────────────────────────────────────
+function posLabel(r) {
+  if (r.line_start) return `Line ${r.line_start}${r.line_end && r.line_end !== r.line_start ? '–' + r.line_end : ''}`;
+  if (r.char_start != null) return `chars ${r.char_start}–${r.char_end}`;
+  return 'no position';
 }
 
-// ─── Keyboard shortcuts ──────────────────────────────────────
+function renderInspector() {
+  const el = document.getElementById('inspector');
+  const r = S.rules.find(x => x.id === S.focusedRuleId);
+  if (!r) {
+    el.innerHTML = `<div class="insp-empty">Select a highlight, or select text in the document and press <b>+ Add Rule</b>.<br><br>${S.rules.length} rule${S.rules.length === 1 ? '' : 's'} in this file — use <kbd>j</kbd>/<kbd>k</kbd> to step through.</div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="insp-top">
+      <span class="insp-top-label">Rule ${S.rules.findIndex(x => x.id === r.id) + 1} of ${S.rules.length}
+        &nbsp;·&nbsp; ${posLabel(r)} &nbsp;·&nbsp; ${esc(extractorOf(r))}</span>
+      <button class="insp-exit" onclick="exitInspector()" title="Back to rule list (Esc)">✕</button>
+    </div>
+
+    <div class="insp-label">Tag</div>
+    <div id="tagSection">${tagSectionHTML(r)}</div>
+
+    <div class="insp-label">LLM Rationale</div>
+    <textarea class="insp-rationale" id="inspRationale" readonly placeholder="Run the LLM judge (top bar) to populate this…">${esc(r.llm_rationale || '')}</textarea>
+
+    <div class="insp-label">Comment</div>
+    <textarea class="insp-comment" id="inspComment" placeholder="Your comment…"
+      oninput="autoGrow(this)" onblur="saveComment()" onkeydown="commentKey(event)">${esc(r.notes || '')}</textarea>
+
+    <div class="insp-actions">
+      <span class="insp-status" id="inspStatus"></span>
+      <button class="insp-del" onclick="deleteFocusedRule()">Delete rule</button>
+    </div>`;
+  autoGrow(document.getElementById('inspRationale'));
+  autoGrow(document.getElementById('inspComment'));
+}
+
+// Tag buttons + (when POWER) the norm/strategy sub-row.
+function tagSectionHTML(r) {
+  const tagBtns = TAGS.map(t =>
+    `<button class="tag-btn${r.tag === t ? ' active ' + t.toLowerCase() : ''}" onclick="setTag('${t}')">${t}</button>`
+  ).join('');
+  const powerRow = r.tag === 'POWER'
+    ? `<div class="power-row"><span class="power-hint">as:</span>${POWER_TYPES.map(p =>
+        `<button class="sub-btn${r.power_type === p ? ' active' : ''}" onclick="setPowerType('${p}')">${p}</button>`).join('')}</div>`
+    : '';
+  return `<div class="tag-row">${tagBtns}</div>${powerRow}`;
+}
+
+// Auto-grow a textarea to fit its content, up to its CSS max-height, then scroll.
+function autoGrow(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  const max = parseInt(getComputedStyle(el).maxHeight, 10) || 320;
+  const h = Math.min(el.scrollHeight, max);
+  el.style.height = h + 'px';
+  el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden';
+}
+
+function setInspStatus(msg, cls = '') {
+  const el = document.getElementById('inspStatus');
+  if (el) { el.textContent = msg; el.className = 'insp-status' + (cls ? ' ' + cls : ''); }
+}
+
+function refreshTagSection(r) {
+  const el = document.getElementById('tagSection');
+  if (el) el.innerHTML = tagSectionHTML(r);
+}
+
+async function setTag(t) {
+  const r = S.rules.find(x => x.id === S.focusedRuleId);
+  if (!r) return;
+  const newTag = r.tag === t ? null : t;   // toggle in place
+  r.tag = newTag;
+  if (newTag !== 'POWER') r.power_type = null;
+  refreshTagSection(r);                     // update buttons only — don't rebuild the panel
+  await api(`/api/rules/${r.id}`, 'PATCH', { tag: newTag, power_type: r.power_type });
+}
+
+async function setPowerType(p) {
+  const r = S.rules.find(x => x.id === S.focusedRuleId);
+  if (!r) return;
+  r.power_type = r.power_type === p ? null : p;
+  refreshTagSection(r);
+  await api(`/api/rules/${r.id}`, 'PATCH', { power_type: r.power_type });
+}
+
+async function saveComment() {
+  const r = S.rules.find(x => x.id === S.focusedRuleId);
+  const inp = document.getElementById('inspComment');
+  if (!r || !inp) return;
+  const notes = inp.value.trim() || null;
+  if (notes === (r.notes || null)) return;
+  r.notes = notes;
+  await api(`/api/rules/${r.id}`, 'PATCH', { notes });
+  setInspStatus('Comment saved', 'ok');
+}
+
+function commentKey(e) {
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.target.blur(); }
+  e.stopPropagation();
+}
+
+async function deleteFocusedRule() {
+  const r = S.rules.find(x => x.id === S.focusedRuleId);
+  if (!r) return;
+  const idx = S.rules.findIndex(x => x.id === r.id);
+  await api(`/api/rules/${r.id}`, 'DELETE');
+  S.rules = S.rules.filter(x => x.id !== r.id);
+  const nextId = S.rules[idx]?.id || S.rules[idx - 1]?.id || null;
+  S.focusedRuleId = nextId;
+  if (!nextId) S.inspectorOpen = false;
+  renderViewer();
+  renderRightPanel();
+  if (nextId) paintFocus();
+  refreshFileBadge(S.currentFile?.id);
+}
+
+
+// ─── Tool view (editable prompts) ────────────────────────────
+const MODEL_OPTIONS = `
+  <optgroup label="Perplexity">
+    <option value="sonar">sonar</option>
+    <option value="sonar-pro">sonar-pro</option>
+    <option value="sonar-reasoning-pro">sonar-reasoning-pro</option>
+    <option value="sonar-deep-research">sonar-deep-research</option>
+  </optgroup>
+  <optgroup label="Anthropic (via Perplexity)">
+    <option value="anthropic/claude-haiku-4-5">claude-haiku-4-5</option>
+    <option value="anthropic/claude-sonnet-4-5">claude-sonnet-4-5</option>
+    <option value="anthropic/claude-sonnet-4-6">claude-sonnet-4-6</option>
+    <option value="anthropic/claude-opus-4-5">claude-opus-4-5</option>
+    <option value="anthropic/claude-opus-4-6">claude-opus-4-6</option>
+    <option value="anthropic/claude-opus-4-7">claude-opus-4-7</option>
+    <option value="anthropic/claude-opus-4-8">claude-opus-4-8</option>
+  </optgroup>
+  <optgroup label="OpenAI (via Perplexity)">
+    <option value="openai/gpt-5-mini">gpt-5-mini</option>
+    <option value="openai/gpt-5">gpt-5</option>
+    <option value="openai/gpt-5.1">gpt-5.1</option>
+    <option value="openai/gpt-5.4-mini">gpt-5.4-mini</option>
+    <option value="openai/gpt-5.4">gpt-5.4</option>
+    <option value="openai/gpt-5.5">gpt-5.5</option>
+  </optgroup>`;
+
+function toggleTool() {
+  if (!S.currentFile || S.judgeRunning) return;   // locked while a run is in flight
+  S.toolMode = !S.toolMode;
+  document.getElementById('judgeBtn').classList.toggle('active', S.toolMode);
+  renderJudgeModal();
+}
+
+// The LLM judge is a centered pop-up modal over a dimmed backdrop.
+function renderJudgeModal() {
+  let modal = document.getElementById('judgeModal');
+  if (!S.toolMode) { if (modal) modal.remove(); return; }
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'judgeModal';
+    modal.className = 'modal-backdrop';
+    // click on the dimmed backdrop (outside the card) closes it
+    modal.addEventListener('mousedown', e => { if (e.target === modal && !S.judgeRunning) toggleTool(); });
+    document.body.appendChild(modal);
+  }
+  // While the judge is running, lock the modal: clear it and show a spinner only.
+  if (S.judgeRunning) {
+    modal.innerHTML = `
+      <div class="modal-card">
+        <div class="judge-loading">
+          <div class="spinner"></div>
+          <div class="judge-loading-text">Running LLM judge over the whole document…</div>
+        </div>
+      </div>`;
+    return;
+  }
+  modal.innerHTML = `
+    <div class="modal-card">
+      <div class="modal-head">
+        <span class="tool-title">LLM judge</span>
+        <div style="flex:1"></div>
+        <button class="insp-exit" onclick="toggleTool()" title="Back to document (Esc)">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="tool-row">
+          <span class="lbl">Model</span>
+          <select class="tool-model" id="judgeModelSel">${MODEL_OPTIONS}</select>
+        </div>
+        <textarea class="tool-prompt" id="judgePromptArea">${esc(S.judgePrompt)}</textarea>
+      </div>
+      <div class="modal-foot">
+        <span class="tool-status" id="judgeToolStatus">Extracts every rule in the document and tags it (PROHIBIT / OBLIGE / PERMIT / POWER). Your edits are saved when you run.</span>
+        <button class="btn primary" id="judgeRunBtn" onclick="runJudge()">▶ Run</button>
+      </div>
+    </div>`;
+  document.getElementById('judgeModelSel').value = S.judgeModel;
+  document.getElementById('judgeModelSel').onchange = e => { S.judgeModel = e.target.value; };
+  document.getElementById('judgePromptArea').oninput = e => { S.judgePrompt = e.target.value; };
+}
+
+function setToolStatus(id, msg, cls = '') {
+  const el = document.getElementById(id);
+  if (el) { el.textContent = msg; el.className = 'tool-status' + (cls ? ' ' + cls : ''); }
+}
+
+async function persistSettings(obj) { await api('/api/settings', 'POST', obj); }
+
+// The single unified LLM-judge run: extract + tag + rationale over the whole
+// document. Locks the panel behind a spinner, then releases back to the panel.
+async function runJudge() {
+  if (!S.currentFile || S.judgeRunning) return;
+  const area = document.getElementById('judgePromptArea');
+  if (area) S.judgePrompt = area.value;
+  if (!S.judgePrompt.trim()) { setToolStatus('judgeToolStatus', 'Enter a prompt', 'error'); return; }
+
+  S.judgeRunning = true;
+  renderJudgeModal();   // clear modal → spinner (user is locked in)
+  await persistSettings({ llm_judge_prompt: S.judgePrompt, judge_model: S.judgeModel });
+
+  const res = await api('/api/llm', 'POST', {
+    file_id: S.currentFile.id, prompt: S.judgePrompt, model: S.judgeModel, replace_llm: true,
+  });
+  if (!res.error) {
+    const fresh = await api(`/api/rules/${S.currentFile.id}`);
+    if (Array.isArray(fresh)) S.rules = fresh;
+    S.focusedRuleId = null; S.inspectorOpen = false;
+  }
+
+  S.judgeRunning = false;
+  renderJudgeModal();    // release → back to the LLM judge modal panel
+  renderViewer();        // refresh the document highlights underneath
+  renderRightPanel();
+  refreshFileBadge(S.currentFile.id);
+  if (res.error) setToolStatus('judgeToolStatus', res.error, 'error');
+  else setToolStatus('judgeToolStatus',
+    `Done — ${(res.rules || []).length} rules extracted & tagged. Open the document to review.`, 'ok');
+}
+
+// ─── Keyboard ────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
+  if (S.judgeRunning) return;   // locked while a judge run is in flight
   const tag = document.activeElement?.tagName?.toLowerCase();
-  const inText = tag==='textarea'||tag==='input';
-
-  // ⌘↵ – add rule (skip if in LLM prompt textarea)
-  if ((e.metaKey||e.ctrlKey) && e.key==='Enter') {
-    if (document.activeElement?.id === 'llmPrompt') return;
+  const inText = tag === 'textarea' || tag === 'input';
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+    if (inText) return;
     if (S.selection) { e.preventDefault(); addHandRule(); }
     return;
   }
-  if (inText) return;
-
+  if (inText) {
+    // Esc inside the judge modal closes it; elsewhere it just blurs the field.
+    if (e.key === 'Escape') { if (S.toolMode) toggleTool(); else document.activeElement.blur(); }
+    return;
+  }
+  if (S.toolMode) {
+    if (e.key === 'Escape') toggleTool();
+    return;
+  }
   switch (e.key) {
     case 'j': case 'ArrowDown': e.preventDefault(); moveFocus(+1); break;
     case 'k': case 'ArrowUp':   e.preventDefault(); moveFocus(-1); break;
-    case 'n':
-      e.preventDefault();
-      if (S.focusedRuleId) openNoteEditor(S.focusedRuleId);
-      break;
     case 'd':
       e.preventDefault();
-      if (S.focusedRuleId) deleteRule({ stopPropagation(){} }, S.focusedRuleId);
-      break;
-    case 'x':
-      e.preventDefault();
-      if (S.focusedRuleId) {
-        if (e.shiftKey && S.lastSelectedId) { rangeSelect(S.lastSelectedId, S.focusedRuleId); break; }
-        toggleRuleSelect(S.focusedRuleId, !S.selectedIds.has(S.focusedRuleId));
-      }
+      if (S.focusedRuleId) deleteFocusedRule();
       break;
     case 'Escape':
-      if (S.editingNoteId) closeNoteEditor(S.editingNoteId, false);
+      if (S.inspectorOpen) exitInspector();
       else clearSelection();
       break;
   }
 });
 
-// Hover rule card → highlight mark
-const rulesPanel = document.querySelector('.rules-panel');
-rulesPanel.addEventListener('mouseover', e => {
-  const card = e.target.closest('.rule-card');
-  if (!card || card.id==='rc-'+S.focusedRuleId) return;
-  document.querySelector(`mark.hl[data-rid="${card.id.replace('rc-','')}"]`)?.classList.add('hover');
-});
-rulesPanel.addEventListener('mouseout', e => {
-  const card = e.target.closest('.rule-card');
-  if (!card) return;
-  document.querySelector(`mark.hl[data-rid="${card.id.replace('rc-','')}"]`)?.classList.remove('hover');
-});
-
 // ─── Export ──────────────────────────────────────────────────
-function exportCSV() {
-  window.open('/export', '_blank');
-}
+function exportCSV() { window.open('/export', '_blank'); }
 
 // ─── Helpers ─────────────────────────────────────────────────
-async function api(url, method='GET', body=null) {
+async function api(url, method = 'GET', body = null) {
   try {
-    const opts = {method, headers:{}};
-    if (body) { opts.headers['Content-Type']='application/json'; opts.body=JSON.stringify(body); }
+    const opts = { method, headers: {} };
+    if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
     const r = await fetch(url, opts); return r.json();
-  } catch(e) { return {error:e.message}; }
+  } catch (e) { return { error: e.message }; }
 }
 function refreshFileBadge(id) {
   if (!id) return;
-  const f = S.allFiles.find(f=>f.id===id);
+  const f = S.allFiles.find(f => f.id === id);
   if (f) {
-    f.hand_count = S.rules.filter(r=>r.source==='hand').length;
-    f.llm_count  = S.rules.filter(r=>r.source==='llm').length;
+    f.hand_count = S.rules.filter(r => r.source === 'hand').length;
+    f.llm_count  = S.rules.filter(r => r.source === 'llm').length;
   }
   filterFiles(document.getElementById('fileSearch').value);
 }
 function esc(s) {
-  if (s==null) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-                  .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  if (s == null) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
-function escHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function escAttr(s) { return s.replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;'); }
-function fmtSize(n) { return n>1024?`${(n/1024).toFixed(1)}k`:`${n||'?'}b`; }
+function escHtml(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function escAttr(s) { return s.replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;'); }
+function fmtSize(n) { return n > 1024 ? `${(n / 1024).toFixed(1)}k` : `${n || '?'}b`; }
 
 init();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=5002)
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5002")))
+    parser.add_argument("--debug", action="store_true",
+                        default=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes"))
     args = parser.parse_args()
     print(f"Rule Annotator → http://{args.host}:{args.port}")
-    app.run(debug=True, host=args.host, port=args.port, threaded=False)
+    # threaded=True so a slow request (e.g. /export) never blocks the UI;
+    # reloader stays off unless --debug so the container keeps running.
+    app.run(debug=args.debug, host=args.host, port=args.port,
+            threaded=True, use_reloader=args.debug)

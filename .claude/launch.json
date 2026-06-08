@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "annotate",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["annotate.py", "--port", "5057"],
+      "port": 5057
+    }
+  ]
+}
