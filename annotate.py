@@ -302,10 +302,10 @@ def run_llm():
         usr_msg = filled
     else:
         sys_msg = (
-            "You are a precise rule extractor. Extract all behavioral rules, constraints, "
-            "guidelines, and instructions from the given file. "
-            "Return ONLY a valid JSON array, no other text. "
-            'Each element: {"rule_text":"<exact or near-exact quote>","line_start":<int>,"line_end":<int>}'
+            "You extract rules from the given document and return the result as a "
+            "single valid JSON array and nothing else — no prose, no markdown fences, "
+            "no trailing commentary. Use exactly the field schema given in the user's "
+            "instructions for each array element."
         )
         usr_msg = (
             f"{prompt}\n\nFile content:\n---\n{content[:30000]}\n---\n\nReturn ONLY a JSON array."
@@ -314,7 +314,9 @@ def run_llm():
     # Third-party models (anthropic/*, openai/*) use the Agent API; native Sonar models use Chat API
     use_agent_api = "/" in model
     if use_agent_api:
-        payload_dict = {"model": model, "input": usr_msg}
+        # Agent API uses max_output_tokens; raise it so large rule sets aren't
+        # truncated mid-JSON (truncation breaks the array parse).
+        payload_dict = {"model": model, "input": usr_msg, "max_output_tokens": 32000}
         if sys_msg:
             payload_dict["instructions"] = sys_msg
         payload = json.dumps(payload_dict).encode()
@@ -325,7 +327,7 @@ def run_llm():
             messages.insert(0, {"role": "system", "content": sys_msg})
         payload = json.dumps({
             "model": model, "messages": messages,
-            "temperature": 0.1, "max_tokens": 4096,
+            "temperature": 0.1, "max_tokens": 16000,
         }).encode()
         url = PERPLEXITY_CHAT_URL
 
@@ -417,10 +419,10 @@ def run_llm():
 
     def _norm_tag(t):
         t = (t or "").strip().upper()
-        return t if t in ("PROHIBIT", "OBLIGE", "PERMIT", "POWER") else None
+        return t if t in ("PROHIBIT", "OBLIGATION", "PERMIT", "PREFERENCE") else None
 
     def _norm_power(tag, pt):
-        if tag != "POWER":
+        if tag != "PREFERENCE":
             return None
         pt = (pt or "").strip().lower()
         return pt if pt in ("norm", "strategy") else None
@@ -486,8 +488,8 @@ def export_page():
     # NOTE: sample_con() is a cached, shared read-only connection — do NOT close it.
 
     def _power(tag, ptype):
-        if tag == "POWER" and ptype:
-            return f"POWER:{ptype}"
+        if tag == "PREFERENCE" and ptype:
+            return f"PREFERENCE:{ptype}"
         return tag or ""
 
     import csv, io
@@ -606,19 +608,56 @@ def set_settings():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _recover_json_objects(text):
+    """Pull every complete top-level {...} object out of text, respecting
+    strings/escapes. Recovers rules from a truncated JSON array (the cut-off
+    final object is simply skipped)."""
+    objs, depth, start, in_str, esc = [], 0, None, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:        esc = False
+            elif ch == '\\': esc = True
+            elif ch == '"':  in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == '{':
+            if depth == 0: start = i
+            depth += 1
+        elif ch == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objs.append(text[start:i + 1]); start = None
+    return objs
+
 def _parse_llm_rules(text):
     text = re.sub(r'^```(?:json)?\s*','',text.strip())
     text = re.sub(r'\s*```$','',text).strip()
+    # 1. clean whole-array parse
     try:
         d = json.loads(text)
         if isinstance(d, list): return d
     except: pass
+    # 2. outermost [...] block
     m = re.search(r'\[.*\]', text, re.DOTALL)
     if m:
         try:
             d = json.loads(m.group())
             if isinstance(d, list): return d
         except: pass
+    # 3. recover complete objects (handles truncated/streamed JSON — keeps every
+    #    finished rule with its tag/rationale, drops only the cut-off last one)
+    recovered = []
+    for chunk in _recover_json_objects(text):
+        try:
+            obj = json.loads(chunk)
+            if isinstance(obj, dict) and obj.get("rule_text"):
+                recovered.append(obj)
+        except: pass
+    if recovered:
+        return recovered
+    # 4. last resort: treat non-trivial lines as bare rule text
     return [{"rule_text": re.sub(r'^[-*\d.]+\s*','',l.strip())}
             for l in text.split('\n') if len(l.strip()) > 20]
 
@@ -857,20 +896,33 @@ kbd {
 .rl-item:hover { border-color: #c7c7e0; }
 .rl-item.active { border-color: var(--rc-bdr, #6366f1); box-shadow: 0 0 0 1px var(--rc-bdr, #6366f1); }
 .rl-bar { width: 4px; flex-shrink: 0; background: var(--rc-bdr, #c0c0d8); }
-.rl-body { flex: 1; min-width: 0; padding: 8px 10px 8px 4px; }
+.rl-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.rl-header { padding: 8px 10px 8px 6px; cursor: pointer; }
+.rl-header:hover { background: #fafaff; }
 .rl-top { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
 .rl-pos { font-size: 10px; color: #9090b0; }
-.rl-flags { margin-left: auto; display: flex; gap: 4px; }
+.rl-flags { margin-left: auto; display: flex; gap: 5px; align-items: center; }
 .rl-flag { font-size: 11px; color: #8080b0; }
+.rl-caret { font-size: 9px; color: #a0a0c0; }
 .rl-text { font-size: 12px; line-height: 1.45; color: #2a2a3e; word-break: break-word; }
+
+/* accordion expanded detail */
+.rl-detail {
+  display: flex; flex-direction: column; gap: 9px;
+  padding: 6px 11px 12px 6px; border-top: 1px solid #ececf4;
+}
+.rl-detail .insp-rationale { max-height: 220px; }
+.rl-detail .insp-comment { max-height: 180px; }
+.rl-detail .insp-top { margin-bottom: -2px; }
+.rl-detail .insp-top-label { font-size: 10px; }
 .rl-tag {
   display: inline-block; font-size: 9px; font-weight: 800; letter-spacing: 0.4px;
   padding: 1px 6px; border-radius: 7px; background: #ececf6; color: #6060a0;
 }
-.rl-tag.prohibit { background: #fee2e2; color: #b91c1c; }
-.rl-tag.oblige   { background: #dbeafe; color: #1d4ed8; }
-.rl-tag.permit   { background: #dcfce7; color: #15803d; }
-.rl-tag.power    { background: #f3e8ff; color: #7e22ce; }
+.rl-tag.prohibit   { background: #fee2e2; color: #b91c1c; }
+.rl-tag.obligation { background: #dbeafe; color: #1d4ed8; }
+.rl-tag.permit     { background: #dcfce7; color: #15803d; }
+.rl-tag.preference { background: #f3e8ff; color: #7e22ce; }
 
 /* ── Inspector top bar (exit) ── */
 .insp-top { display: flex; align-items: center; justify-content: space-between; }
@@ -892,18 +944,19 @@ kbd {
 .insp-pos { font-size: 11px; color: #9090b0; margin-top: -6px; }
 .insp-label { font-size: 11px; font-weight: 700; color: #6060a0; letter-spacing: 0.3px; text-transform: uppercase; }
 
-/* tag toggle */
-.tag-row { display: flex; gap: 6px; flex-wrap: wrap; }
+/* tag toggle — 2×2 grid so the four labels line up evenly */
+.tag-row { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .tag-btn {
-  padding: 7px 14px; border-radius: 9px; border: 1.5px solid #d4d4e4;
+  padding: 8px 10px; border-radius: 9px; border: 1.5px solid #d4d4e4;
   background: #fff; color: #6b6b85; font-size: 12px; font-weight: 700;
-  letter-spacing: 0.4px; cursor: pointer; transition: all 0.1s; flex: 1; min-width: 72px;
+  letter-spacing: 0.3px; cursor: pointer; transition: all 0.1s;
+  text-align: center; white-space: nowrap;
 }
 .tag-btn:hover { border-color: #b0b0c8; }
-.tag-btn.active.prohibit { background: #fee2e2; border-color: #ef4444; color: #b91c1c; }
-.tag-btn.active.oblige   { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
-.tag-btn.active.permit   { background: #dcfce7; border-color: #22c55e; color: #15803d; }
-.tag-btn.active.power    { background: #f3e8ff; border-color: #a855f7; color: #7e22ce; }
+.tag-btn.active.prohibit   { background: #fee2e2; border-color: #ef4444; color: #b91c1c; }
+.tag-btn.active.obligation { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
+.tag-btn.active.permit     { background: #dcfce7; border-color: #22c55e; color: #15803d; }
+.tag-btn.active.preference { background: #f3e8ff; border-color: #a855f7; color: #7e22ce; }
 .power-row { display: flex; gap: 6px; padding-left: 2px; }
 .sub-btn {
   padding: 5px 14px; border-radius: 8px; border: 1.5px solid #e0d4f0;
@@ -969,24 +1022,48 @@ Prefer exact or near-exact quotes from the file. Extract each independently enfo
 
 Return only a valid JSON array. Each element:
 {"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</script>
-<script type="text/plain" id="defaultJudgePrompt">You are the LLM judge. Read the document below and extract every rule, classifying each one with a deontic tag.
+<script type="text/plain" id="defaultJudgePrompt">You are the LLM judge. Read the document below, extract every rule, and classify each one with a deontic tag.
 
 A "rule" is any natural-language instruction, constraint, prohibition, requirement, permission, or grant of authority given to an LLM or agent. Prefer exact or near-exact quotes from the document. Extract each independently meaningful clause as its own rule — do not merge unrelated requirements, and skip purely motivational or explanatory text with no directive force.
 
-For each rule, assign exactly ONE tag:
+Assign exactly ONE tag per rule, using these definitions, cue words, and concrete examples:
 
-- PROHIBIT: forbids an action. Cues: "never", "do not", "must not", "avoid", "don't".
-- OBLIGE: requires an action. Cues: "must", "always", "shall", "is required to", "ensure".
-- PERMIT: allows an action without requiring it. Cues: "may", "can", "is allowed to", "feel free to".
-- POWER: confers authority or capability to change what is permitted/obliged, or prescribes how such authority is exercised. For POWER, also set "power_type":
-    - "norm": establishes, changes, overrides, or governs a rule/policy itself (e.g. "this file takes precedence", "you may update the conventions").
-    - "strategy": prescribes an approach, method, ordering, or procedure for achieving a goal (e.g. "follow this chain", "read all memory files first").
-  For PROHIBIT, OBLIGE, and PERMIT, set "power_type" to null.
+- PROHIBIT — forbids an action; the agent must NOT do it.
+  Cues: "never", "do not", "must not", "avoid", "don't", "under no circumstances".
+  Examples:
+    - "Never commit secrets or API keys to the repository."
+    - "Do not accept, process, or store sensitive client data."
+    - "Don't run destructive git commands without confirmation."
 
-For each rule, write a short "rationale" (1-3 sentences) explaining why the tag fits and what would be needed to enforce the rule deterministically outside the model.
+- OBLIGATION — requires an action; the agent MUST do it.
+  Cues: "must", "always", "shall", "is required to", "ensure", "make sure".
+  Examples:
+    - "Always run the test suite before committing."
+    - "You must log every change in CHANGELOG.md."
+    - "Ensure all new code follows PEP 8."
+
+- PERMIT — allows an action without requiring it; the agent MAY do it.
+  Cues: "may", "can", "is allowed to", "feel free to", "optionally".
+  Examples:
+    - "You may reply directly if the sender is a known contact."
+    - "Feel free to suggest refactors, but don't apply them automatically."
+    - "You can use the web search tool when you need current information."
+
+- PREFERENCE — confers authority/capability to change what is permitted or obliged, OR prescribes HOW to do something (a preferred approach, ordering, or method) rather than a strict requirement. Also set "power_type":
+    - "norm": establishes, changes, overrides, or governs a rule/policy itself.
+        Examples: "This file takes precedence over all other instructions." / "You may update the conventions in CONVENTIONS.md as the project evolves."
+    - "strategy": prescribes a preferred approach, method, ordering, or procedure for achieving a goal.
+        Examples: "Prefer small, focused commits." / "Read all memory-bank files at the start of every task." / "When unsure, ask a clarifying question before proceeding."
+  For PROHIBIT, OBLIGATION, and PERMIT, set "power_type" to null.
+
+When a rule could fit more than one tag, choose the tag matching its strongest directive force (PROHIBIT/OBLIGATION outrank PERMIT/PREFERENCE) and explain the tension in the rationale.
+
+For each rule, write a "rationale" (1-3 sentences) that MUST:
+  1. Explicitly state WHY you chose this tag — quote the specific cue word(s) or describe the directive force that decided it, and name any other tag you considered and why you rejected it.
+  2. Note briefly what would be needed to enforce the rule deterministically outside the model.
 
 Return ONLY a valid JSON array, no other text. Each element:
-{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>, "tag": "PROHIBIT|OBLIGE|PERMIT|POWER", "power_type": "norm|strategy|null", "rationale": "<why this tag + how to enforce>"}</script>
+{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>, "tag": "PROHIBIT|OBLIGATION|PERMIT|PREFERENCE", "power_type": "norm|strategy|null", "rationale": "<why THIS tag: cite the cue/force and the rejected alternative, then how to enforce>"}</script>
 
 <div class="layout">
 
@@ -1041,7 +1118,7 @@ Return ONLY a valid JSON array, no other text. Each element:
 <script>
 // ─── Constants ───────────────────────────────────────────────
 const DEFAULT_JUDGE = document.getElementById('defaultJudgePrompt').textContent.trim();
-const TAGS = ['PROHIBIT', 'OBLIGE', 'PERMIT', 'POWER'];
+const TAGS = ['PROHIBIT', 'OBLIGATION', 'PERMIT', 'PREFERENCE'];
 const POWER_TYPES = ['norm', 'strategy'];
 
 // ─── State ───────────────────────────────────────────────────
@@ -1397,28 +1474,25 @@ function paintFocus() {
 
 function setFocusedRule(id) {
   S.focusedRuleId = id;
-  if (id) S.inspectorOpen = true;     // selecting a rule opens its inspector
   paintFocus();
-  renderRightPanel();
+  renderRuleList();
   if (id) {
+    document.getElementById('rl-' + id)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     const span = [...document.querySelectorAll('.rule-hl')]
       .find(el => el.dataset.rids.split(',').includes(id));
     span?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   }
 }
 
-// Right panel shows the rule LIST by default, or the single-rule inspector
-// once a rule is selected. The inspector's exit button returns to the list.
-function renderRightPanel() {
-  const r = S.rules.find(x => x.id === S.focusedRuleId);
-  if (S.inspectorOpen && r) renderInspector();
-  else renderRuleList();
-}
+function renderRightPanel() { renderRuleList(); }
 
-function exitInspector() {
-  S.inspectorOpen = false;
-  paintFocus();
-  renderRuleList();
+// collapse the currently expanded rule (Esc, red ✕)
+function exitInspector() { setFocusedRule(null); }
+
+// accordion: clicking a rule expands it; clicking it again (or another) collapses
+function toggleRuleExpand(id, evt) {
+  evt?.stopPropagation();
+  setFocusedRule(S.focusedRuleId === id ? null : id);
 }
 
 function renderRuleList() {
@@ -1431,26 +1505,34 @@ function renderRuleList() {
     el.innerHTML = `<div class="insp-empty">No rules yet.<br><br>Select text in the document and press <b>+ Add Rule</b>, or open <b>LLM judge</b> and press <b>Run</b> to extract &amp; tag every rule.</div>`;
     return;
   }
-  const items = S.rules.map((r, i) => {
+  const items = S.rules.map((r) => {
     const col = colorFor(extractorOf(r));
+    const expanded = r.id === S.focusedRuleId;
     const tag = r.tag
-      ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}${r.tag === 'POWER' && r.power_type ? ':' + r.power_type : ''}</span>`
+      ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}${r.tag === 'PREFERENCE' && r.power_type ? ':' + r.power_type : ''}</span>`
       : '';
     const flags = [
       r.llm_rationale ? '<span class="rl-flag" title="Has LLM rationale">⚖</span>' : '',
       r.notes ? '<span class="rl-flag" title="Has comment">✎</span>' : '',
     ].join('');
     const preview = r.rule_text.replace(/\s+/g, ' ').slice(0, 90);
-    return `<div class="rl-item${r.id === S.focusedRuleId ? ' active' : ''}" style="${rcVars(col)}"
-                 onclick="setFocusedRule('${r.id}')">
+    return `<div class="rl-item${expanded ? ' active expanded' : ''}" id="rl-${r.id}" style="${rcVars(col)}">
       <div class="rl-bar"></div>
       <div class="rl-body">
-        <div class="rl-top">${tag}<span class="rl-pos">${posLabel(r)}</span><span class="rl-flags">${flags}</span></div>
-        <div class="rl-text">${esc(preview)}${r.rule_text.length > 90 ? '…' : ''}</div>
+        <div class="rl-header" onclick="toggleRuleExpand('${r.id}', event)">
+          <div class="rl-top">${tag}<span class="rl-pos">${posLabel(r)}</span>
+            <span class="rl-flags">${flags}<span class="rl-caret">${expanded ? '▾' : '▸'}</span></span></div>
+          <div class="rl-text">${esc(preview)}${r.rule_text.length > 90 ? '…' : ''}</div>
+        </div>
+        ${expanded ? ruleDetailHTML(r) : ''}
       </div>
     </div>`;
   }).join('');
   el.innerHTML = `<div class="rl-head">${S.rules.length} rule${S.rules.length === 1 ? '' : 's'} in this file</div>${items}`;
+  if (S.focusedRuleId) {
+    autoGrow(document.getElementById('inspRationale'));
+    autoGrow(document.getElementById('inspComment'));
+  }
 }
 
 function moveFocus(delta) {
@@ -1469,18 +1551,12 @@ function posLabel(r) {
   return 'no position';
 }
 
-function renderInspector() {
-  const el = document.getElementById('inspector');
-  const r = S.rules.find(x => x.id === S.focusedRuleId);
-  if (!r) {
-    el.innerHTML = `<div class="insp-empty">Select a highlight, or select text in the document and press <b>+ Add Rule</b>.<br><br>${S.rules.length} rule${S.rules.length === 1 ? '' : 's'} in this file — use <kbd>j</kbd>/<kbd>k</kbd> to step through.</div>`;
-    return;
-  }
-  el.innerHTML = `
+// Expanded detail rendered inline inside the focused rule's accordion card.
+function ruleDetailHTML(r) {
+  return `<div class="rl-detail">
     <div class="insp-top">
       <span class="insp-top-label">Rule ${S.rules.findIndex(x => x.id === r.id) + 1} of ${S.rules.length}
-        &nbsp;·&nbsp; ${posLabel(r)} &nbsp;·&nbsp; ${esc(extractorOf(r))}</span>
-      <button class="insp-exit" onclick="exitInspector()" title="Back to rule list (Esc)">✕</button>
+        &nbsp;·&nbsp; ${esc(extractorOf(r))}</span>
     </div>
 
     <div class="insp-label">Tag</div>
@@ -1496,17 +1572,16 @@ function renderInspector() {
     <div class="insp-actions">
       <span class="insp-status" id="inspStatus"></span>
       <button class="insp-del" onclick="deleteFocusedRule()">Delete rule</button>
-    </div>`;
-  autoGrow(document.getElementById('inspRationale'));
-  autoGrow(document.getElementById('inspComment'));
+    </div>
+  </div>`;
 }
 
-// Tag buttons + (when POWER) the norm/strategy sub-row.
+// Tag buttons + (when PREFERENCE) the norm/strategy sub-row.
 function tagSectionHTML(r) {
   const tagBtns = TAGS.map(t =>
     `<button class="tag-btn${r.tag === t ? ' active ' + t.toLowerCase() : ''}" onclick="setTag('${t}')">${t}</button>`
   ).join('');
-  const powerRow = r.tag === 'POWER'
+  const powerRow = r.tag === 'PREFERENCE'
     ? `<div class="power-row"><span class="power-hint">as:</span>${POWER_TYPES.map(p =>
         `<button class="sub-btn${r.power_type === p ? ' active' : ''}" onclick="setPowerType('${p}')">${p}</button>`).join('')}</div>`
     : '';
@@ -1531,6 +1606,16 @@ function setInspStatus(msg, cls = '') {
 function refreshTagSection(r) {
   const el = document.getElementById('tagSection');
   if (el) el.innerHTML = tagSectionHTML(r);
+  // keep the collapsed-header tag badge in sync (in place — preserves textareas)
+  const top = document.getElementById('rl-' + r.id)?.querySelector('.rl-top');
+  if (top) {
+    const html = r.tag
+      ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}${r.tag === 'PREFERENCE' && r.power_type ? ':' + r.power_type : ''}</span>`
+      : '';
+    const old = top.querySelector('.rl-tag');
+    if (old) old.outerHTML = html;
+    else if (html) top.insertAdjacentHTML('afterbegin', html);
+  }
 }
 
 async function setTag(t) {
@@ -1538,7 +1623,7 @@ async function setTag(t) {
   if (!r) return;
   const newTag = r.tag === t ? null : t;   // toggle in place
   r.tag = newTag;
-  if (newTag !== 'POWER') r.power_type = null;
+  if (newTag !== 'PREFERENCE') r.power_type = null;
   refreshTagSection(r);                     // update buttons only — don't rebuild the panel
   await api(`/api/rules/${r.id}`, 'PATCH', { tag: newTag, power_type: r.power_type });
 }
@@ -1575,9 +1660,8 @@ async function deleteFocusedRule() {
   S.rules = S.rules.filter(x => x.id !== r.id);
   const nextId = S.rules[idx]?.id || S.rules[idx - 1]?.id || null;
   S.focusedRuleId = nextId;
-  if (!nextId) S.inspectorOpen = false;
   renderViewer();
-  renderRightPanel();
+  renderRuleList();
   if (nextId) paintFocus();
   refreshFileBadge(S.currentFile?.id);
 }
@@ -1654,7 +1738,7 @@ function renderJudgeModal() {
         <textarea class="tool-prompt" id="judgePromptArea">${esc(S.judgePrompt)}</textarea>
       </div>
       <div class="modal-foot">
-        <span class="tool-status" id="judgeToolStatus">Extracts every rule in the document and tags it (PROHIBIT / OBLIGE / PERMIT / POWER). Your edits are saved when you run.</span>
+        <span class="tool-status" id="judgeToolStatus">Extracts every rule in the document and tags it (PROHIBIT / OBLIGATION / PERMIT / PREFERENCE). Your edits are saved when you run.</span>
         <button class="btn primary" id="judgeRunBtn" onclick="runJudge()">▶ Run</button>
       </div>
     </div>`;
@@ -1728,7 +1812,7 @@ document.addEventListener('keydown', e => {
       if (S.focusedRuleId) deleteFocusedRule();
       break;
     case 'Escape':
-      if (S.inspectorOpen) exitInspector();
+      if (S.focusedRuleId) exitInspector();   // collapse the expanded rule
       else clearSelection();
       break;
   }
