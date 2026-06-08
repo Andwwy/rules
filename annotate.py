@@ -202,7 +202,7 @@ def api_rules(fid):
                source, llm_run_id, notes, extracted_by, created_at,
                tag, power_type, llm_rationale
         FROM extracted_rules WHERE file_id=?
-        ORDER BY COALESCE(char_start,999999), created_at
+        ORDER BY COALESCE(line_start, 999999), COALESCE(char_start, 999999), created_at
     """, [fid]).fetchall()
     con.close()
     return jsonify([_rule_row(r) for r in rows])
@@ -336,7 +336,7 @@ def run_llm():
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=600) as resp:
             resp_data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"API {e.code}: {e.read().decode()}"}), 502
@@ -385,17 +385,15 @@ def run_llm():
     for rule in extracted:
         rt = rule.get("rule_text","")
         if not rt: continue
-        # 1. Exact match
-        idx = content.find(rt)
-        # 2. Case-insensitive match
-        if idx == -1: idx = cl.find(rt.lower())
-        if idx >= 0:
-            rule["char_start"] = idx
-            rule["char_end"]   = idx + len(rt)
-            rule["line_start"] = content[:idx].count("\n") + 1
-            rule["line_end"]   = content[:idx+len(rt)].count("\n") + 1
+        loc = _locate_rule(content, cl, rt)
+        if loc:
+            cs, ce = loc   # don't shadow `b` (the request JSON) used later
+            rule["char_start"] = cs
+            rule["char_end"]   = ce
+            rule["line_start"] = content[:cs].count("\n") + 1
+            rule["line_end"]   = content[:ce].count("\n") + 1
         elif not rule.get("line_start"):
-            # 3. Word-overlap fuzzy fallback: find line with most shared words
+            # Word-overlap fuzzy fallback: find line with most shared words
             words = [w for w in re.split(r'\W+', rt.lower()) if len(w) > 3]
             if words:
                 best_li, best_score = -1, 0
@@ -419,7 +417,7 @@ def run_llm():
 
     def _norm_tag(t):
         t = (t or "").strip().upper()
-        return t if t in ("PROHIBIT", "OBLIGATION", "PERMIT", "PREFERENCE") else None
+        return t if t in ("PROHIBITION", "PRESCRIPTION", "PERMISSION", "PREFERENCE") else None
 
     def _norm_power(tag, pt):
         if tag != "PREFERENCE":
@@ -608,6 +606,37 @@ def set_settings():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _locate_rule(content, cl, rt):
+    """Return (char_start, char_end) for a rule quote, or None.
+    Falls back to the longest matching prefix so quotes that span a paragraph
+    break (e.g. '...respond like this: "Heads up') still anchor to the right
+    spot instead of trusting the model's approximate line number."""
+    rt = (rt or "").strip()
+    if not rt:
+        return None
+    # 1. exact / case-insensitive full match
+    idx = content.find(rt)
+    if idx == -1:
+        idx = cl.find(rt.lower())
+    if idx >= 0:
+        return idx, idx + len(rt)
+    # 2. longest contiguous prefix that appears in the file (binary search —
+    #    prefix membership is monotonic, so a longer found prefix implies the
+    #    shorter ones are found too)
+    rl = rt.lower()
+    lo, hi, best_len, best_idx = 16, len(rl), -1, -1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        j = cl.find(rl[:mid])
+        if j != -1:
+            best_len, best_idx = mid, j
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best_idx >= 0 and best_len >= 20:
+        return best_idx, best_idx + best_len
+    return None
+
 def _recover_json_objects(text):
     """Pull every complete top-level {...} object out of text, respecting
     strings/escapes. Recovers rules from a truncated JSON array (the cut-off
@@ -919,9 +948,9 @@ kbd {
   display: inline-block; font-size: 9px; font-weight: 800; letter-spacing: 0.4px;
   padding: 1px 6px; border-radius: 7px; background: #ececf6; color: #6060a0;
 }
-.rl-tag.prohibit   { background: #fee2e2; color: #b91c1c; }
-.rl-tag.obligation { background: #dbeafe; color: #1d4ed8; }
-.rl-tag.permit     { background: #dcfce7; color: #15803d; }
+.rl-tag.prohibition { background: #fee2e2; color: #b91c1c; }
+.rl-tag.prescription { background: #dbeafe; color: #1d4ed8; }
+.rl-tag.permission  { background: #dcfce7; color: #15803d; }
 .rl-tag.preference { background: #f3e8ff; color: #7e22ce; }
 
 /* ── Inspector top bar (exit) ── */
@@ -953,9 +982,9 @@ kbd {
   text-align: center; white-space: nowrap;
 }
 .tag-btn:hover { border-color: #b0b0c8; }
-.tag-btn.active.prohibit   { background: #fee2e2; border-color: #ef4444; color: #b91c1c; }
-.tag-btn.active.obligation { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
-.tag-btn.active.permit     { background: #dcfce7; border-color: #22c55e; color: #15803d; }
+.tag-btn.active.prohibition { background: #fee2e2; border-color: #ef4444; color: #b91c1c; }
+.tag-btn.active.prescription { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
+.tag-btn.active.permission  { background: #dcfce7; border-color: #22c55e; color: #15803d; }
 .tag-btn.active.preference { background: #f3e8ff; border-color: #a855f7; color: #7e22ce; }
 .power-row { display: flex; gap: 6px; padding-left: 2px; }
 .sub-btn {
@@ -1028,42 +1057,40 @@ A "rule" is any natural-language instruction, constraint, prohibition, requireme
 
 Assign exactly ONE tag per rule, using these definitions, cue words, and concrete examples:
 
-- PROHIBIT — forbids an action; the agent must NOT do it.
+- PROHIBITION — forbids an action; the agent must NOT do it.
   Cues: "never", "do not", "must not", "avoid", "don't", "under no circumstances".
   Examples:
     - "Never commit secrets or API keys to the repository."
     - "Do not accept, process, or store sensitive client data."
     - "Don't run destructive git commands without confirmation."
 
-- OBLIGATION — requires an action; the agent MUST do it.
+- PRESCRIPTION — requires an action; the agent MUST do it.
   Cues: "must", "always", "shall", "is required to", "ensure", "make sure".
   Examples:
     - "Always run the test suite before committing."
     - "You must log every change in CHANGELOG.md."
     - "Ensure all new code follows PEP 8."
 
-- PERMIT — allows an action without requiring it; the agent MAY do it.
+- PERMISSION — allows an action without requiring it; the agent MAY do it.
   Cues: "may", "can", "is allowed to", "feel free to", "optionally".
   Examples:
     - "You may reply directly if the sender is a known contact."
     - "Feel free to suggest refactors, but don't apply them automatically."
     - "You can use the web search tool when you need current information."
 
-- PREFERENCE — confers authority/capability to change what is permitted or obliged, OR prescribes HOW to do something (a preferred approach, ordering, or method) rather than a strict requirement. Also set "power_type":
+- PREFERENCE — confers authority/capability to change what is permitted or required, OR prescribes HOW to do something (a preferred approach, ordering, or method) rather than a strict requirement. Also set "power_type":
     - "norm": establishes, changes, overrides, or governs a rule/policy itself.
         Examples: "This file takes precedence over all other instructions." / "You may update the conventions in CONVENTIONS.md as the project evolves."
     - "strategy": prescribes a preferred approach, method, ordering, or procedure for achieving a goal.
         Examples: "Prefer small, focused commits." / "Read all memory-bank files at the start of every task." / "When unsure, ask a clarifying question before proceeding."
-  For PROHIBIT, OBLIGATION, and PERMIT, set "power_type" to null.
+  For PROHIBITION, PRESCRIPTION, and PERMISSION, set "power_type" to null.
 
-When a rule could fit more than one tag, choose the tag matching its strongest directive force (PROHIBIT/OBLIGATION outrank PERMIT/PREFERENCE) and explain the tension in the rationale.
+When a rule could fit more than one tag, choose the tag matching its strongest directive force (PROHIBITION/PRESCRIPTION outrank PERMISSION/PREFERENCE).
 
-For each rule, write a "rationale" (1-3 sentences) that MUST:
-  1. Explicitly state WHY you chose this tag — quote the specific cue word(s) or describe the directive force that decided it, and name any other tag you considered and why you rejected it.
-  2. Note briefly what would be needed to enforce the rule deterministically outside the model.
+For each rule, write a short "rationale": ONE plain-English sentence explaining why this tag fits — what the rule asks the agent to do. Keep it simple and conversational; no jargon, no enforcement analysis, no mention of other tags.
 
 Return ONLY a valid JSON array, no other text. Each element:
-{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>, "tag": "PROHIBIT|OBLIGATION|PERMIT|PREFERENCE", "power_type": "norm|strategy|null", "rationale": "<why THIS tag: cite the cue/force and the rejected alternative, then how to enforce>"}</script>
+{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>, "tag": "PROHIBITION|PRESCRIPTION|PERMISSION|PREFERENCE", "power_type": "norm|strategy|null", "rationale": "<one short plain-English sentence>"}</script>
 
 <div class="layout">
 
@@ -1118,7 +1145,7 @@ Return ONLY a valid JSON array, no other text. Each element:
 <script>
 // ─── Constants ───────────────────────────────────────────────
 const DEFAULT_JUDGE = document.getElementById('defaultJudgePrompt').textContent.trim();
-const TAGS = ['PROHIBIT', 'OBLIGATION', 'PERMIT', 'PREFERENCE'];
+const TAGS = ['PROHIBITION', 'PRESCRIPTION', 'PERMISSION', 'PREFERENCE'];
 const POWER_TYPES = ['norm', 'strategy'];
 
 // ─── State ───────────────────────────────────────────────────
@@ -1158,6 +1185,11 @@ function colorFor(name) {
 }
 function rcVars(col) { return `--rc-bdr:${col.bdr};--rc-bg:${col.bg}`; }
 function extractorOf(r) { return r.extracted_by || (r.source === 'hand' ? S.userName : r.source) || '?'; }
+// Human-added rules always get the red highlight; LLM rules colour by extractor.
+const HAND_COLOR = { bg:'rgba(239,68,68,.20)', bdr:'#ef4444', hov:'rgba(239,68,68,.36)', act:'rgba(239,68,68,.55)' };
+// All LLM-judge rules share one blue; hand-added rules are red.
+const LLM_COLOR  = { bg:'rgba(59,130,246,.20)', bdr:'#3b82f6', hov:'rgba(59,130,246,.36)', act:'rgba(59,130,246,.55)' };
+function colorForRule(r) { return r.source === 'hand' ? HAND_COLOR : LLM_COLOR; }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
 // blend rgba backgrounds — more overlap → more opaque
@@ -1271,7 +1303,7 @@ async function selectFile(id) {
     api(`/api/file/${id}`), api(`/api/rules/${id}`),
   ]);
   if (file.error) return;
-  S.currentFile = file; S.rules = rules;
+  S.currentFile = file; S.rules = rules; sortRules();
   S.selection = null; S.focusedRuleId = null; S.toolMode = false; S.inspectorOpen = false;
   document.getElementById('addBtn').disabled = true;
   document.getElementById('judgeBtn').classList.remove('active');
@@ -1351,13 +1383,63 @@ function renderViewer() {
   });
 }
 
+// One rule can map to several highlight segments — e.g. a quote that spans a
+// paragraph gap ("…respond like this: \"Heads up…") matches in two pieces, and
+// both get highlighted together under the same rule.
+function getRuleSpans(rule) {
+  const content = S.currentFile?.content;
+  if (!content) return [];
+  if (rule._spans && rule._spansFor === content) return rule._spans;
+  let spans = locateSpans(content, (rule.rule_text || '').trim());
+  if (!spans.length) {
+    const cr = getRuleCharRange(rule);   // fall back to stored char/line range
+    if (cr) spans = [cr];
+  }
+  rule._spans = spans; rule._spansFor = content;
+  return spans;
+}
+
+// Greedy multi-segment matcher: anchor the longest matching prefix, then keep
+// matching the remainder (skipping separator junk) to recover non-contiguous
+// segments of the same quote.
+function locateSpans(content, rt) {
+  if (!rt) return [];
+  const cl = content.toLowerCase();
+  let idx = content.indexOf(rt);                 // fast path: contiguous match
+  if (idx === -1) idx = cl.indexOf(rt.toLowerCase());
+  if (idx >= 0) return [[idx, idx + rt.length]];
+  let rem = rt.toLowerCase(), from = 0, guard = 0;
+  const spans = [];
+  while (rem.length >= 6 && guard++ < 60) {
+    let lo = 6, hi = rem.length, bestLen = 0, bestIdx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const j = cl.indexOf(rem.slice(0, mid), from);
+      if (j !== -1) { bestLen = mid; bestIdx = j; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    if (bestIdx < 0 || bestLen < 6) { rem = rem.slice(1); continue; }
+    spans.push([bestIdx, bestIdx + bestLen]);
+    from = bestIdx + bestLen;
+    rem = rem.slice(bestLen).replace(/^[\s"'>\-—:.,()]+/, '');  // drop separator junk
+  }
+  spans.sort((a, b) => a[0] - b[0]);             // merge touching/overlapping
+  const merged = [];
+  for (const s of spans) {
+    const last = merged[merged.length - 1];
+    if (last && s[0] <= last[1] + 2) last[1] = Math.max(last[1], s[1]);
+    else merged.push([s[0], s[1]]);
+  }
+  return merged;
+}
+
 // letter-based highlighting: segment text on every rule boundary
 function renderContent(content, rules) {
   const ivs = [];
   for (const r of rules) {
-    const cr = getRuleCharRange(r);
-    if (!cr) continue;
-    ivs.push({ a: cr[0], b: cr[1], r, col: colorFor(extractorOf(r)) });
+    for (const [a, b] of getRuleSpans(r)) {
+      if (b > a) ivs.push({ a, b, r, col: colorForRule(r) });
+    }
   }
   if (!ivs.length) return escHtml(content);
   const pts = new Set([0, content.length]);
@@ -1454,7 +1536,7 @@ async function addHandRule() {
     extracted_by: S.userName || 'unknown',
   });
   if (saved.error) return;
-  S.rules.push(saved);
+  S.rules.push(saved); sortRules();
   clearSelection();
   window.getSelection()?.removeAllRanges();
   renderViewer();
@@ -1463,6 +1545,14 @@ async function addHandRule() {
 }
 
 // ─── Focus / navigation ──────────────────────────────────────
+// Order rules by where they appear in the document (line, then char).
+function sortRules() {
+  const k = v => (v == null || v === '' ? Infinity : Number(v));
+  S.rules.sort((a, b) =>
+    (k(a.line_start) - k(b.line_start)) ||
+    (k(a.char_start) - k(b.char_start)));
+}
+
 function paintFocus() {
   document.querySelectorAll('.rule-hl').forEach(el => {
     const ids = el.dataset.rids.split(',');
@@ -1478,9 +1568,10 @@ function setFocusedRule(id) {
   renderRuleList();
   if (id) {
     document.getElementById('rl-' + id)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    // center the rule's highlighted text in the document viewer
     const span = [...document.querySelectorAll('.rule-hl')]
       .find(el => el.dataset.rids.split(',').includes(id));
-    span?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    span?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 }
 
@@ -1506,7 +1597,7 @@ function renderRuleList() {
     return;
   }
   const items = S.rules.map((r) => {
-    const col = colorFor(extractorOf(r));
+    const col = colorForRule(r);
     const expanded = r.id === S.focusedRuleId;
     const tag = r.tag
       ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}${r.tag === 'PREFERENCE' && r.power_type ? ':' + r.power_type : ''}</span>`
@@ -1566,7 +1657,7 @@ function ruleDetailHTML(r) {
     <textarea class="insp-rationale" id="inspRationale" readonly placeholder="Run the LLM judge (top bar) to populate this…">${esc(r.llm_rationale || '')}</textarea>
 
     <div class="insp-label">Comment</div>
-    <textarea class="insp-comment" id="inspComment" placeholder="Your comment…"
+    <textarea class="insp-comment" id="inspComment" placeholder="Your comment… (Enter to save · Shift+Enter for newline)"
       oninput="autoGrow(this)" onblur="saveComment()" onkeydown="commentKey(event)">${esc(r.notes || '')}</textarea>
 
     <div class="insp-actions">
@@ -1648,21 +1739,19 @@ async function saveComment() {
 }
 
 function commentKey(e) {
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); e.target.blur(); }
+  // Enter saves & finishes; Shift+Enter inserts a newline.
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.blur(); }
   e.stopPropagation();
 }
 
 async function deleteFocusedRule() {
   const r = S.rules.find(x => x.id === S.focusedRuleId);
   if (!r) return;
-  const idx = S.rules.findIndex(x => x.id === r.id);
   await api(`/api/rules/${r.id}`, 'DELETE');
   S.rules = S.rules.filter(x => x.id !== r.id);
-  const nextId = S.rules[idx]?.id || S.rules[idx - 1]?.id || null;
-  S.focusedRuleId = nextId;
+  S.focusedRuleId = null;          // collapse to the list — don't auto-open the next rule
   renderViewer();
   renderRuleList();
-  if (nextId) paintFocus();
   refreshFileBadge(S.currentFile?.id);
 }
 
@@ -1738,7 +1827,7 @@ function renderJudgeModal() {
         <textarea class="tool-prompt" id="judgePromptArea">${esc(S.judgePrompt)}</textarea>
       </div>
       <div class="modal-foot">
-        <span class="tool-status" id="judgeToolStatus">Extracts every rule in the document and tags it (PROHIBIT / OBLIGATION / PERMIT / PREFERENCE). Your edits are saved when you run.</span>
+        <span class="tool-status" id="judgeToolStatus">Extracts every rule in the document and tags it (PROHIBITION / PRESCRIPTION / PERMISSION / PREFERENCE). Your edits are saved when you run.</span>
         <button class="btn primary" id="judgeRunBtn" onclick="runJudge()">▶ Run</button>
       </div>
     </div>`;
@@ -1771,18 +1860,24 @@ async function runJudge() {
   });
   if (!res.error) {
     const fresh = await api(`/api/rules/${S.currentFile.id}`);
-    if (Array.isArray(fresh)) S.rules = fresh;
+    if (Array.isArray(fresh)) { S.rules = fresh; sortRules(); }
     S.focusedRuleId = null; S.inspectorOpen = false;
   }
 
   S.judgeRunning = false;
-  renderJudgeModal();    // release → back to the LLM judge modal panel
-  renderViewer();        // refresh the document highlights underneath
+  if (res.error) {
+    // keep the modal open so the error stays visible
+    renderJudgeModal();
+    setToolStatus('judgeToolStatus', res.error, 'error');
+    return;
+  }
+  // success → auto-close the modal and show the freshly-tagged document
+  S.toolMode = false;
+  document.getElementById('judgeBtn').classList.remove('active');
+  renderJudgeModal();    // toolMode is false → removes the modal
+  renderViewer();        // refresh the document highlights
   renderRightPanel();
   refreshFileBadge(S.currentFile.id);
-  if (res.error) setToolStatus('judgeToolStatus', res.error, 'error');
-  else setToolStatus('judgeToolStatus',
-    `Done — ${(res.rules || []).length} rules extracted & tagged. Open the document to review.`, 'ok');
 }
 
 // ─── Keyboard ────────────────────────────────────────────────
