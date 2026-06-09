@@ -46,9 +46,17 @@ if os.path.exists(_env_path):
 
 # ---------------------------------------------------------------------------
 # DB
+#
+# Annotations live in MotherDuck (cloud DuckDB) when MOTHERDUCK_TOKEN is set —
+# this is what makes Vercel (ephemeral filesystem) and multi-device work. With
+# no token, it falls back to the local annotations.db file. The token is read
+# from the environment (.env locally, Vercel env vars in production).
 # ---------------------------------------------------------------------------
-def annot_con():
-    con = duckdb.connect(ANNOT_DB)
+MOTHERDUCK_TOKEN = os.environ.get("MOTHERDUCK_TOKEN") or os.environ.get("motherduck_token")
+MOTHERDUCK_DATABASE = os.environ.get("MOTHERDUCK_DATABASE", "rules")
+USE_MOTHERDUCK = bool(MOTHERDUCK_TOKEN)
+
+def _ensure_schema(con):
     con.execute("""
         CREATE TABLE IF NOT EXISTS extracted_rules (
             id           VARCHAR PRIMARY KEY,
@@ -65,36 +73,48 @@ def annot_con():
             created_at   TIMESTAMP DEFAULT now()
         )
     """)
-    # notes == user "Comment" in the inspector
+    # notes == user "Comment" in the inspector;
+    # annotator == which person owns this labeling (hand rules AND the LLM runs they triggered)
     for col in ("notes VARCHAR", "extracted_by VARCHAR",
-                "tag VARCHAR", "power_type VARCHAR", "llm_rationale TEXT"):
+                "tag VARCHAR", "power_type VARCHAR", "llm_rationale TEXT",
+                "annotator VARCHAR"):
         try: con.execute(f"ALTER TABLE extracted_rules ADD COLUMN {col}")
         except Exception: pass
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS app_settings (
-            key   VARCHAR PRIMARY KEY,
-            value TEXT
-        )
-    """)
+    con.execute("CREATE TABLE IF NOT EXISTS annotators (name VARCHAR PRIMARY KEY, created_at TIMESTAMP DEFAULT now())")
+    con.execute("CREATE TABLE IF NOT EXISTS app_settings (key VARCHAR PRIMARY KEY, value TEXT)")
     con.execute("""
         CREATE TABLE IF NOT EXISTS llm_runs (
-            id           VARCHAR PRIMARY KEY,
-            file_id      VARCHAR NOT NULL,
-            prompt       TEXT,
-            model        VARCHAR,
-            raw_response TEXT,
-            rule_count   INTEGER DEFAULT 0,
-            created_at   TIMESTAMP DEFAULT now()
+            id VARCHAR PRIMARY KEY, file_id VARCHAR NOT NULL, prompt TEXT, model VARCHAR,
+            raw_response TEXT, rule_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT now()
         )
     """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS saved_prompts (
-            id        VARCHAR PRIMARY KEY,
-            prompt    TEXT NOT NULL,
-            label     VARCHAR,
-            saved_at  TIMESTAMP DEFAULT now()
-        )
-    """)
+    con.execute("CREATE TABLE IF NOT EXISTS saved_prompts (id VARCHAR PRIMARY KEY, prompt TEXT NOT NULL, label VARCHAR, saved_at TIMESTAMP DEFAULT now())")
+
+def _md_connect(target):
+    # On Vercel the project dir is read-only; point DuckDB's extension/home dir
+    # at the writable /tmp so the MotherDuck extension can auto-install.
+    cfg = {"home_directory": "/tmp"} if os.environ.get("VERCEL") else {}
+    return duckdb.connect(target, config=cfg)
+
+_annot_base = None   # cached MotherDuck session (one network connection)
+
+def annot_con():
+    """Return an annotations connection. Route code uses it then calls .close().
+    - Local: a fresh per-request connection to annotations.db (cheap, thread-safe).
+    - MotherDuck: a per-request cursor over one cached cloud session; .close()
+      then closes only the cursor, keeping the (expensive) session alive."""
+    global _annot_base
+    if USE_MOTHERDUCK:
+        if _annot_base is None:
+            boot = _md_connect(f"md:?motherduck_token={MOTHERDUCK_TOKEN}")
+            boot.execute(f"CREATE DATABASE IF NOT EXISTS {MOTHERDUCK_DATABASE}")
+            boot.close()
+            base = _md_connect(f"md:{MOTHERDUCK_DATABASE}?motherduck_token={MOTHERDUCK_TOKEN}")
+            _ensure_schema(base)
+            _annot_base = base
+        return _annot_base.cursor()
+    con = duckdb.connect(ANNOT_DB)
+    _ensure_schema(con)
     return con
 
 _sample_ro = None
@@ -122,10 +142,17 @@ def api_files():
         "SELECT id, source_url, repo_name, file_type, content_len, source "
         "FROM sample ORDER BY content_len DESC"
     ).fetchall()
+    annotator = (request.args.get("annotator") or "").strip()
     con = annot_con()
-    raw = con.execute(
-        "SELECT file_id, source, COUNT(*) FROM extracted_rules GROUP BY 1,2"
-    ).fetchall()
+    if annotator:
+        raw = con.execute(
+            "SELECT file_id, source, COUNT(*) FROM extracted_rules WHERE annotator=? GROUP BY 1,2",
+            [annotator]
+        ).fetchall()
+    else:
+        raw = con.execute(
+            "SELECT file_id, source, COUNT(*) FROM extracted_rules GROUP BY 1,2"
+        ).fetchall()
     con.close()
     counts = {}
     for fid, src, n in raw:
@@ -164,6 +191,7 @@ def _rule_row(r):
         "notes": r[8], "extracted_by": r[9],
         "created_at": str(r[10]),
         "tag": r[11], "power_type": r[12], "llm_rationale": r[13],
+        "annotator": r[14],
     }
 
 @app.route("/api/all-rules")
@@ -196,14 +224,20 @@ def api_all_rules():
 
 @app.route("/api/rules/<fid>")
 def api_rules(fid):
+    annotator = (request.args.get("annotator") or "").strip()
     con = annot_con()
-    rows = con.execute("""
+    sql = """
         SELECT id, rule_text, char_start, char_end, line_start, line_end,
                source, llm_run_id, notes, extracted_by, created_at,
-               tag, power_type, llm_rationale
+               tag, power_type, llm_rationale, annotator
         FROM extracted_rules WHERE file_id=?
-        ORDER BY COALESCE(line_start, 999999), COALESCE(char_start, 999999), created_at
-    """, [fid]).fetchall()
+    """
+    params = [fid]
+    if annotator:
+        sql += " AND annotator=?"
+        params.append(annotator)
+    sql += " ORDER BY COALESCE(line_start, 999999), COALESCE(char_start, 999999), created_at"
+    rows = con.execute(sql, params).fetchall()
     con.close()
     return jsonify([_rule_row(r) for r in rows])
 
@@ -214,24 +248,27 @@ def save_rule():
     rule_text = b.get("rule_text","").strip()
     if not fid or not rule_text:
         return jsonify({"error": "file_id and rule_text required"}), 400
-    rid = make_id(fid, "hand", rule_text)
-    by  = b.get("extracted_by") or "unknown"
+    annotator = (b.get("annotator") or b.get("extracted_by") or "unknown").strip()
+    rid = make_id(fid, "hand", annotator, rule_text)   # scoped per annotator
+    by  = b.get("extracted_by") or annotator
     con = annot_con()
     con.execute("""
         INSERT OR IGNORE INTO extracted_rules
             (id,file_id,rule_text,char_start,char_end,line_start,line_end,
-             source,llm_run_id,notes,extracted_by)
-        VALUES(?,?,?,?,?,?,?,'hand',NULL,NULL,?)
+             source,llm_run_id,notes,extracted_by,annotator)
+        VALUES(?,?,?,?,?,?,?,'hand',NULL,NULL,?,?)
     """, [rid, fid, rule_text,
           b.get("char_start"), b.get("char_end"),
-          b.get("line_start"), b.get("line_end"), by])
+          b.get("line_start"), b.get("line_end"), by, annotator])
+    if annotator:
+        con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
     con.close()
     return jsonify({
         "id": rid, "rule_text": rule_text,
         "char_start": b.get("char_start"), "char_end": b.get("char_end"),
         "line_start": b.get("line_start"), "line_end": b.get("line_end"),
         "source": "hand", "llm_run_id": None, "notes": None,
-        "extracted_by": by,
+        "extracted_by": by, "annotator": annotator,
         "tag": None, "power_type": None, "llm_rationale": None,
     })
 
@@ -406,14 +443,20 @@ def run_llm():
                     rule["line_start"] = best_li + 1
                     rule["line_end"]   = best_li + 1
 
+    annotator = (b.get("annotator") or "").strip()
+    if annotator:
+        con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
     con.execute(
         "INSERT INTO llm_runs(id,file_id,prompt,model,raw_response,rule_count) VALUES(?,?,?,?,?,?)",
         [run_id, fid, prompt, model, raw, len(extracted)]
     )
-    # The unified "LLM judge" run replaces the previously auto-extracted set so
-    # re-running doesn't pile up duplicates (hand-added rules are untouched).
+    # The unified "LLM judge" run replaces this annotator's previously auto-extracted
+    # set (other annotators' rules and hand-added rules are untouched).
     if b.get("replace_llm"):
-        con.execute("DELETE FROM extracted_rules WHERE file_id=? AND source='llm'", [fid])
+        con.execute(
+            "DELETE FROM extracted_rules WHERE file_id=? AND source='llm' AND annotator IS NOT DISTINCT FROM ?",
+            [fid, annotator or None]
+        )
 
     def _norm_tag(t):
         t = (t or "").strip().upper()
@@ -429,25 +472,25 @@ def run_llm():
     for rule in extracted:
         rt = rule.get("rule_text","").strip()
         if not rt: continue
-        eid = make_id(fid, "llm", run_id, rt)
+        eid = make_id(fid, "llm", annotator, run_id, rt)
         tag = _norm_tag(rule.get("tag"))
         power_type = _norm_power(tag, rule.get("power_type"))
         rationale = rule.get("rationale") or rule.get("llm_rationale")
         con.execute("""
             INSERT OR IGNORE INTO extracted_rules
                 (id,file_id,rule_text,char_start,char_end,line_start,line_end,
-                 source,llm_run_id,notes,extracted_by,tag,power_type,llm_rationale)
-            VALUES(?,?,?,?,?,?,?,'llm',?,NULL,?,?,?,?)
+                 source,llm_run_id,notes,extracted_by,tag,power_type,llm_rationale,annotator)
+            VALUES(?,?,?,?,?,?,?,'llm',?,NULL,?,?,?,?,?)
         """, [eid, fid, rt,
               rule.get("char_start"), rule.get("char_end"),
               rule.get("line_start"), rule.get("line_end"),
-              run_id, model, tag, power_type, rationale])
+              run_id, model, tag, power_type, rationale, annotator or None])
         saved.append({
             "id": eid, "rule_text": rt,
             "char_start": rule.get("char_start"), "char_end": rule.get("char_end"),
             "line_start": rule.get("line_start"), "line_end": rule.get("line_end"),
             "source": "llm", "llm_run_id": run_id, "notes": None,
-            "extracted_by": model,
+            "extracted_by": model, "annotator": annotator,
             "tag": tag, "power_type": power_type, "llm_rationale": rationale,
         })
     con.close()
@@ -466,14 +509,20 @@ def delete_llm_run(run_id):
 # ---------------------------------------------------------------------------
 @app.route("/export")
 def export_page():
+    annotator = (request.args.get("annotator") or "").strip()
     acon = annot_con()
-    rows = acon.execute("""
+    sql = """
         SELECT r.file_id, r.rule_text, r.line_start, r.line_end,
                r.source, r.extracted_by, r.notes, r.created_at,
-               r.tag, r.power_type, r.llm_rationale
+               r.tag, r.power_type, r.llm_rationale, r.annotator
         FROM extracted_rules r
-        ORDER BY r.file_id, COALESCE(r.line_start, 999999), r.created_at
-    """).fetchall()
+    """
+    params = []
+    if annotator:
+        sql += " WHERE r.annotator=?"
+        params.append(annotator)
+    sql += " ORDER BY r.file_id, COALESCE(r.line_start, 999999), r.created_at"
+    rows = acon.execute(sql, params).fetchall()
     acon.close()
     sc = sample_con()
     url_map = {}
@@ -485,19 +534,14 @@ def export_page():
         ).fetchall()}
     # NOTE: sample_con() is a cached, shared read-only connection — do NOT close it.
 
-    def _power(tag, ptype):
-        if tag == "PREFERENCE" and ptype:
-            return f"PREFERENCE:{ptype}"
-        return tag or ""
-
     import csv, io
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["source_url","source","extracted_by","line_start","line_end",
+    writer.writerow(["annotator","source_url","source","extracted_by","line_start","line_end",
                      "rule_text","tag","user_comment","llm_rationale","created_at"])
     for r in rows:
-        writer.writerow([url_map.get(r[0],""), r[4], r[5] or "", r[2] or "", r[3] or "",
-                         r[1], _power(r[8], r[9]), r[6] or "", r[10] or "", str(r[7] or "")])
+        writer.writerow([r[11] or "", url_map.get(r[0],""), r[4], r[5] or "", r[2] or "", r[3] or "",
+                         r[1], r[8] or "", r[6] or "", r[10] or "", str(r[7] or "")])
     csv_text = buf.getvalue()
     row_count = len(rows)
 
@@ -579,6 +623,33 @@ def delete_prompt(pid):
     con.execute("DELETE FROM saved_prompts WHERE id=?", [pid])
     con.close()
     return jsonify({"ok": True})
+
+# ---------------------------------------------------------------------------
+# Routes – annotators (the people doing the labeling)
+# ---------------------------------------------------------------------------
+@app.route("/api/annotators")
+def list_annotators():
+    con = annot_con()
+    # union of registered annotators and any that appear on rules
+    rows = con.execute("""
+        SELECT name FROM annotators
+        UNION
+        SELECT DISTINCT annotator FROM extracted_rules WHERE annotator IS NOT NULL AND annotator <> ''
+        ORDER BY 1
+    """).fetchall()
+    con.close()
+    return jsonify([r[0] for r in rows])
+
+@app.route("/api/annotators", methods=["POST"])
+def create_annotator():
+    b = request.json or {}
+    name = (b.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    con = annot_con()
+    con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [name])
+    con.close()
+    return jsonify({"ok": True, "name": name})
 
 # ---------------------------------------------------------------------------
 # Routes – app settings (persisted, editable judge/extract prompts + models)
@@ -1078,19 +1149,19 @@ Assign exactly ONE tag per rule, using these definitions, cue words, and concret
     - "Feel free to suggest refactors, but don't apply them automatically."
     - "You can use the web search tool when you need current information."
 
-- PREFERENCE — confers authority/capability to change what is permitted or required, OR prescribes HOW to do something (a preferred approach, ordering, or method) rather than a strict requirement. Also set "power_type":
-    - "norm": establishes, changes, overrides, or governs a rule/policy itself.
-        Examples: "This file takes precedence over all other instructions." / "You may update the conventions in CONVENTIONS.md as the project evolves."
-    - "strategy": prescribes a preferred approach, method, ordering, or procedure for achieving a goal.
-        Examples: "Prefer small, focused commits." / "Read all memory-bank files at the start of every task." / "When unsure, ask a clarifying question before proceeding."
-  For PROHIBITION, PRESCRIPTION, and PERMISSION, set "power_type" to null.
+- PREFERENCE — expresses a soft preference or recommends HOW to do something (a preferred approach, ordering, or method) rather than a strict requirement.
+  Cues: "prefer", "ideally", "when possible", "it's best to", "try to", "consider".
+  Examples:
+    - "Prefer small, focused commits."
+    - "Read all memory-bank files at the start of every task."
+    - "When unsure, ask a clarifying question before proceeding."
 
 When a rule could fit more than one tag, choose the tag matching its strongest directive force (PROHIBITION/PRESCRIPTION outrank PERMISSION/PREFERENCE).
 
 For each rule, write a short "rationale": ONE plain-English sentence explaining why this tag fits — what the rule asks the agent to do. Keep it simple and conversational; no jargon, no enforcement analysis, no mention of other tags.
 
 Return ONLY a valid JSON array, no other text. Each element:
-{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>, "tag": "PROHIBITION|PRESCRIPTION|PERMISSION|PREFERENCE", "power_type": "norm|strategy|null", "rationale": "<one short plain-English sentence>"}</script>
+{"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>, "tag": "PROHIBITION|PRESCRIPTION|PERMISSION|PREFERENCE", "rationale": "<one short plain-English sentence>"}</script>
 
 <div class="layout">
 
@@ -1126,9 +1197,9 @@ Return ONLY a valid JSON array, no other text. Each element:
   <!-- ── Inspector ── -->
   <div class="insp-panel">
     <div class="name-bar">
-      <label for="annotatorName">Annotator:</label>
-      <input id="annotatorName" class="name-input" placeholder="Your name" oninput="saveName(this.value)">
-      <button class="csv-btn" onclick="exportCSV()" title="Export rules as CSV">⬇ CSV</button>
+      <label for="annotatorSelect">Annotator:</label>
+      <select id="annotatorSelect" class="name-input" onchange="onAnnotatorChange(this.value)"></select>
+      <button class="csv-btn" onclick="exportCSV()" title="Export this annotator's rules as CSV">⬇ CSV</button>
     </div>
     <div class="inspector" id="inspector">
       <div class="insp-empty">Select a file, then click a highlight or select text and press <b>+ Add Rule</b>.</div>
@@ -1146,7 +1217,6 @@ Return ONLY a valid JSON array, no other text. Each element:
 // ─── Constants ───────────────────────────────────────────────
 const DEFAULT_JUDGE = document.getElementById('defaultJudgePrompt').textContent.trim();
 const TAGS = ['PROHIBITION', 'PRESCRIPTION', 'PERMISSION', 'PREFERENCE'];
-const POWER_TYPES = ['norm', 'strategy'];
 
 // ─── State ───────────────────────────────────────────────────
 const S = {
@@ -1157,6 +1227,7 @@ const S = {
   focusedRuleId: null,
   inspectorOpen: false,
   userName:      localStorage.getItem('annotatorName') || '',
+  annotators:    [],
   toolMode:      false,
   judgeRunning:  false,
   judgePrompt:   DEFAULT_JUDGE,
@@ -1238,8 +1309,8 @@ function initResizablePanel() {
 
 // ─── Boot ────────────────────────────────────────────────────
 async function init() {
-  document.getElementById('annotatorName').value = S.userName;
   initResizablePanel();
+  await loadAnnotators();
   const settings = await api('/api/settings');
   if (settings && !settings.error) {
     // llm_judge_prompt is the unified extract+tag+rationale prompt (new key so
@@ -1247,16 +1318,65 @@ async function init() {
     if (settings.llm_judge_prompt) S.judgePrompt = settings.llm_judge_prompt;
     if (settings.judge_model)      S.judgeModel  = settings.judge_model;
   }
-  const files = await api('/api/files');
+  const files = await api(filesUrl());
   if (files.error) { return; }
   S.allFiles = files;
   document.getElementById('fileCountLabel').textContent = files.length;
   renderFileList(files);
 }
 
-function saveName(v) {
-  S.userName = v.trim();
+// ─── Annotators ──────────────────────────────────────────────
+function filesUrl() {
+  return S.userName ? `/api/files?annotator=${encodeURIComponent(S.userName)}` : '/api/files';
+}
+
+async function loadAnnotators() {
+  const list = await api('/api/annotators');
+  S.annotators = Array.isArray(list) ? list : [];
+  // keep a sensible active annotator
+  if (!S.userName && S.annotators.length) S.userName = S.annotators[0];
+  renderAnnotatorSelect();
+}
+
+function renderAnnotatorSelect() {
+  const sel = document.getElementById('annotatorSelect');
+  if (!sel) return;
+  const opts = S.annotators.map(a =>
+    `<option value="${esc(a)}"${a === S.userName ? ' selected' : ''}>${esc(a)}</option>`).join('');
+  sel.innerHTML = opts + `<option value="__new__">＋ New annotator…</option>`;
+  if (!S.annotators.length) sel.value = '__new__';
+}
+
+async function onAnnotatorChange(v) {
+  if (v === '__new__') {
+    const name = (prompt('New annotator name:') || '').trim();
+    if (!name) { renderAnnotatorSelect(); return; }   // cancelled → restore selection
+    await api('/api/annotators', 'POST', { name });
+    S.userName = name;
+    if (!S.annotators.includes(name)) S.annotators.push(name);
+    S.annotators.sort();
+  } else {
+    S.userName = v;
+  }
   localStorage.setItem('annotatorName', S.userName);
+  renderAnnotatorSelect();
+  await refreshForAnnotator();
+}
+
+// Reload the file list (counts) and the current file's rules for the active annotator.
+async function refreshForAnnotator() {
+  const files = await api(filesUrl());
+  if (Array.isArray(files)) { S.allFiles = files; renderFileList(files); }
+  if (S.currentFile) {
+    const rules = await api(`/api/rules/${S.currentFile.id}?annotator=${encodeURIComponent(S.userName)}`);
+    if (Array.isArray(rules)) { S.rules = rules; sortRules(); }
+    S.focusedRuleId = null; S.selection = null; S.toolMode = false;
+    document.getElementById('addBtn').disabled = true;
+    document.getElementById('judgeBtn').classList.remove('active');
+    renderJudgeModal();
+    renderViewer();
+    renderRightPanel();
+  }
 }
 
 // ─── File list ───────────────────────────────────────────────
@@ -1299,8 +1419,9 @@ function filterFiles(q) {
 // ─── Select file ─────────────────────────────────────────────
 async function selectFile(id) {
   if (S.judgeRunning) return;   // locked while a judge run is in flight
+  const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
   const [file, rules] = await Promise.all([
-    api(`/api/file/${id}`), api(`/api/rules/${id}`),
+    api(`/api/file/${id}`), api(`/api/rules/${id}${aq}`),
   ]);
   if (file.error) return;
   S.currentFile = file; S.rules = rules; sortRules();
@@ -1534,6 +1655,7 @@ async function addHandRule() {
     file_id: S.currentFile.id, rule_text: text.trim(),
     char_start: start, char_end: end, line_start, line_end,
     extracted_by: S.userName || 'unknown',
+    annotator: S.userName || 'unknown',
   });
   if (saved.error) return;
   S.rules.push(saved); sortRules();
@@ -1600,7 +1722,7 @@ function renderRuleList() {
     const col = colorForRule(r);
     const expanded = r.id === S.focusedRuleId;
     const tag = r.tag
-      ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}${r.tag === 'PREFERENCE' && r.power_type ? ':' + r.power_type : ''}</span>`
+      ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}</span>`
       : '';
     const flags = [
       r.llm_rationale ? '<span class="rl-flag" title="Has LLM rationale">⚖</span>' : '',
@@ -1667,16 +1789,12 @@ function ruleDetailHTML(r) {
   </div>`;
 }
 
-// Tag buttons + (when PREFERENCE) the norm/strategy sub-row.
+// Single-choice tag buttons.
 function tagSectionHTML(r) {
   const tagBtns = TAGS.map(t =>
     `<button class="tag-btn${r.tag === t ? ' active ' + t.toLowerCase() : ''}" onclick="setTag('${t}')">${t}</button>`
   ).join('');
-  const powerRow = r.tag === 'PREFERENCE'
-    ? `<div class="power-row"><span class="power-hint">as:</span>${POWER_TYPES.map(p =>
-        `<button class="sub-btn${r.power_type === p ? ' active' : ''}" onclick="setPowerType('${p}')">${p}</button>`).join('')}</div>`
-    : '';
-  return `<div class="tag-row">${tagBtns}</div>${powerRow}`;
+  return `<div class="tag-row">${tagBtns}</div>`;
 }
 
 // Auto-grow a textarea to fit its content, up to its CSS max-height, then scroll.
@@ -1700,9 +1818,7 @@ function refreshTagSection(r) {
   // keep the collapsed-header tag badge in sync (in place — preserves textareas)
   const top = document.getElementById('rl-' + r.id)?.querySelector('.rl-top');
   if (top) {
-    const html = r.tag
-      ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}${r.tag === 'PREFERENCE' && r.power_type ? ':' + r.power_type : ''}</span>`
-      : '';
+    const html = r.tag ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}</span>` : '';
     const old = top.querySelector('.rl-tag');
     if (old) old.outerHTML = html;
     else if (html) top.insertAdjacentHTML('afterbegin', html);
@@ -1714,17 +1830,8 @@ async function setTag(t) {
   if (!r) return;
   const newTag = r.tag === t ? null : t;   // toggle in place
   r.tag = newTag;
-  if (newTag !== 'PREFERENCE') r.power_type = null;
   refreshTagSection(r);                     // update buttons only — don't rebuild the panel
-  await api(`/api/rules/${r.id}`, 'PATCH', { tag: newTag, power_type: r.power_type });
-}
-
-async function setPowerType(p) {
-  const r = S.rules.find(x => x.id === S.focusedRuleId);
-  if (!r) return;
-  r.power_type = r.power_type === p ? null : p;
-  refreshTagSection(r);
-  await api(`/api/rules/${r.id}`, 'PATCH', { power_type: r.power_type });
+  await api(`/api/rules/${r.id}`, 'PATCH', { tag: newTag });
 }
 
 async function saveComment() {
@@ -1857,9 +1964,11 @@ async function runJudge() {
 
   const res = await api('/api/llm', 'POST', {
     file_id: S.currentFile.id, prompt: S.judgePrompt, model: S.judgeModel, replace_llm: true,
+    annotator: S.userName || 'unknown',
   });
   if (!res.error) {
-    const fresh = await api(`/api/rules/${S.currentFile.id}`);
+    const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
+    const fresh = await api(`/api/rules/${S.currentFile.id}${aq}`);
     if (Array.isArray(fresh)) { S.rules = fresh; sortRules(); }
     S.focusedRuleId = null; S.inspectorOpen = false;
   }
@@ -1914,7 +2023,10 @@ document.addEventListener('keydown', e => {
 });
 
 // ─── Export ──────────────────────────────────────────────────
-function exportCSV() { window.open('/export', '_blank'); }
+function exportCSV() {
+  const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
+  window.open('/export' + aq, '_blank');
+}
 
 // ─── Helpers ─────────────────────────────────────────────────
 async function api(url, method = 'GET', body = null) {
