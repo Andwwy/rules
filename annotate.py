@@ -20,7 +20,7 @@ Usage:
   open http://localhost:5002
 """
 
-import hashlib, json, os, re, urllib.request, urllib.error
+import hashlib, json, os, re, threading, urllib.request, urllib.error
 from datetime import datetime, timezone
 import duckdb
 from flask import Flask, jsonify, request
@@ -96,20 +96,27 @@ def _md_connect(target):
     cfg = {"home_directory": "/tmp"} if os.environ.get("RENDER") else {}
     return duckdb.connect(target, config=cfg)
 
-_annot_base = None   # cached MotherDuck session (one network connection)
+_annot_base = None          # cached MotherDuck session (one network connection)
+_md_lock = threading.Lock()  # guards the lazy session init against concurrent requests
 
 def _md_base():
     """Open once and cache the single MotherDuck session. Both the annotation
     tables AND the `sample` source documents live in this one cloud database, so
-    nothing DB-related needs to ship in git for the Render deploy."""
+    nothing DB-related needs to ship in git for the Render deploy.
+
+    The init is lock-guarded: a fresh page load fires several requests at once
+    (threaded dev server / gunicorn --threads), and without the lock they'd race
+    on session creation and some would come back empty."""
     global _annot_base
     if _annot_base is None:
-        boot = _md_connect(f"md:?motherduck_token={MOTHERDUCK_TOKEN}")
-        boot.execute(f"CREATE DATABASE IF NOT EXISTS {MOTHERDUCK_DATABASE}")
-        boot.close()
-        base = _md_connect(f"md:{MOTHERDUCK_DATABASE}?motherduck_token={MOTHERDUCK_TOKEN}")
-        _ensure_schema(base)
-        _annot_base = base
+        with _md_lock:
+            if _annot_base is None:   # double-checked: another thread may have won
+                boot = _md_connect(f"md:?motherduck_token={MOTHERDUCK_TOKEN}")
+                boot.execute(f"CREATE DATABASE IF NOT EXISTS {MOTHERDUCK_DATABASE}")
+                boot.close()
+                base = _md_connect(f"md:{MOTHERDUCK_DATABASE}?motherduck_token={MOTHERDUCK_TOKEN}")
+                _ensure_schema(base)
+                _annot_base = base
     return _annot_base
 
 def annot_con():
@@ -125,16 +132,15 @@ def annot_con():
 
 _sample_ro = None
 def sample_con():
-    """Cached, shared read-only handle to the `sample` source documents — callers
-    must NOT close it.
-    - MotherDuck: a cursor over the shared cloud session (the `sample` table lives
-      in the same MotherDuck database; load it with upload_sample_to_motherduck.py).
-    - Local: a read-only connection to sample.db."""
+    """Read-only handle to the `sample` source documents — callers need NOT close it.
+    - MotherDuck: a FRESH cursor over the shared cloud session per call. A cursor is
+      duckdb's thread-safe unit, so each request gets its own (a single shared cursor
+      would race across threads and return empty). The `sample` table lives in the
+      same MotherDuck database; load it with upload_sample_to_motherduck.py.
+    - Local: a cached read-only connection to sample.db."""
     global _sample_ro
     if USE_MOTHERDUCK:
-        if _sample_ro is None:
-            _sample_ro = _md_base().cursor()
-        return _sample_ro
+        return _md_base().cursor()
     if _sample_ro is None and os.path.exists(SAMPLE_DB):
         _sample_ro = duckdb.connect(SAMPLE_DB, read_only=True)
     return _sample_ro
@@ -1002,6 +1008,17 @@ kbd {
 
 /* ── Rule list ── */
 .rl-head { font-size: 11px; font-weight: 700; color: #8080a8; text-transform: uppercase; letter-spacing: 0.3px; padding: 2px 2px 4px; flex-shrink: 0; }
+.rl-headbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0; }
+.rl-filter { display: inline-flex; background: #ececf4; border-radius: 8px; padding: 2px; gap: 2px; }
+.rl-filter button {
+  border: 0; background: transparent; cursor: pointer; font: inherit;
+  font-size: 11px; font-weight: 600; color: #7070a0; padding: 3px 9px; border-radius: 6px;
+  display: inline-flex; align-items: center; gap: 5px; line-height: 1;
+}
+.rl-filter button:hover { color: #4338ca; }
+.rl-filter button.active { background: white; color: #4338ca; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
+.rl-filter .fcount { font-size: 10px; font-weight: 700; color: #a0a0c0; }
+.rl-filter button.active .fcount { color: #6366f1; }
 .rl-item {
   display: flex; gap: 9px; align-items: stretch; cursor: pointer;
   background: #fff; border: 1px solid #ececf4; border-radius: 8px;
@@ -1244,6 +1261,7 @@ const S = {
   userName:      localStorage.getItem('annotatorName') || '',
   annotators:    [],
   toolMode:      false,
+  ruleFilter:    localStorage.getItem('ruleFilter') || 'all',   // all | hand | llm
   judgeRunning:  false,
   judgePrompt:   DEFAULT_JUDGE,
   judgeModel:    'anthropic/claude-sonnet-4-6',
@@ -1277,6 +1295,24 @@ const HAND_COLOR = { bg:'rgba(239,68,68,.20)', bdr:'#ef4444', hov:'rgba(239,68,6
 const LLM_COLOR  = { bg:'rgba(59,130,246,.20)', bdr:'#3b82f6', hov:'rgba(59,130,246,.36)', act:'rgba(59,130,246,.55)' };
 function colorForRule(r) { return r.source === 'hand' ? HAND_COLOR : LLM_COLOR; }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
+
+// Human / LLM / All filter — drives BOTH the inspector list and the body highlights.
+function matchesFilter(r) {
+  return S.ruleFilter === 'all'
+    || (S.ruleFilter === 'hand' && r.source === 'hand')
+    || (S.ruleFilter === 'llm'  && r.source === 'llm');
+}
+function visibleRules() { return S.rules.filter(matchesFilter); }
+
+function setRuleFilter(v) {
+  if (v === S.ruleFilter) return;
+  S.ruleFilter = v;
+  localStorage.setItem('ruleFilter', v);
+  // if the focused rule is now hidden, collapse it so we don't show stale detail
+  if (S.focusedRuleId && !visibleRules().some(r => r.id === S.focusedRuleId)) S.focusedRuleId = null;
+  renderViewer();        // re-highlight the document body
+  renderRightPanel();    // re-render the rule list
+}
 
 // blend rgba backgrounds — more overlap → more opaque
 function parseRgba(s) {
@@ -1500,7 +1536,7 @@ function renderViewer() {
   body.innerHTML = `
     <div class="line-nums">${lineNums}</div>
     <pre class="content-pre" id="contentPre"></pre>`;
-  document.getElementById('contentPre').innerHTML = renderContent(content, S.rules);
+  document.getElementById('contentPre').innerHTML = renderContent(content, visibleRules());
   const pre = document.getElementById('contentPre');
   pre.addEventListener('mouseup', onViewerMouseUp);
   pre.addEventListener('click', e => {
@@ -1733,7 +1769,16 @@ function renderRuleList() {
     el.innerHTML = `<div class="insp-empty">No rules yet.<br><br>Select text in the document and press <b>+ Add Rule</b>, or open <b>LLM judge</b> and press <b>Run</b> to extract &amp; tag every rule.</div>`;
     return;
   }
-  const items = S.rules.map((r) => {
+  const vis = visibleRules();
+  const head = `<div class="rl-headbar">
+    <div class="rl-head">${vis.length} rule${vis.length === 1 ? '' : 's'} in this file</div>
+    ${filterBarHTML()}
+  </div>`;
+  if (!vis.length) {
+    el.innerHTML = head + `<div class="insp-empty">No ${S.ruleFilter === 'hand' ? 'human-labelled' : 'LLM-labelled'} rules in this file.</div>`;
+    return;
+  }
+  const items = vis.map((r) => {
     const col = colorForRule(r);
     const expanded = r.id === S.focusedRuleId;
     const tag = r.tag
@@ -1756,20 +1801,31 @@ function renderRuleList() {
       </div>
     </div>`;
   }).join('');
-  el.innerHTML = `<div class="rl-head">${S.rules.length} rule${S.rules.length === 1 ? '' : 's'} in this file</div>${items}`;
+  el.innerHTML = head + items;
   if (S.focusedRuleId) {
     autoGrow(document.getElementById('inspRationale'));
     autoGrow(document.getElementById('inspComment'));
   }
 }
 
+// Segmented All / Human / LLM control shown above the rule list. Counts are over
+// ALL rules in the file (so you can see how many would appear under each filter).
+function filterBarHTML() {
+  const hand = S.rules.filter(r => r.source === 'hand').length;
+  const llm  = S.rules.filter(r => r.source === 'llm').length;
+  const opt = (v, label, n) =>
+    `<button class="${S.ruleFilter === v ? 'active' : ''}" onclick="setRuleFilter('${v}')" title="Show ${label} labels">${label}<span class="fcount">${n}</span></button>`;
+  return `<div class="rl-filter">${opt('all', 'All', S.rules.length)}${opt('hand', 'Human', hand)}${opt('llm', 'LLM', llm)}</div>`;
+}
+
 function moveFocus(delta) {
-  if (!S.rules.length) return;
-  const idx = S.rules.findIndex(r => r.id === S.focusedRuleId);
+  const vis = visibleRules();
+  if (!vis.length) return;
+  const idx = vis.findIndex(r => r.id === S.focusedRuleId);
   const next = idx < 0
-    ? (delta > 0 ? 0 : S.rules.length - 1)
-    : clamp(idx + delta, 0, S.rules.length - 1);
-  setFocusedRule(S.rules[next].id);
+    ? (delta > 0 ? 0 : vis.length - 1)
+    : clamp(idx + delta, 0, vis.length - 1);
+  setFocusedRule(vis[next].id);
 }
 
 // ─── Inspector ───────────────────────────────────────────────
@@ -1783,7 +1839,7 @@ function posLabel(r) {
 function ruleDetailHTML(r) {
   return `<div class="rl-detail">
     <div class="insp-top">
-      <span class="insp-top-label">Rule ${S.rules.findIndex(x => x.id === r.id) + 1} of ${S.rules.length}
+      <span class="insp-top-label">Rule ${visibleRules().findIndex(x => x.id === r.id) + 1} of ${visibleRules().length}
         &nbsp;·&nbsp; ${esc(extractorOf(r))}</span>
     </div>
 
