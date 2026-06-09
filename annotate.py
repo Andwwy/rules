@@ -48,9 +48,9 @@ if os.path.exists(_env_path):
 # DB
 #
 # Annotations live in MotherDuck (cloud DuckDB) when MOTHERDUCK_TOKEN is set —
-# this is what makes Vercel (ephemeral filesystem) and multi-device work. With
-# no token, it falls back to the local annotations.db file. The token is read
-# from the environment (.env locally, Vercel env vars in production).
+# this is what makes the Render deployment (ephemeral filesystem) and multi-device
+# work. With no token, it falls back to the local annotations.db file. The token is
+# read from the environment (.env locally, Render env vars in production).
 # ---------------------------------------------------------------------------
 MOTHERDUCK_TOKEN = os.environ.get("MOTHERDUCK_TOKEN") or os.environ.get("motherduck_token")
 MOTHERDUCK_DATABASE = os.environ.get("MOTHERDUCK_DATABASE", "rules")
@@ -91,35 +91,50 @@ def _ensure_schema(con):
     con.execute("CREATE TABLE IF NOT EXISTS saved_prompts (id VARCHAR PRIMARY KEY, prompt TEXT NOT NULL, label VARCHAR, saved_at TIMESTAMP DEFAULT now())")
 
 def _md_connect(target):
-    # On Vercel the project dir is read-only; point DuckDB's extension/home dir
-    # at the writable /tmp so the MotherDuck extension can auto-install.
-    cfg = {"home_directory": "/tmp"} if os.environ.get("VERCEL") else {}
+    # On Render, point DuckDB's extension/home dir at the writable /tmp so the
+    # MotherDuck extension can auto-install regardless of the home-dir setup.
+    cfg = {"home_directory": "/tmp"} if os.environ.get("RENDER") else {}
     return duckdb.connect(target, config=cfg)
 
 _annot_base = None   # cached MotherDuck session (one network connection)
+
+def _md_base():
+    """Open once and cache the single MotherDuck session. Both the annotation
+    tables AND the `sample` source documents live in this one cloud database, so
+    nothing DB-related needs to ship in git for the Render deploy."""
+    global _annot_base
+    if _annot_base is None:
+        boot = _md_connect(f"md:?motherduck_token={MOTHERDUCK_TOKEN}")
+        boot.execute(f"CREATE DATABASE IF NOT EXISTS {MOTHERDUCK_DATABASE}")
+        boot.close()
+        base = _md_connect(f"md:{MOTHERDUCK_DATABASE}?motherduck_token={MOTHERDUCK_TOKEN}")
+        _ensure_schema(base)
+        _annot_base = base
+    return _annot_base
 
 def annot_con():
     """Return an annotations connection. Route code uses it then calls .close().
     - Local: a fresh per-request connection to annotations.db (cheap, thread-safe).
     - MotherDuck: a per-request cursor over one cached cloud session; .close()
       then closes only the cursor, keeping the (expensive) session alive."""
-    global _annot_base
     if USE_MOTHERDUCK:
-        if _annot_base is None:
-            boot = _md_connect(f"md:?motherduck_token={MOTHERDUCK_TOKEN}")
-            boot.execute(f"CREATE DATABASE IF NOT EXISTS {MOTHERDUCK_DATABASE}")
-            boot.close()
-            base = _md_connect(f"md:{MOTHERDUCK_DATABASE}?motherduck_token={MOTHERDUCK_TOKEN}")
-            _ensure_schema(base)
-            _annot_base = base
-        return _annot_base.cursor()
+        return _md_base().cursor()
     con = duckdb.connect(ANNOT_DB)
     _ensure_schema(con)
     return con
 
 _sample_ro = None
 def sample_con():
+    """Cached, shared read-only handle to the `sample` source documents — callers
+    must NOT close it.
+    - MotherDuck: a cursor over the shared cloud session (the `sample` table lives
+      in the same MotherDuck database; load it with upload_sample_to_motherduck.py).
+    - Local: a read-only connection to sample.db."""
     global _sample_ro
+    if USE_MOTHERDUCK:
+        if _sample_ro is None:
+            _sample_ro = _md_base().cursor()
+        return _sample_ro
     if _sample_ro is None and os.path.exists(SAMPLE_DB):
         _sample_ro = duckdb.connect(SAMPLE_DB, read_only=True)
     return _sample_ro

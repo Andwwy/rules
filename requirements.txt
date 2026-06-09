@@ -1,4 +1,6 @@
 flask==3.1.3
+# WSGI server for the Render deployment (start command runs `gunicorn annotate:app`).
+gunicorn==23.0.0
 # Pinned to match the version that wrote sample.db / annotations.db.
 # DuckDB refuses to open a database created by a newer minor version, so keep
 # this in sync with the host DuckDB if you regenerate the .db files.

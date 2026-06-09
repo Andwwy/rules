@@ -7,17 +7,20 @@ annotators, and export per-annotator to CSV.
 
 ## Database — MotherDuck (cloud) or local
 
-Annotations are stored in **MotherDuck** (cloud DuckDB) when a token is present,
-which is what makes the Vercel deployment and multi-device use work. With no token
-it falls back to a local `annotations.db` file.
+Both the source documents (`sample`) and the annotations live in **MotherDuck**
+(cloud DuckDB) whenever `MOTHERDUCK_TOKEN` is set — and it should be set everywhere,
+**including local dev**, so everyone reads and writes the same shared cloud DB. This
+is what makes the Render deployment and multi-device use work. If the token is
+absent the app falls back to local files (`sample.db` / `annotations.db`) — that's
+an offline-only escape hatch, not the normal path.
 
 | Env var | Purpose |
 |---|---|
-| `MOTHERDUCK_TOKEN` | MotherDuck access token. **Set this to use the cloud DB.** Get it from the MotherDuck dashboard. |
+| `MOTHERDUCK_TOKEN` | MotherDuck access token. **Set this everywhere (local + Render)** to use the shared cloud DB. Get it from the MotherDuck dashboard. |
 | `MOTHERDUCK_DATABASE` | MotherDuck database name (default `rules`). Created automatically if missing. |
 
-- **Locally:** put `MOTHERDUCK_TOKEN=...` in `.env` (same file as `PERPLEXITY_API_KEY`). Omit it to use the local `annotations.db` instead.
-- **Vercel:** add `MOTHERDUCK_TOKEN` (and optionally `MOTHERDUCK_DATABASE`) in Project → Settings → Environment Variables. `PERPLEXITY_API_KEY` goes there too.
+- **Locally:** put `MOTHERDUCK_TOKEN=...` in `.env` (same file as `PERPLEXITY_API_KEY`) — then local dev reads/writes MotherDuck just like prod. Only omit it if you deliberately want offline local files.
+- **Render:** add `MOTHERDUCK_TOKEN` (and optionally `MOTHERDUCK_DATABASE`) in the service's Environment settings. `PERPLEXITY_API_KEY` goes there too. (`render.yaml` declares these with `sync:false`, so Render prompts for the values on first deploy.)
 
 **Move existing local annotations into MotherDuck** (one-off, idempotent):
 
@@ -25,23 +28,31 @@ it falls back to a local `annotations.db` file.
 python3 migrate_to_motherduck.py    # reads MOTHERDUCK_TOKEN from .env / env
 ```
 
-## Deploy to Vercel
+## Deploy to Render
 
-`vercel.json` + `api/index.py` are set up to run the Flask app on Vercel's Python
-runtime (all routes rewrite to the function; `annotate.py` and `sample.db` are
-bundled via `includeFiles`).
+`render.yaml` is a [Render Blueprint](https://render.com/docs/blueprint-spec) that
+runs the Flask app as a web service on Render's native Python runtime: it installs
+`requirements.txt` and serves `annotate:app` with gunicorn on Render's `$PORT`.
+
+1. Push this repo to GitHub/GitLab and create a **Blueprint** in the Render
+   dashboard pointing at it (or **New → Web Service** and let it detect `render.yaml`).
+2. When prompted, set `MOTHERDUCK_TOKEN` and `PERPLEXITY_API_KEY` (declared
+   `sync:false` so they're never committed). `MOTHERDUCK_DATABASE` defaults to `rules`.
+
+No database ships in git. Both the **source documents** (the `sample` table) and the
+**annotations** are served from MotherDuck, so Render only needs the code plus the
+`MOTHERDUCK_TOKEN`. DuckDB's extension dir is pointed at the writable `/tmp` when the
+`RENDER` env var is present (set automatically by Render).
+
+The annotation set is currently a **fixed 100-file sample** loaded into MotherDuck
+(`rules.sample`). Load/refresh it from the local `sample.db` with:
 
 ```bash
-vercel            # preview deploy
-vercel --prod     # production
+python3 upload_sample_to_motherduck.py   # reads MOTHERDUCK_TOKEN from .env / env
 ```
 
-Set the env vars (`MOTHERDUCK_TOKEN`, `PERPLEXITY_API_KEY`) in the Vercel dashboard
-first. Vercel's read-only filesystem is handled — DuckDB's extension dir is pointed
-at `/tmp` when the `VERCEL` env var is present.
-
-> **Note:** `sample.db` (the source documents) is bundled into the deployment. The
-> large `rules.db` / `processed.db` files are excluded via `.vercelignore`.
+> **Note:** this 100-file sample is a stopgap — we'll switch to the full set of
+> scraped files later. See [SPEC.md](SPEC.md).
 
 ## Run with Docker (recommended — keeps running, persists annotations)
 

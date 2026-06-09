@@ -1,0 +1,22 @@
+# Render Blueprint — deploys the Flask app as a web service.
+# Render builds from the connected git repo. No DB ships in git: both the source
+# documents (the `sample` table) and the annotations are served from MotherDuck
+# via MOTHERDUCK_TOKEN.
+services:
+  - type: web
+    name: rule-annotator
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    # Render injects $PORT. One worker + threads matches the app's design
+    # (a single cached MotherDuck session shared via per-request cursors).
+    # 300s timeout covers slow LLM-judge (Perplexity) requests.
+    startCommand: gunicorn annotate:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 300
+    envVars:
+      # Set the secret values in the Render dashboard (sync:false = not in repo).
+      - key: MOTHERDUCK_TOKEN
+        sync: false
+      - key: PERPLEXITY_API_KEY
+        sync: false
+      - key: MOTHERDUCK_DATABASE
+        value: rules
