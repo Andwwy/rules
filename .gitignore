@@ -207,3 +207,6 @@ marimo/_lsp/
 __marimo__/
 annotations.db
 sample.db
+# local DB backups from the offline workflow (download_from_motherduck.py)
+*.db.*.bak
+*.db.wal

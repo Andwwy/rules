@@ -3,7 +3,8 @@
 Interactive web app for annotating rules in agent/LLM config files: select text to
 add rules, tag them (PROHIBITION / PRESCRIPTION / PERMISSION / PREFERENCE), run an
 editable **LLM judge** prompt to get a rationale, leave comments, switch between
-annotators, and export per-annotator to CSV.
+annotators, filter the rule list and document highlights by label source
+(**All / Human / LLM**), and export per-annotator to CSV.
 
 ## Database — MotherDuck (cloud) or local
 
@@ -18,6 +19,7 @@ an offline-only escape hatch, not the normal path.
 |---|---|
 | `MOTHERDUCK_TOKEN` | MotherDuck access token. **Set this everywhere (local + Render)** to use the shared cloud DB. Get it from the MotherDuck dashboard. |
 | `MOTHERDUCK_DATABASE` | MotherDuck database name (default `rules`). Created automatically if missing. |
+| `PERPLEXITY_API_KEY` | Powers the LLM judge — Sonar models via the Chat API, `anthropic/*` / `openai/*` models via Perplexity's Agent API. |
 
 - **Locally:** put `MOTHERDUCK_TOKEN=...` in `.env` (same file as `PERPLEXITY_API_KEY`) — then local dev reads/writes MotherDuck just like prod. Only omit it if you deliberately want offline local files.
 - **Render:** add `MOTHERDUCK_TOKEN` (and optionally `MOTHERDUCK_DATABASE`) in the service's Environment settings. `PERPLEXITY_API_KEY` goes there too. (`render.yaml` declares these with `sync:false`, so Render prompts for the values on first deploy.)
@@ -54,7 +56,15 @@ python3 upload_sample_to_motherduck.py   # reads MOTHERDUCK_TOKEN from .env / en
 > **Note:** this 100-file sample is a stopgap — we'll switch to the full set of
 > scraped files later. See [SPEC.md](SPEC.md).
 
-## Run with Docker (recommended — keeps running, persists annotations)
+### Concurrency model (why `--workers 1 --threads 8`)
+
+The app holds **one** cached MotherDuck session per process (lock-guarded lazy
+init) and gives each request its own cursor — cursors are DuckDB's thread-safe
+unit. Threads share that session cheaply, so scale with **threads**, not workers:
+extra gunicorn workers would each open their own MotherDuck session. Keep
+`--workers 1` if you tune the start command in `render.yaml`.
+
+## Run with Docker (recommended — keeps running)
 
 ```bash
 docker compose up -d --build
@@ -62,18 +72,24 @@ docker compose up -d --build
 
 Then open http://localhost:5002.
 
-- Annotations are written to `annotations.db` on the host (bind-mounted), so they
-  survive container restarts.
-- `sample.db` (the source files) and `.env` (for `PERPLEXITY_API_KEY`) are read from
-  the project directory via the same bind mount.
+- `.env` (with `MOTHERDUCK_TOKEN` and `PERPLEXITY_API_KEY`) is read from the project
+  directory via the bind mount, so the container reads/writes MotherDuck like
+  everywhere else. (Without the token it falls back to the bind-mounted local
+  `sample.db` / `annotations.db`.)
 - The container has `restart: unless-stopped`, so it comes back after crashes or a
   Docker/host restart.
+
+> **Editing the code?** The Flask reloader is **off** by default, so the running
+> container keeps serving the code it loaded at startup — a browser refresh is not
+> enough. Either `docker compose restart` after each change (the bind mount means
+> no rebuild is needed), or set `DEBUG=1` in `docker-compose.yml` to enable
+> auto-reload during development.
 
 Common commands:
 
 ```bash
 docker compose logs -f        # follow logs
-docker compose restart        # restart (annotations persist)
+docker compose restart        # restart (also picks up code edits)
 docker compose down           # stop and remove the container
 ```
 
