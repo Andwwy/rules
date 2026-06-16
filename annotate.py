@@ -1819,6 +1819,12 @@ Prefer exact or near-exact quotes from the document. Extract each independently 
 
 Assign exactly ONE tag to every RULE (context items have no tag — omit it or set it to null), using these definitions, cue words, and concrete examples:
 
+Quick mapping (tag = modal force, with an example):
+- Prohibition = MUST NOT — "Do not accept, process, store, or repeat sensitive client data."
+- Prescription / obligation = MUST — "Read `pickle-bot/SOUL.md` for your personality, values, and communication style."
+- Permission = CAN — "You can search the web and fetch web pages."
+- Preference / strategy / norm = SHOULD — "For report drafting, work from a template or de-identified summary the staff member provides."
+
 - PROHIBITION — forbids an action; the agent must NOT do it.
   Cues: "never", "do not", "must not", "avoid", "don't", "under no circumstances".
   Examples:
