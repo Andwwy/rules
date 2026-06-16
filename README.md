@@ -94,9 +94,20 @@ docker compose down           # stop and remove the container
 ```
 
 CSV export is at the **⬇ CSV** button (top-right of the inspector) or directly at
-http://localhost:5002/export. It includes the `tag`, `user_comment`, and
-`llm_rationale` columns so the human annotation and the LLM judge output sit
-side-by-side.
+http://localhost:5002/export. It is one flat file covering **both entity types** —
+filter on the leading `record_type` column (`rule` / `context` / `relation`):
+
+- **rule / context rows** fill `kind`, `tag`, `rule_text`, `line_start`/`line_end`,
+  `char_start`/`char_end`, `user_comment`, and `llm_rationale` (human annotation and
+  LLM judge output side-by-side), plus the rule `id`.
+- **relation rows** fill `relation_type` (the annotator's label),
+  `llm_relation_type` (the LLM's suggested label, for contrast),
+  `source_rule_text`/`target_rule_text` (the endpoints resolved to text), and
+  `source_id`/`target_id`.
+
+Every row also carries `annotator`, `source_url`, `source` (`hand` / `llm` /
+`revise`), and `created_at`. Scope is the current file or all labeled files, per
+the chooser under the button.
 
 ## Run directly (without Docker)
 

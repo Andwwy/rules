@@ -76,9 +76,11 @@ def _ensure_schema(con):
     # notes == user "Comment" in the inspector;
     # annotator == which person owns this labeling (hand rules AND the LLM runs they triggered)
     # kind == 'rule' (a directive — gets a deontic tag) or 'context' (background, no tag)
+    # context_type == sub-type of a 'context' node: 'condition' | 'reference' |
+    # 'definition' (NULL for rules and for unclassified context).
     for col in ("notes VARCHAR", "extracted_by VARCHAR",
                 "tag VARCHAR", "power_type VARCHAR", "llm_rationale TEXT",
-                "annotator VARCHAR", "kind VARCHAR"):
+                "annotator VARCHAR", "kind VARCHAR", "context_type VARCHAR"):
         try: con.execute(f"ALTER TABLE extracted_rules ADD COLUMN {col}")
         except Exception: pass
     con.execute("CREATE TABLE IF NOT EXISTS annotators (name VARCHAR PRIMARY KEY, created_at TIMESTAMP DEFAULT now())")
@@ -293,6 +295,7 @@ def _rule_row(r):
         "created_at": str(r[10]),
         "tag": r[11], "power_type": r[12], "llm_rationale": r[13],
         "annotator": r[14], "kind": r[15] or "rule",
+        "context_type": r[16],
     }
 
 @app.route("/api/all-rules")
@@ -330,7 +333,7 @@ def api_rules(fid):
     sql = """
         SELECT id, rule_text, char_start, char_end, line_start, line_end,
                source, llm_run_id, notes, extracted_by, created_at,
-               tag, power_type, llm_rationale, annotator, kind
+               tag, power_type, llm_rationale, annotator, kind, context_type
         FROM extracted_rules WHERE file_id=?
     """
     params = [fid]
@@ -372,14 +375,15 @@ def save_rule():
         "source": "hand", "llm_run_id": None, "notes": None,
         "extracted_by": by, "annotator": annotator, "kind": kind,
         "tag": None, "power_type": None, "llm_rationale": None,
+        "context_type": None,
     })
 
 @app.route("/api/rules/<rid>", methods=["PATCH"])
 def patch_rule(rid):
-    """Update any of: notes (Comment), tag, power_type, llm_rationale, kind."""
+    """Update any of: notes (Comment), tag, power_type, llm_rationale, kind, context_type."""
     b = request.json or {}
     updates, params = [], []
-    for k in ("notes", "tag", "power_type", "llm_rationale", "kind"):
+    for k in ("notes", "tag", "power_type", "llm_rationale", "kind", "context_type"):
         if k in b:
             updates.append(f"{k}=?")
             params.append(b.get(k) or None)
@@ -539,7 +543,7 @@ def _perplexity_complete(model, sys_msg, usr_msg, api_key, max_out=16000):
         except (KeyError, IndexError): return ""
     return rd.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-_REL_TYPES = ("refinement", "exception", "support", "checkpoint", "conflict", "duplication")
+_REL_TYPES = ("refinement", "exception", "define", "checkpoint", "conflict", "duplication", "trigger")
 
 @app.route("/api/llm-relations", methods=["POST"])
 def run_llm_relations():
@@ -616,7 +620,8 @@ def run_llm_relations():
             continue
         rtype = (e.get("type") or e.get("relation_type") or "").strip().lower()
         if rtype not in _REL_TYPES:
-            rtype = "support" if rtype.startswith("support") else None
+            # legacy "support (defines/…)" and any "define …" variants → 'define'
+            rtype = "define" if rtype.startswith(("support", "define")) else None
         rationale = e.get("rationale") or e.get("llm_rationale")
         rid = make_id(fid, src, tgt, rtype or "", annotator, "llm")
         if rid in seen:
@@ -867,6 +872,7 @@ def run_llm():
             "source": pass_source, "llm_run_id": run_id, "notes": None,
             "extracted_by": model, "annotator": annotator, "kind": kind,
             "tag": tag, "power_type": power_type, "llm_rationale": rationale,
+            "context_type": None,
         })
     if insert_rows:
         # Single multi-row INSERT = one MotherDuck round-trip instead of N.
@@ -898,42 +904,88 @@ def export_page():
     annotator = (request.args.get("annotator") or "").strip()
     file_id   = (request.args.get("file_id") or "").strip()   # optional: limit to one file
     acon = annot_con()
-    sql = """
-        SELECT r.file_id, r.rule_text, r.line_start, r.line_end,
-               r.source, r.extracted_by, r.notes, r.created_at,
-               r.tag, r.power_type, r.llm_rationale, r.annotator, r.kind
+    # ── Rules / context entities ─────────────────────────────────────────
+    rule_sql = """
+        SELECT r.id, r.file_id, r.rule_text, r.kind, r.tag,
+               r.line_start, r.line_end, r.char_start, r.char_end,
+               r.source, r.extracted_by, r.notes, r.llm_rationale,
+               r.annotator, r.created_at, r.context_type
         FROM extracted_rules r
     """
-    params, conds = [], []
-    if annotator:
-        conds.append("r.annotator=?"); params.append(annotator)
-    if file_id:
-        conds.append("r.file_id=?");   params.append(file_id)
-    if conds:
-        sql += " WHERE " + " AND ".join(conds)
-    sql += " ORDER BY r.file_id, COALESCE(r.line_start, 999999), r.created_at"
-    rows = acon.execute(sql, params).fetchall()
+    rconds, rparams = [], []
+    if annotator: rconds.append("r.annotator=?"); rparams.append(annotator)
+    if file_id:   rconds.append("r.file_id=?");   rparams.append(file_id)
+    if rconds: rule_sql += " WHERE " + " AND ".join(rconds)
+    rule_sql += " ORDER BY r.file_id, COALESCE(r.line_start, 999999), r.created_at"
+    rule_rows = acon.execute(rule_sql, rparams).fetchall()
+
+    # ── Relations (directed edges between the entities above) ─────────────
+    rel_sql = """
+        SELECT e.id, e.file_id, e.source_id, e.target_id,
+               e.relation_type, e.llm_relation_type, e.source,
+               e.notes, e.llm_rationale, e.annotator, e.created_at
+        FROM relations e
+    """
+    econds, eparams = [], []
+    if annotator: econds.append("e.annotator=?"); eparams.append(annotator)
+    if file_id:   econds.append("e.file_id=?");   eparams.append(file_id)
+    if econds: rel_sql += " WHERE " + " AND ".join(econds)
+    rel_sql += " ORDER BY e.file_id, e.created_at"
+    rel_rows = acon.execute(rel_sql, eparams).fetchall()
     acon.close()
+
+    # id → rule_text so a relation row can show its endpoints' text, not just ids
+    rule_text_map = {r[0]: r[2] for r in rule_rows}
+
     sc = sample_con()
     url_map = {}
-    if rows:
-        fids = list({r[0] for r in rows})
+    fids = list({r[1] for r in rule_rows} | {e[1] for e in rel_rows})
+    if fids:
         placeholders = ",".join("?" * len(fids))
-        url_map = {r[0]: r[1] for r in sc.execute(
+        url_map = {row[0]: row[1] for row in sc.execute(
             f"SELECT id, source_url FROM sample WHERE id IN ({placeholders})", fids
         ).fetchall()}
     # NOTE: sample_con() is a cached, shared read-only connection — do NOT close it.
 
     import csv, io
+    blank = lambda v: "" if v is None else v
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["annotator","kind","source_url","source","extracted_by","line_start","line_end",
-                     "rule_text","tag","user_comment","llm_rationale","created_at"])
-    for r in rows:
-        writer.writerow([r[11] or "", r[12] or "rule", url_map.get(r[0],""), r[4], r[5] or "", r[2] or "", r[3] or "",
-                         r[1], r[8] or "", r[6] or "", r[10] or "", str(r[7] or "")])
+    # One flat CSV for both entity types — filter on `record_type` downstream.
+    # rule/context rows fill the rule_* columns; relation rows fill the rel_* ones.
+    writer.writerow([
+        "record_type","annotator","source_url","source","extracted_by",
+        "kind","tag","context_type","rule_text","line_start","line_end","char_start","char_end",
+        "relation_type","llm_relation_type","source_rule_text","target_rule_text",
+        "user_comment","llm_rationale","id","source_id","target_id","created_at",
+    ])
+    for r in rule_rows:
+        writer.writerow([
+            r[3] or "rule",                                  # record_type (= kind)
+            r[13] or "", url_map.get(r[1],""), r[9] or "", r[10] or "",
+            r[3] or "rule", r[4] or "", r[15] or "", r[2],   # kind, tag, context_type, rule_text
+            blank(r[5]), blank(r[6]), blank(r[7]), blank(r[8]),  # line/char start+end
+            "", "", "", "",                                  # relation-only columns
+            r[11] or "", r[12] or "",                        # user_comment, llm_rationale
+            r[0], "", "",                                    # id, (no source/target)
+            str(r[14] or ""),
+        ])
+    for e in rel_rows:
+        writer.writerow([
+            "relation",
+            e[9] or "", url_map.get(e[1],""), e[6] or "", "",   # annotator, url, source(hand/llm), extracted_by
+            "", "", "", "",                                  # kind, tag, context_type, rule_text (n/a)
+            "", "", "", "",                                  # line/char (n/a)
+            e[4] or "", e[5] or "",                          # relation_type (user), llm_relation_type
+            rule_text_map.get(e[2], f"(rule {e[2]})"),       # source_rule_text
+            rule_text_map.get(e[3], f"(rule {e[3]})"),       # target_rule_text
+            e[7] or "", e[8] or "",                          # user_comment (notes), llm_rationale
+            e[0], e[2], e[3],                                # id, source_id, target_id
+            str(e[10] or ""),
+        ])
     csv_text = buf.getvalue()
-    row_count = len(rows)
+    row_count = len(rule_rows)
+    rel_count = len(rel_rows)
 
     # Human-readable scope for the header + a matching download filename.
     if file_id:
@@ -951,7 +1003,7 @@ def export_page():
 
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
-<title>Rules Export</title>
+<title>Rules &amp; Relations Export</title>
 <style>
   body {{ font-family: system-ui, sans-serif; margin: 0; background: #f8f8fc; }}
   .bar {{ display:flex; align-items:center; gap:12px; padding:12px 18px;
@@ -971,8 +1023,8 @@ def export_page():
 </style>
 </head><body>
 <div class="bar">
-  <h2>Rules Export</h2>
-  <small>{scope_label} · {row_count} rule{"s" if row_count!=1 else ""}</small>
+  <h2>Rules &amp; Relations Export</h2>
+  <small>{scope_label} · {row_count} rule{"s" if row_count!=1 else ""} · {rel_count} relation{"s" if rel_count!=1 else ""}</small>
   <button class="cp" onclick="copyCSV()">Copy</button>
   <button class="dl" onclick="downloadCSV()">Download CSV</button>
 </div>
@@ -1058,23 +1110,54 @@ def create_annotator():
 # ---------------------------------------------------------------------------
 # Routes – app settings (persisted, editable judge/extract prompts + models)
 # ---------------------------------------------------------------------------
+# The judge/extract/relation prompts are PER-ANNOTATOR: stored as "<key>::<annotator>".
+# Everything else (e.g. judge_model) stays global. An annotator with no saved value
+# falls back to the built-in default the frontend already holds.
+PROMPT_KEYS = ("llm_judge_prompt", "llm_judge_prompt_revise", "llm_relation_prompt")
+
 @app.route("/api/settings")
 def get_settings():
+    annotator = (request.args.get("annotator") or "").strip()
     con = annot_con()
     rows = con.execute("SELECT key, value FROM app_settings").fetchall()
     con.close()
-    return jsonify({k: v for k, v in rows})
+    allset = {k: v for k, v in rows}
+    out = {}
+    for k, v in allset.items():
+        if "::" in k or k in PROMPT_KEYS:
+            continue          # per-annotator overrides + legacy-global prompts: resolved below
+        out[k] = v            # global, non-prompt settings (e.g. judge_model)
+    if annotator:             # only THIS annotator's customised prompts (else the frontend default wins)
+        for pk in PROMPT_KEYS:
+            v = allset.get(f"{pk}::{annotator}")
+            if v is not None:
+                out[pk] = v
+    return jsonify(out)
 
 @app.route("/api/settings", methods=["POST"])
 def set_settings():
     b = request.json or {}
+    annotator = (b.get("annotator") or "").strip()
     con = annot_con()
     for k, v in b.items():
+        if k == "annotator":
+            continue
+        key = f"{k}::{annotator}" if (k in PROMPT_KEYS and annotator) else k
         con.execute(
             "INSERT INTO app_settings(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [k, v]
+            [key, v]
         )
+    con.close()
+    return jsonify({"ok": True})
+
+@app.route("/api/settings/<key>", methods=["DELETE"])
+def reset_setting(key):
+    """Restore a prompt to its built-in default by dropping this annotator's override."""
+    annotator = (request.args.get("annotator") or "").strip()
+    full = f"{key}::{annotator}" if (key in PROMPT_KEYS and annotator) else key
+    con = annot_con()
+    con.execute("DELETE FROM app_settings WHERE key=?", [full])
     con.close()
     return jsonify({"ok": True})
 
@@ -1537,7 +1620,7 @@ kbd {
 .confirm-ok:hover { background: #a93226; border-color: #a93226; }
 .confirm-ok:focus-visible { outline: 2px solid #e88; outline-offset: 2px; }
 .rl-headbar {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-shrink: 0;
+  display: flex; flex-direction: column; align-items: stretch; gap: 7px; flex-shrink: 0;
   /* freeze the count + filter at the top while the rule list scrolls under it.
      The negative margins bleed over the .inspector container's 14px/16px padding
      so the opaque background spans the full width and sticks flush to the top. */
@@ -1555,11 +1638,12 @@ kbd {
 .rl-filter button.active { background: white; color: #4338ca; box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
 .rl-filter .fcount { font-size: 10px; font-weight: 700; color: #a0a0c0; }
 .rl-filter button.active .fcount { color: #6366f1; }
-/* dropdown filter */
+/* dropdown filters — two side-by-side: source (All/Human/LLM) + type */
+.rl-filter-row { display: flex; gap: 6px; align-items: center; }
 .rl-filter-select {
   font: inherit; font-size: 11px; font-weight: 600; color: #4338ca;
   background: #ececf4; border: 1px solid #d8d8ec; border-radius: 7px;
-  padding: 4px 8px; cursor: pointer; max-width: 170px;
+  padding: 4px 8px; cursor: pointer; min-width: 0; flex: 1 1 0;
 }
 .rl-filter-select:focus { outline: none; border-color: #6366f1; }
 /* Context / Rule sliding pill toggle — compact, left-aligned */
@@ -1591,6 +1675,10 @@ kbd {
 }
 .rl-item:hover { border-color: #c7c7e0; }
 .rl-item.active { border-color: var(--rc-bdr, #6366f1); box-shadow: 0 0 0 1px var(--rc-bdr, #6366f1); }
+/* The filter no longer hides — non-matching rows just fade, but stay fully clickable;
+   hovering or expanding one brings it back to full opacity. */
+.rl-item.rl-faded { opacity: 0.4; transition: opacity 0.12s; }
+.rl-item.rl-faded:hover, .rl-item.rl-faded.expanded { opacity: 1; }
 .rl-bar { width: 4px; flex-shrink: 0; background: var(--rc-bdr, #c0c0d8); }
 .rl-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .rl-header { padding: 8px 10px 8px 6px; cursor: pointer; }
@@ -1654,6 +1742,10 @@ kbd {
 .tag-btn.active.prescription { background: #dbeafe; border-color: #3b82f6; color: #1d4ed8; }
 .tag-btn.active.permission  { background: #dcfce7; border-color: #22c55e; color: #15803d; }
 .tag-btn.active.preference { background: #f3e8ff; border-color: #a855f7; color: #7e22ce; }
+/* context sub-type buttons (condition/example/definition) — grey, three across */
+.tag-row.ctx, .tag-row:has(.tag-btn.ctx) { grid-template-columns: 1fr 1fr 1fr; }
+.tag-btn.ctx { font-size: 11px; padding: 7px 6px; }
+.tag-btn.active.ctx { background: #eceef4; border-color: #8b91ad; color: #4b5066; }
 .power-row { display: flex; gap: 6px; padding-left: 2px; }
 .sub-btn {
   padding: 5px 14px; border-radius: 8px; border: 1.5px solid #e0d4f0;
@@ -1783,7 +1875,7 @@ Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single 
 Each relation has a "source" and a "target" (entity R-labels), a "type", and a one-sentence "rationale". Direction matters (source → target). Use these types:
 - refinement — the source narrows, specifies, or details the target (a more specific case of a more general rule).
 - exception — the source carves out an exception to the target.
-- support — the source supports, defines, exemplifies, or motivates the target.
+- define — the source supplies the meaning, specification, or concrete content the target refers to (e.g. a list/definition the rule points at).
 - checkpoint — the source is a verification step or gate for the target.
 - conflict — the source conflicts with or contradicts the target.
 - duplication — the source restates or duplicates the target.
@@ -1791,7 +1883,7 @@ Each relation has a "source" and a "target" (entity R-labels), a "type", and a o
 Only propose relations you are reasonably confident about — skip weak or spurious links. At most one relation per ordered pair.
 
 Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single line — no markdown fences, no indentation. Each element:
-{"source": "R<n>", "target": "R<n>", "type": "refinement|exception|support|checkpoint|conflict|duplication", "rationale": "<one short plain-English sentence>"}</script>
+{"source": "R<n>", "target": "R<n>", "type": "refinement|exception|define|checkpoint|conflict|duplication", "rationale": "<one short plain-English sentence>"}</script>
 
 <div class="layout">
 
@@ -1843,7 +1935,7 @@ Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single 
     <div class="name-bar">
       <label for="annotatorSelect">Annotator:</label>
       <select id="annotatorSelect" class="name-input" onchange="onAnnotatorChange(this.value)"></select>
-      <button class="csv-btn" onclick="exportCSV(event)" title="Export this annotator's rules as CSV — current file or all labeled files">⬇ CSV</button>
+      <button class="csv-btn" onclick="exportCSV(event)" title="Export this annotator's rules, context & relations as CSV — current file or all labeled files">⬇ CSV</button>
     </div>
     <div class="inspector" id="inspector">
       <div class="insp-empty">Select a file, then click a highlight or select text and press <b>+ Add</b>.</div>
@@ -1858,15 +1950,19 @@ const DEFAULT_EXTRACT  = document.getElementById('defaultJudgePrompt').textConte
 const DEFAULT_REVISE   = document.getElementById('defaultRevisePrompt').textContent.trim();
 const DEFAULT_RELATION = document.getElementById('defaultRelationPrompt').textContent.trim();
 const TAGS = ['PROHIBITION', 'PRESCRIPTION', 'PERMISSION', 'PREFERENCE'];
+// Sub-types of a 'context' node (parallel to a rule's deontic TAGS):
+//   condition = a trigger that gates rules · reference = an illustration / pointer ·
+//   definition = fixes the meaning of a term/system/action.
+const CONTEXT_TYPES = ['condition', 'reference', 'definition'];
 // Relation labeling (adapted from the rules-relation edge inspector). A relation
 // is a directed edge between two rule/context entities, with one of these types.
-// The three "support (…)" variants are aggregated into a single "support".
-const REL_TYPES = ['refinement', 'exception', 'support', 'checkpoint', 'conflict', 'duplication'];
+const REL_TYPES = ['refinement', 'exception', 'define', 'checkpoint', 'conflict', 'duplication', 'trigger'];
 const REL_COLOR = {
-  'refinement': '#7d6bd9', 'exception': '#cf4f44', 'support': '#5a9e4b',
+  'refinement': '#7d6bd9', 'exception': '#cf4f44', 'define': '#5a9e4b',
   'checkpoint': '#4aa3d8', 'conflict': '#e0762f', 'duplication': '#888',
+  'trigger': '#c44f9b',   // condition → rule: the condition gates/fires the rule
 };
-// any legacy "support (defines/exemplifies/motivates)" still maps to the support colour
+// legacy "support (…)" labels still map to define's colour
 const relColor = t => REL_COLOR[t] || ((t || '').startsWith('support') ? '#5a9e4b' : '#777');
 // LLM-judge passes. Both pull rules AND context in one go (each item self-labels
 // its kind); they differ by provenance/colour and prompt. `source` is what the
@@ -1894,10 +1990,16 @@ const S = {
   toolMode:      false,
   commentMode:   false,   // the file-level Comment panel (⌘?)
   fileComment:   '',      // current annotator's saved comment for the open file
-  // all | {rule|context}[:hand|:llm]   (:llm bucket = machine = extract + revise)
-  ruleFilter:    (function(){ const v = localStorage.getItem('ruleFilter') || 'all';
-                   return ['all','rule','rule:hand','rule:llm',
-                           'context','context:hand','context:llm'].includes(v) ? v : 'all'; })(),
+  // Two independent rule-list filters:
+  //   filterSrc:  'all' | 'hand' | 'llm'   (:llm bucket = machine = extract + revise)
+  //   filterType: 'all' | 'rule' | 'rule:<TAG>' | 'context' | 'context:<subtype>'
+  filterSrc:     (function(){ const v = localStorage.getItem('filterSrc') || 'all';
+                   return ['all','hand','llm'].includes(v) ? v : 'all'; })(),
+  filterType:    (function(){ const v = localStorage.getItem('filterType') || 'all';
+                   const ok = ['all','rule','context']
+                     .concat(['PROHIBITION','PRESCRIPTION','PERMISSION','PREFERENCE'].map(t=>'rule:'+t))
+                     .concat(['condition','reference','definition'].map(t=>'context:'+t));
+                   return ok.includes(v) ? v : 'all'; })(),
   judgeRunning:  false,
   judgeMode:     'extract',   // which judge pass the modal is editing/running
   judgePrompts:  { extract: DEFAULT_EXTRACT, revise: DEFAULT_REVISE, relation: DEFAULT_RELATION },
@@ -1971,29 +2073,46 @@ function typeBadgeColor(r) {
 }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
-// Filter combines kind (rule/context) and source bucket. Values:
-//   'all' | 'rule' | 'rule:hand' | 'rule:llm' | 'context' | 'context:hand' | 'context:llm'
-// The ':llm' bucket means "machine" (extract + revise); ':hand' means human.
-function inBucket(r, bucket) {
-  if (!bucket) return true;
-  return bucket === 'hand' ? r.source === 'hand' : r.source !== 'hand';
+// Two independent axes that AND together.
+// Source bucket: 'all' | 'hand' (human) | 'llm' (machine = extract + revise).
+function ruleCtxType(r) { return r.context_type || null; }   // condition|example|definition
+function matchesSrc(r, src) {
+  src = src || S.filterSrc || 'all';
+  if (src === 'all') return true;
+  return src === 'hand' ? r.source === 'hand' : r.source !== 'hand';
 }
-function matchesFilter(r) {
-  const f = S.ruleFilter || 'all';
-  if (f === 'all') return true;
-  const [kind, src] = f.split(':');
-  return ruleKind(r) === kind && inBucket(r, src);
+// Type axis: 'all' | 'rule' | 'rule:<TAG>' | 'context' | 'context:<subtype>'.
+function matchesType(r, ft) {
+  ft = ft || S.filterType || 'all';
+  if (ft === 'all') return true;
+  const [kind, sub] = ft.split(':');
+  if (ruleKind(r) !== kind) return false;
+  if (!sub) return true;
+  return kind === 'rule' ? r.tag === sub : ruleCtxType(r) === sub;
 }
-function visibleRules() { return S.rules.filter(matchesFilter); }
+function matchesFilter(r) { return matchesType(r) && matchesSrc(r); }
+// A filter is "active" when either axis is narrowed away from All.
+function filterActive() { return (S.filterSrc && S.filterSrc !== 'all') || (S.filterType && S.filterType !== 'all'); }
+// Nothing is ever hidden. The filter just FADES non-matching rules (in the list and
+// the document) while keeping every rule fully clickable/editable — so it's easy to
+// reassign things across a filter. Relation mode doesn't fade at all (the filter is
+// irrelevant there; every entity must stay pickable). So this is simply every rule.
+function visibleRules() { return S.rules; }
 
-function setRuleFilter(v) {
-  if (v === S.ruleFilter) return;
-  S.ruleFilter = v;
-  localStorage.setItem('ruleFilter', v);
-  // if the focused rule is now hidden, collapse it so we don't show stale detail
-  if (S.focusedRuleId && !visibleRules().some(r => r.id === S.focusedRuleId)) S.focusedRuleId = null;
-  renderViewer();        // re-highlight the document body
-  renderRightPanel();    // re-render the rule list
+function setFilterSrc(v) {
+  if (v === S.filterSrc) return;
+  S.filterSrc = v; localStorage.setItem('filterSrc', v);
+  afterFilterChange();
+}
+function setFilterType(v) {
+  if (v === S.filterType) return;
+  S.filterType = v; localStorage.setItem('filterType', v);
+  afterFilterChange();
+}
+function afterFilterChange() {
+  // nothing is hidden now, so the focused rule never disappears — just re-fade.
+  renderViewer();        // re-fade the document highlights
+  renderRightPanel();    // re-fade the rule list (incl. both filter selects)
 }
 
 // blend rgba backgrounds — more overlap → more opaque
@@ -2045,20 +2164,25 @@ function initResizablePanel() {
   });
 }
 
+// Load the judge prompts for the CURRENT annotator: reset to the built-in defaults,
+// then apply any prompts this annotator has saved. (Re-run whenever the annotator
+// changes, since prompts are per-person now.)
+async function loadJudgeSettings() {
+  S.judgePrompts = { extract: DEFAULT_EXTRACT, revise: DEFAULT_REVISE, relation: DEFAULT_RELATION };
+  const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
+  const settings = await api('/api/settings' + aq);
+  if (settings && !settings.error) {
+    for (const m of JUDGE_MODES) if (settings[m.key]) S.judgePrompts[m.id] = settings[m.key];
+    if (settings.llm_relation_prompt) S.judgePrompts.relation = settings.llm_relation_prompt;
+    if (settings.judge_model) S.judgeModel = settings.judge_model;
+  }
+}
+
 // ─── Boot ────────────────────────────────────────────────────
 async function init() {
   initResizablePanel();
   await loadAnnotators();
-  const settings = await api('/api/settings');
-  if (settings && !settings.error) {
-    // Each extraction mode persists its prompt under its own settings key
-    // (rule keeps the legacy llm_judge_prompt key for backward compatibility).
-    for (const m of JUDGE_MODES) {
-      if (settings[m.key]) S.judgePrompts[m.id] = settings[m.key];
-    }
-    if (settings.llm_relation_prompt) S.judgePrompts.relation = settings.llm_relation_prompt;
-    if (settings.judge_model) S.judgeModel = settings.judge_model;
-  }
+  await loadJudgeSettings();
   const files = await api(filesUrl());
   if (files.error) { return; }
   S.allFiles = files;
@@ -2107,6 +2231,7 @@ async function onAnnotatorChange(v) {
 
 // Reload the file list (counts) and the current file's rules for the active annotator.
 async function refreshForAnnotator() {
+  await loadJudgeSettings();   // judge prompts are per-annotator — load this person's
   const files = await api(filesUrl());
   if (Array.isArray(files)) { S.allFiles = files; renderFileList(files); }
   loadFileComment();   // the comment is per-annotator — refetch on switch
@@ -2364,9 +2489,13 @@ function renderContent(content, rules) {
     const hov = blendBgs(cover.map(c => c.col.hov));
     const act = blendBgs(cover.map(c => c.col.act));
     const focused = rids.includes(S.focusedRuleId);
+    // Fade a highlight only when NONE of the rules under it match the filter; hover
+    // (data-hov) and focus still show the full colour, so it stays discoverable.
+    const dim = filterActive() && !cover.some(c => matchesFilter(c.r));
+    const rest = dim ? fadeRgba(bg, 0.3) : bg;
     html += `<span class="rule-hl${focused ? ' focused' : ''}" data-rids="${rids.join(',')}"`
-      + ` data-bg="${bg}" data-hov="${hov}" data-act="${act}"`
-      + ` style="background:${focused ? act : bg}" title="${title}">${escHtml(seg)}</span>`;
+      + ` data-bg="${rest}" data-hov="${hov}" data-act="${act}"`
+      + ` style="background:${focused ? act : rest}" title="${title}">${escHtml(seg)}</span>`;
   }
   return html;
 }
@@ -2820,25 +2949,24 @@ function renderRuleList() {
     el.innerHTML = `<div class="insp-empty">No rules yet.<br><br>Select text in the document and press <b>+ Add</b>, or open <b>LLM judge</b> and press <b>Run</b> to extract &amp; tag every rule.</div>`;
     return;
   }
-  const vis = visibleRules();
+  const vis = visibleRules();          // every rule — the filter only fades, never hides
+  const active = filterActive();
+  const matchN = active ? S.rules.filter(matchesFilter).length : vis.length;
   const head = `<div class="rl-headbar">
-    <div class="rl-head">${vis.length} rule${vis.length === 1 ? '' : 's'}</div>
+    <div class="rl-head">${vis.length} rule${vis.length === 1 ? '' : 's'}${active ? ` · ${matchN} match` : ''}</div>
     ${filterBarHTML()}
   </div>`;
-  if (!vis.length) {
-    el.innerHTML = head + `<div class="insp-empty">No labels match this filter.</div>`;
-    return;
-  }
   const items = vis.map((r) => {
     const col = colorForRule(r);
     const expanded = r.id === S.focusedRuleId;
+    const faded = active && !matchesFilter(r);
     const tag = badgeHTML(r);
     const flags = [
       r.llm_rationale ? '<span class="rl-flag" title="Has LLM rationale">⚖</span>' : '',
       r.notes ? '<span class="rl-flag" title="Has comment">✎</span>' : '',
     ].join('');
     const preview = r.rule_text.replace(/\s+/g, ' ').slice(0, 90);
-    return `<div class="rl-item${expanded ? ' active expanded' : ''}" id="rl-${r.id}" style="${rcVars(col)}">
+    return `<div class="rl-item${expanded ? ' active expanded' : ''}${faded ? ' rl-faded' : ''}" id="rl-${r.id}" style="${rcVars(col)}">
       <div class="rl-bar"></div>
       <div class="rl-body">
         <div class="rl-header" onclick="toggleRuleExpand('${r.id}', event)">
@@ -2857,25 +2985,35 @@ function renderRuleList() {
   }
 }
 
-// Dropdown filter over the rule list: All, or Rule/Context × All/Human/LLM.
-// Counts are over ALL rules in the file.
+// Two independent dropdowns over the rule list: SOURCE (All/Human/LLM) and TYPE
+// (Rule + its deontic tags · Context + its sub-types). Each option's count reflects
+// the OTHER filter's current selection, so the numbers always match what you'd see.
 function filterBarHTML() {
-  const cnt = (kind, bucket) => S.rules.filter(r => ruleKind(r) === kind && inBucket(r, bucket)).length;
-  const sel = v => S.ruleFilter === v ? ' selected' : '';
-  const opt = (v, label, n) => `<option value="${v}"${sel(v)}>${label} (${n})</option>`;
-  return `<select class="rl-filter-select" onchange="setRuleFilter(this.value)">
-    ${opt('all', 'All', S.rules.length)}
+  const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+  // SOURCE counts respect the active TYPE filter; TYPE counts respect the active SOURCE filter.
+  const cntSrc  = src => S.rules.filter(r => matchesType(r) && matchesSrc(r, src)).length;
+  const cntType = ft  => S.rules.filter(r => matchesType(r, ft) && matchesSrc(r)).length;
+  const selS = v => S.filterSrc  === v ? ' selected' : '';
+  const selT = v => S.filterType === v ? ' selected' : '';
+  const optS = (v, label) => `<option value="${v}"${selS(v)}>${label} (${cntSrc(v)})</option>`;
+  const optT = (v, label) => `<option value="${v}"${selT(v)}>${label} (${cntType(v)})</option>`;
+
+  const src = `<select class="rl-filter-select" title="Filter by who labeled it" onchange="setFilterSrc(this.value)">
+    ${optS('all', 'All')}${optS('hand', 'Human')}${optS('llm', 'LLM')}
+  </select>`;
+
+  const type = `<select class="rl-filter-select" title="Filter by rule / context type" onchange="setFilterType(this.value)">
+    ${optT('all', 'All types')}
     <optgroup label="Rule">
-      ${opt('rule', 'Rule · All', cnt('rule'))}
-      ${opt('rule:hand', 'Rule · Human', cnt('rule','hand'))}
-      ${opt('rule:llm', 'Rule · LLM', cnt('rule','llm'))}
+      ${optT('rule', 'Rule · All')}
+      ${TAGS.map(t => optT('rule:' + t, cap(t.toLowerCase()))).join('')}
     </optgroup>
     <optgroup label="Context">
-      ${opt('context', 'Context · All', cnt('context'))}
-      ${opt('context:hand', 'Context · Human', cnt('context','hand'))}
-      ${opt('context:llm', 'Context · LLM', cnt('context','llm'))}
+      ${optT('context', 'Context · All')}
+      ${CONTEXT_TYPES.map(t => optT('context:' + t, cap(t))).join('')}
     </optgroup>
   </select>`;
+  return `<div class="rl-filter-row">${src}${type}</div>`;
 }
 
 function moveFocus(delta) {
@@ -2919,9 +3057,14 @@ function ruleDetailHTML(r) {
   </div>`;
 }
 
-// Deontic tag buttons — only for 'rule' items (context spans have no tag).
+// Type picker: deontic tag for 'rule' items, sub-type for 'context' items.
 function tagSectionHTML(r) {
-  if (ruleKind(r) !== 'rule') return '';
+  if (ruleKind(r) === 'context') {
+    const btns = CONTEXT_TYPES.map(t =>
+      `<button class="tag-btn ctx${r.context_type === t ? ' active ctx' : ''}" onclick="setContextType('${t}')">${t[0].toUpperCase() + t.slice(1)}</button>`
+    ).join('');
+    return `<div class="insp-label">Context type</div><div class="tag-row ctx">${btns}</div>`;
+  }
   const tagBtns = TAGS.map(t =>
     `<button class="tag-btn${r.tag === t ? ' active ' + t.toLowerCase() : ''}" onclick="setTag('${t}')">${t}</button>`
   ).join('');
@@ -2932,10 +3075,12 @@ async function setKind(k) {
   const r = S.rules.find(x => x.id === S.focusedRuleId);
   if (!r || ruleKind(r) === k) return;
   r.kind = k;
-  if (k === 'context') r.tag = null;     // context spans carry no deontic tag
-  await api(`/api/rules/${r.id}`, 'PATCH', { kind: k, tag: r.tag });
+  const patch = { kind: k };
+  if (k === 'context') { r.tag = null; patch.tag = null; }            // rules-only deontic tag
+  else { r.context_type = null; patch.context_type = null; }          // context-only sub-type
+  await api(`/api/rules/${r.id}`, 'PATCH', patch);
   renderViewer();        // highlight colour changes (grey for context)
-  renderRightPanel();    // re-render: show/hide Tag, update filter membership
+  renderRightPanel();    // re-render: swap Tag↔Context-type picker, update filter membership
 }
 
 // Auto-grow a textarea to fit its content, up to its CSS max-height, then scroll.
@@ -2953,9 +3098,11 @@ function setInspStatus(msg, cls = '') {
   if (el) { el.textContent = msg; el.className = 'insp-status' + (cls ? ' ' + cls : ''); }
 }
 
-// Header badge: a CONTEXT label for context items, else the rule's deontic tag.
+// Header badge: the context sub-type (or plain CONTEXT) for context items,
+// else the rule's deontic tag.
 function badgeHTML(r) {
-  if (ruleKind(r) === 'context') return '<span class="rl-tag context">CONTEXT</span>';
+  if (ruleKind(r) === 'context')
+    return `<span class="rl-tag context">${r.context_type ? r.context_type.toUpperCase() : 'CONTEXT'}</span>`;
   return r.tag ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}</span>` : '';
 }
 
@@ -2979,6 +3126,15 @@ async function setTag(t) {
   r.tag = newTag;
   refreshTagSection(r);                     // update buttons only — don't rebuild the panel
   await api(`/api/rules/${r.id}`, 'PATCH', { tag: newTag });
+}
+
+// Context sub-type (condition / reference / definition) — parallel to setTag.
+async function setContextType(t) {
+  const r = S.rules.find(x => x.id === S.focusedRuleId);
+  if (!r) return;
+  r.context_type = r.context_type === t ? null : t;   // click the active one to clear
+  refreshTagSection(r);                                // update buttons + header badge in place
+  await api(`/api/rules/${r.id}`, 'PATCH', { context_type: r.context_type });
 }
 
 async function saveComment() {
@@ -3085,6 +3241,7 @@ function renderJudgeModal() {
         </div>
         <div class="modal-foot">
           <span class="tool-status" id="judgeToolStatus">Proposes typed relations between this file's ${n} rule/context entit${n === 1 ? 'y' : 'ies'}. The LLM's label is editable — your change overrides it. Replaces previous LLM relations; keeps yours. Needs ≥ 2 entities.</span>
+          <button class="btn ghost" onclick="restoreDefaultPrompt()" title="Reset this prompt to the built-in default">↺ Restore default</button>
           <button class="btn primary" id="judgeRunBtn" onclick="runJudge()"${n < 2 ? ' disabled' : ''}>▶ Extract relations</button>
         </div>
       </div>`;
@@ -3120,7 +3277,8 @@ function renderJudgeModal() {
         <textarea class="tool-prompt" id="judgePromptArea">${esc(S.judgePrompts[S.judgeMode] || '')}</textarea>
       </div>
       <div class="modal-foot">
-        <span class="tool-status" id="judgeToolStatus">${md.blurb} Your edits are saved when you run.</span>
+        <span class="tool-status" id="judgeToolStatus">${md.blurb} Your edits are saved (per annotator) when you run.</span>
+        <button class="btn ghost" onclick="restoreDefaultPrompt()" title="Reset this prompt to the built-in default">↺ Restore default</button>
         <button class="btn primary" id="judgeRunBtn" onclick="runJudge()">${runLabel}</button>
       </div>
     </div>`;
@@ -3222,7 +3380,25 @@ function updateCommentBtn() {
   if (btn) btn.classList.toggle('has-comment', !!S.fileComment);
 }
 
-async function persistSettings(obj) { await api('/api/settings', 'POST', obj); }
+// Prompts are saved per-annotator; judge_model stays global. The annotator is
+// attached here so every caller persists under the right person.
+async function persistSettings(obj) { await api('/api/settings', 'POST', { ...obj, annotator: S.userName || '' }); }
+
+// "Restore default": drop this annotator's saved prompt for the active mode so it
+// reverts to the built-in default (and tracks future default changes).
+async function restoreDefaultPrompt() {
+  const aq = '?annotator=' + encodeURIComponent(S.userName || '');
+  if (S.mode === 'relation') {
+    S.judgePrompts.relation = DEFAULT_RELATION;
+    await api('/api/settings/llm_relation_prompt' + aq, 'DELETE');
+  } else {
+    const md = judgeModeDef(S.judgeMode);
+    S.judgePrompts[S.judgeMode] = md.deflt;
+    await api('/api/settings/' + md.key + aq, 'DELETE');
+  }
+  renderJudgeModal();   // rebuilds the textarea from S.judgePrompts (now the default)
+  setToolStatus('judgeToolStatus', 'Restored the default prompt for this annotator.', 'ok');
+}
 
 // The single unified LLM-judge run: extract + tag + rationale over the whole
 // document. Locks the panel behind a spinner, then releases back to the panel.
