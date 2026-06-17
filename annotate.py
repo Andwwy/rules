@@ -2016,7 +2016,7 @@ const S = {
   filterSrc:     (function(){ const v = localStorage.getItem('filterSrc') || 'all';
                    return ['all','hand','llm'].includes(v) ? v : 'all'; })(),
   filterType:    (function(){ const v = localStorage.getItem('filterType') || 'all';
-                   const ok = ['all','rule','context']
+                   const ok = ['all','rule','rule:none','context']
                      .concat(['PROHIBITION','PRESCRIPTION','PERMISSION','PREFERENCE'].map(t=>'rule:'+t))
                      .concat(['condition','reference','definition'].map(t=>'context:'+t));
                    return ok.includes(v) ? v : 'all'; })(),
@@ -2114,14 +2114,16 @@ function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 // Provenance (human / LLM / reviewed) is conveyed by COLOUR in both the list and the
 // document — it is not a fade-filter. Only the TYPE axis and the keyword search fade.
 function ruleCtxType(r) { return r.context_type || null; }   // condition|example|definition
-// Type axis: 'all' | 'rule' | 'rule:<TAG>' | 'context' | 'context:<subtype>'.
+// Type axis: 'all' | 'rule' | 'rule:<TAG>' | 'rule:none' | 'context' | 'context:<subtype>'.
+// 'rule:none' = a rule with no deontic tag yet (the uncertain ones to revisit).
 function matchesType(r, ft) {
   ft = ft || S.filterType || 'all';
   if (ft === 'all') return true;
   const [kind, sub] = ft.split(':');
   if (ruleKind(r) !== kind) return false;
   if (!sub) return true;
-  return kind === 'rule' ? r.tag === sub : ruleCtxType(r) === sub;
+  if (kind === 'rule') return sub === 'none' ? !r.tag : r.tag === sub;
+  return ruleCtxType(r) === sub;
 }
 // Keyword search over the rule text, comment, and LLM rationale (case-insensitive).
 function matchesSearch(r) {
@@ -3107,6 +3109,7 @@ function filterBarHTML() {
     <optgroup label="Rule">
       ${optT('rule', 'Rule · All')}
       ${TAGS.map(t => optT('rule:' + t, cap(t.toLowerCase()))).join('')}
+      ${optT('rule:none', 'Untagged')}
     </optgroup>
     <optgroup label="Context">
       ${optT('context', 'Context · All')}
