@@ -357,7 +357,10 @@ def save_rule():
     if not fid or not rule_text:
         return jsonify({"error": "file_id and rule_text required"}), 400
     annotator = (b.get("annotator") or b.get("extracted_by") or "unknown").strip()
-    rid = make_id(fid, "hand", annotator, rule_text)   # scoped per annotator
+    # Include the selection's char position so the SAME text selected at a DIFFERENT
+    # spot is a DISTINCT rule (duplicates are independent). Same text + same position
+    # still dedupes (it's literally the same selection).
+    rid = make_id(fid, "hand", annotator, rule_text, b.get("char_start"), b.get("char_end"))
     by  = b.get("extracted_by") or annotator
     kind = "context" if (b.get("kind") == "context") else "rule"
     con = annot_con()
@@ -2488,10 +2491,18 @@ function getRuleSpans(rule) {
   const content = S.currentFile?.content;
   if (!content) return [];
   if (rule._spans && rule._spansFor === content) return rule._spans;
-  let spans = locateSpans(content, (rule.rule_text || '').trim());
-  if (!spans.length) {
-    const cr = getRuleCharRange(rule);   // fall back to stored char/line range
-    if (cr) spans = [cr];
+  const rt = (rule.rule_text || '').trim();
+  let spans = null;
+  // If the stored char range EXACTLY contains this rule's text, use it — this pins the
+  // rule to ITS OWN occurrence, so two rules with identical text highlight different
+  // spots (instead of both snapping to the first text match).
+  const cr = getRuleCharRange(rule);
+  if (cr && content.slice(cr[0], cr[1]).trim() === rt && rt) spans = [cr];
+  // Otherwise locate by text (handles multi-segment quotes / drifted offsets), then
+  // fall back to the stored range as a last resort.
+  if (!spans) {
+    spans = locateSpans(content, rt);
+    if (!spans.length && cr) spans = [cr];
   }
   rule._spans = spans; rule._spansFor = content;
   return spans;
