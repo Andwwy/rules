@@ -231,6 +231,8 @@ def api_files():
         "file_type": r[3], "content_len": r[4], "source": r[5],
         "hand_count": counts.get(r[0], {}).get("hand", 0),
         "llm_count":  _machine(counts.get(r[0], {})),
+        # revised == a 'revise' pass has been run (badge turns green vs. blue for extract-only)
+        "revised":    "revise" in counts.get(r[0], {}),
     } for r in rows])
 
 @app.route("/api/file/<fid>")
@@ -1305,6 +1307,8 @@ body.resizing { cursor: col-resize; user-select: none; }
    (matches the document highlight colours: human red, machine blue) */
 .badge.hand { background: rgba(239,68,68,0.22);  color: #f87171; }
 .badge.llm  { background: rgba(59,130,246,0.26); color: #60a5fa; }
+/* machine badge turns green once a "revise" pass has run on the file */
+.badge.revised { background: rgba(34,197,94,0.24); color: #4ade80; }
 
 /* ── Viewer ── */
 .viewer-panel {
@@ -1685,14 +1689,14 @@ kbd {
 }
 .rl-item:hover { border-color: #c7c7e0; }
 .rl-item.active { border-color: var(--rc-bdr, #6366f1); box-shadow: 0 0 0 1px var(--rc-bdr, #6366f1); }
-/* The filter no longer hides — non-matching rows just fade, but stay fully clickable;
-   hovering or expanding one brings it back to full opacity. */
+/* The filter fades non-matching rows but keeps them fully clickable. Hover does NOT
+   un-fade or tint them — so the filtered view stays readable. Only the expanded
+   (focused) row returns to full opacity. */
 .rl-item.rl-faded { opacity: 0.4; transition: opacity 0.12s; }
-.rl-item.rl-faded:hover, .rl-item.rl-faded.expanded { opacity: 1; }
+.rl-item.rl-faded.expanded { opacity: 1; }
 .rl-bar { width: 4px; flex-shrink: 0; background: var(--rc-bdr, #c0c0d8); }
 .rl-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .rl-header { padding: 8px 10px 8px 6px; cursor: pointer; }
-.rl-header:hover { background: #fafaff; }
 .rl-top { display: flex; align-items: center; gap: 7px; margin-bottom: 3px; }
 .rl-pos { font-size: 10px; color: #9090b0; }
 .rl-flags { margin-left: auto; display: flex; gap: 5px; align-items: center; }
@@ -2165,6 +2169,7 @@ function afterFilterChange() {
 // Live keyword search: re-fade matching/non-matching cards IN PLACE (so the search box
 // keeps focus while typing) and re-fade the document. Full re-renders honour S.search
 // via matchesFilter too, so the two stay consistent.
+let _searchScrollTimer = null;
 function liveSearch(val) {
   S.search = val;
   const vis = visibleRules();         // the source-filtered set the list is showing
@@ -2178,6 +2183,14 @@ function liveSearch(val) {
   const head = document.querySelector('.rl-head');
   if (head) head.textContent = `${vis.length} rule${vis.length === 1 ? '' : 's'}${active ? ` · ${match} match` : ''}`;
   renderViewer();        // fade the document highlights to match
+  // jump the document to the FIRST matching rule (debounced so it settles after you pause
+  // typing rather than lurching on every keystroke). rules are in document order.
+  clearTimeout(_searchScrollTimer);
+  _searchScrollTimer = setTimeout(() => {
+    if (!(S.search || '').trim()) return;
+    const first = visibleRules().find(r => matchesFilter(r) && getRuleSpans(r).length);
+    if (first) scrollDocToNode(first.id);
+  }, 180);
 }
 
 // blend rgba backgrounds — more overlap → more opaque
@@ -2321,10 +2334,11 @@ function renderFileList(files) {
   el.innerHTML = files.map(f => {
     const name = f.repo_name ? f.repo_name.split('/').pop()
       : (f.source_url || f.id).split('/').pop() || f.id;
-    // Separate count badges: red ✎ = human labels, blue ⚖ = machine labels (llm + revise).
+    // Count badges: red ✎ = human labels; machine ⚖ = blue for LLM extraction, GREEN
+    // once a "revise" pass has been run on the file.
     const badge =
       ((f.hand_count || 0) ? `<span class="badge hand" title="${f.hand_count} human label${f.hand_count === 1 ? '' : 's'}">✎ ${f.hand_count}</span>` : '') +
-      ((f.llm_count  || 0) ? `<span class="badge llm" title="${f.llm_count} LLM label${f.llm_count === 1 ? '' : 's'}">⚖ ${f.llm_count}</span>` : '');
+      ((f.llm_count  || 0) ? `<span class="badge ${f.revised ? 'revised' : 'llm'}" title="${f.llm_count} ${f.revised ? 'revised' : 'LLM'} label${f.llm_count === 1 ? '' : 's'}">⚖ ${f.llm_count}</span>` : '');
     const active = S.currentFile?.id === f.id ? ' active' : '';
     return `<div class="file-item${active}" id="fi-${f.id}" onclick="selectFile('${f.id}')">
       <div class="file-idx">${idxMap[f.id] || '?'}</div>
@@ -2554,12 +2568,13 @@ function renderContent(content, rules) {
     const hov = blendBgs(cover.map(c => c.col.hov));
     const act = blendBgs(cover.map(c => c.col.act));
     const focused = rids.includes(S.focusedRuleId);
-    // Fade a highlight only when NONE of the rules under it match the filter; hover
-    // (data-hov) and focus still show the full colour, so it stays discoverable.
+    // Fade a highlight when NONE of the rules under it match the filter. A faded span
+    // does NOT brighten on hover (data-hov = its faint bg) so the filtered view stays
+    // clear; matching spans still brighten on hover as usual.
     const dim = filterActive() && !cover.some(c => matchesFilter(c.r));
     const rest = dim ? fadeRgba(bg, 0.3) : bg;
     html += `<span class="rule-hl${focused ? ' focused' : ''}" data-rids="${rids.join(',')}"`
-      + ` data-bg="${rest}" data-hov="${hov}" data-act="${act}"`
+      + ` data-bg="${rest}" data-hov="${dim ? rest : hov}" data-act="${act}"`
       + ` style="background:${focused ? act : rest}" title="${title}">${escHtml(seg)}</span>`;
   }
   return html;
@@ -2716,10 +2731,14 @@ function renderKbBar() {
     return;
   }
   const r = S.focusedRuleId && S.rules.find(x => x.id === S.focusedRuleId);
-  const awaitingTag = r && ruleKind(r) === 'rule' && !r.tag;
-  kb.innerHTML = awaitingTag
-    ? `<span><kbd>a</kbd><kbd>s</kbd><kbd>d</kbd><kbd>f</kbd> tag</span><span><kbd>j</kbd><kbd>k</kbd> nav</span><span><kbd>Esc</kbd> clear</span>`
-    : `<span><kbd>⌘↵</kbd> add</span><span><kbd>j</kbd><kbd>k</kbd> nav</span><span><kbd>d</kbd> del</span><span><kbd>Esc</kbd> clear</span>`;
+  const segs = [];
+  segs.push(r && ruleKind(r) === 'rule'        // a/s/d/f switch tags whenever a rule is focused
+    ? `<span><kbd>a</kbd><kbd>s</kbd><kbd>d</kbd><kbd>f</kbd> tag</span>`
+    : `<span><kbd>⌘↵</kbd> add</span>`);
+  segs.push(`<span><kbd>j</kbd><kbd>k</kbd> nav</span>`);
+  if (r) segs.push(`<span><kbd>⌫</kbd> del</span>`);   // delete the focused item
+  segs.push(`<span><kbd>Esc</kbd> clear</span>`);
+  kb.innerHTML = segs.join('');
 }
 function setMode(m) {
   if (m === S.mode || (m !== 'rule' && m !== 'relation')) return;
@@ -3208,17 +3227,20 @@ function markReviewed(r) {
   return true;
 }
 
-async function setTag(t) {
+// toggle=true (button click): clicking the active tag clears it. toggle=false
+// (a/s/d/f keyboard): always SET the tag, so re-pressing the current key is a no-op.
+async function setTag(t, toggle = true) {
   const r = S.rules.find(x => x.id === S.focusedRuleId);
   if (!r) return;
-  const newTag = r.tag === t ? null : t;   // toggle in place
+  const newTag = (toggle && r.tag === t) ? null : t;
+  if (newTag === r.tag) return;             // no change (e.g. keyboard 'set' on the current tag)
   r.tag = newTag;
   const patch = { tag: newTag };
   const flipped = markReviewed(r);          // editing an LLM tag = human review
   if (flipped) patch.reviewed = true;
   refreshTagSection(r);                     // update buttons only — don't rebuild the panel
   if (flipped) refreshCardColor(r);         // blue → purple in place
-  renderKbBar();                            // tag set/cleared → toggle the a/s/d/f hint
+  renderKbBar();                            // tag set/cleared → refresh the a/s/d/f hint
   await api(`/api/rules/${r.id}`, 'PATCH', patch);
 }
 
@@ -3627,24 +3649,23 @@ document.addEventListener('keydown', e => {
     }
     return;   // j/k/d rule-nav don't apply while labeling relations
   }
-  // a/s/d/f assign a deontic tag (in on-screen order: PROHIBITION/PRESCRIPTION/
-  // PERMISSION/PREFERENCE) to a focused, still-UNTAGGED rule. Only in that state —
-  // otherwise 'd' falls through to delete below.
+  // a/s/d/f SET the deontic tag (in on-screen order: PROHIBITION/PRESCRIPTION/
+  // PERMISSION/PREFERENCE) whenever a RULE is focused — so you can switch tags freely.
+  // (Set, not toggle: re-pressing the current tag's key keeps it.) Delete moved to ⌫.
   const TAG_KEYS = { a: 0, s: 1, d: 2, f: 3 };
   if (S.focusedRuleId && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key in TAG_KEYS)) {
     const fr = S.rules.find(x => x.id === S.focusedRuleId);
-    if (fr && ruleKind(fr) === 'rule' && !fr.tag) {
+    if (fr && ruleKind(fr) === 'rule') {
       e.preventDefault();
-      setTag(TAGS[TAG_KEYS[e.key]]);
+      setTag(TAGS[TAG_KEYS[e.key]], false);   // false = set/switch (don't toggle off)
       return;
     }
   }
   switch (e.key) {
     case 'j': case 'ArrowDown': e.preventDefault(); moveFocus(+1); break;
     case 'k': case 'ArrowUp':   e.preventDefault(); moveFocus(-1); break;
-    case 'd':
-      e.preventDefault();
-      if (S.focusedRuleId) deleteFocusedRule();
+    case 'Delete': case 'Backspace':           // delete the focused rule/context
+      if (S.focusedRuleId) { e.preventDefault(); deleteFocusedRule(); }
       break;
     case 'Escape':
       if (S.focusedRuleId) exitInspector();   // collapse the expanded rule
@@ -3715,6 +3736,7 @@ function refreshFileBadge(id) {
   if (f) {
     f.hand_count = S.rules.filter(r => r.source === 'hand').length;
     f.llm_count  = S.rules.filter(r => r.source !== 'hand').length;  // llm + revise
+    f.revised    = S.rules.some(r => r.source === 'revise');         // green badge once revised
   }
   filterFiles(document.getElementById('fileSearch').value);
 }
