@@ -80,7 +80,8 @@ def _ensure_schema(con):
     # 'definition' (NULL for rules and for unclassified context).
     for col in ("notes VARCHAR", "extracted_by VARCHAR",
                 "tag VARCHAR", "power_type VARCHAR", "llm_rationale TEXT",
-                "annotator VARCHAR", "kind VARCHAR", "context_type VARCHAR"):
+                "annotator VARCHAR", "kind VARCHAR", "context_type VARCHAR",
+                "reviewed BOOLEAN"):   # set when a human edits an LLM-extracted item's tag/kind/context
         try: con.execute(f"ALTER TABLE extracted_rules ADD COLUMN {col}")
         except Exception: pass
     con.execute("CREATE TABLE IF NOT EXISTS annotators (name VARCHAR PRIMARY KEY, created_at TIMESTAMP DEFAULT now())")
@@ -295,7 +296,7 @@ def _rule_row(r):
         "created_at": str(r[10]),
         "tag": r[11], "power_type": r[12], "llm_rationale": r[13],
         "annotator": r[14], "kind": r[15] or "rule",
-        "context_type": r[16],
+        "context_type": r[16], "reviewed": bool(r[17]),
     }
 
 @app.route("/api/all-rules")
@@ -333,7 +334,8 @@ def api_rules(fid):
     sql = """
         SELECT id, rule_text, char_start, char_end, line_start, line_end,
                source, llm_run_id, notes, extracted_by, created_at,
-               tag, power_type, llm_rationale, annotator, kind, context_type
+               tag, power_type, llm_rationale, annotator, kind, context_type,
+               reviewed
         FROM extracted_rules WHERE file_id=?
     """
     params = [fid]
@@ -375,7 +377,7 @@ def save_rule():
         "source": "hand", "llm_run_id": None, "notes": None,
         "extracted_by": by, "annotator": annotator, "kind": kind,
         "tag": None, "power_type": None, "llm_rationale": None,
-        "context_type": None,
+        "context_type": None, "reviewed": False,
     })
 
 @app.route("/api/rules/<rid>", methods=["PATCH"])
@@ -383,7 +385,7 @@ def patch_rule(rid):
     """Update any of: notes (Comment), tag, power_type, llm_rationale, kind, context_type."""
     b = request.json or {}
     updates, params = [], []
-    for k in ("notes", "tag", "power_type", "llm_rationale", "kind", "context_type"):
+    for k in ("notes", "tag", "power_type", "llm_rationale", "kind", "context_type", "reviewed"):
         if k in b:
             updates.append(f"{k}=?")
             params.append(b.get(k) or None)
@@ -872,7 +874,7 @@ def run_llm():
             "source": pass_source, "llm_run_id": run_id, "notes": None,
             "extracted_by": model, "annotator": annotator, "kind": kind,
             "tag": tag, "power_type": power_type, "llm_rationale": rationale,
-            "context_type": None,
+            "context_type": None, "reviewed": False,
         })
     if insert_rows:
         # Single multi-row INSERT = one MotherDuck round-trip instead of N.
@@ -1600,6 +1602,14 @@ kbd {
 
 /* ── Rule list ── */
 .rl-head { font-size: 11px; font-weight: 700; color: #8080a8; text-transform: uppercase; letter-spacing: 0.3px; padding: 2px 2px 4px; flex-shrink: 0; }
+/* count (left) + keyword search (right) on one row */
+.rl-head-top { display: flex; align-items: center; gap: 10px; }
+.rl-search {
+  flex: 1; min-width: 0; font: inherit; font-size: 11px; color: #333;
+  padding: 4px 9px; border-radius: 7px; border: 1px solid #d8d8ec; background: #fff;
+}
+.rl-search:focus { outline: none; border-color: #6366f1; background: #fff; }
+.rl-search::placeholder { color: #a4a4c0; }
 .rel-head-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .rel-delall { font: inherit; font-size: 11px; font-weight: 600; color: #c0392b; background: transparent; border: 1px solid #e6c4bf; border-radius: 7px; padding: 3px 9px; cursor: pointer; flex-shrink: 0; transition: all 0.12s; }
 .rel-delall:hover { background: #c0392b; color: #fff; border-color: #c0392b; }
@@ -1996,9 +2006,9 @@ const S = {
   toolMode:      false,
   commentMode:   false,   // the file-level Comment panel (⌘?)
   fileComment:   '',      // current annotator's saved comment for the open file
-  // Two independent rule-list filters:
-  //   filterSrc:  'all' | 'hand' | 'llm'   (:llm bucket = machine = extract + revise)
-  //   filterType: 'all' | 'rule' | 'rule:<TAG>' | 'context' | 'context:<subtype>'
+  // Rule-list filters:
+  //   filterSrc:  'all' | 'hand' | 'llm'  — HIDE filter: shows only that category
+  //   filterType: 'all' | 'rule' | 'rule:<TAG>' | 'context' | 'context:<subtype>'  — FADE filter
   filterSrc:     (function(){ const v = localStorage.getItem('filterSrc') || 'all';
                    return ['all','hand','llm'].includes(v) ? v : 'all'; })(),
   filterType:    (function(){ const v = localStorage.getItem('filterType') || 'all';
@@ -2006,6 +2016,7 @@ const S = {
                      .concat(['PROHIBITION','PRESCRIPTION','PERMISSION','PREFERENCE'].map(t=>'rule:'+t))
                      .concat(['condition','reference','definition'].map(t=>'context:'+t));
                    return ok.includes(v) ? v : 'all'; })(),
+  search:        '',        // keyword search over the rule list (fades non-matches)
   judgeRunning:  false,
   judgeMode:     'extract',   // which judge pass the modal is editing/running
   judgePrompts:  { extract: DEFAULT_EXTRACT, revise: DEFAULT_REVISE, relation: DEFAULT_RELATION },
@@ -2042,17 +2053,34 @@ function colorFor(name) {
 }
 function rcVars(col) { return `--rc-bdr:${col.bdr};--rc-bg:${col.bg}`; }
 function extractorOf(r) { return r.extracted_by || (r.source === 'hand' ? S.userName : r.source) || '?'; }
-// Rule highlights: human=red, LLM=blue. Context spans (human or LLM) are grey.
+// Rule highlights by provenance: human=red, pristine LLM=blue, LLM a human has
+// reviewed (re-tagged / re-kinded / commented)=purple.
 const HAND_COLOR    = { bg:'rgba(239,68,68,.20)', bdr:'#ef4444', hov:'rgba(239,68,68,.36)', act:'rgba(239,68,68,.55)' };
 const LLM_COLOR     = { bg:'rgba(59,130,246,.20)', bdr:'#3b82f6', hov:'rgba(59,130,246,.36)', act:'rgba(59,130,246,.55)' };
+const REVIEWED_COLOR = { bg:'rgba(139,92,246,.20)', bdr:'#8b5cf6', hov:'rgba(139,92,246,.36)', act:'rgba(139,92,246,.55)' };
 // Reserved for the relations interface (edges drawn between entities).
 const RELATION_COLOR = { bg:'rgba(168,85,247,.20)',  bdr:'#a855f7', hov:'rgba(168,85,247,.36)', act:'rgba(168,85,247,.54)' };
 // An entity is one of two kinds; relations are edges between entities, not a kind.
 function ruleKind(r) { return r.kind === 'context' ? 'context' : 'rule'; }
-// Colour by provenance only (rule AND context alike): human red, everything the
-// machine produced (extract OR revise) blue. Rule vs context is shown by the badge.
+// True once a human has touched an LLM-extracted item — either changed its
+// classification (reviewed flag, set on a tag/kind/context edit) or left a comment.
+function isReviewed(r) {
+  return r.source !== 'hand' && (!!r.reviewed || !!(r.notes && r.notes.trim()));
+}
+// Colour by provenance (rule AND context alike): human red, pristine machine blue,
+// human-reviewed machine purple. Rule vs context is shown by the badge.
 function colorForRule(r) {
-  return r.source === 'hand' ? HAND_COLOR : LLM_COLOR;
+  if (r.source === 'hand') return HAND_COLOR;
+  return isReviewed(r) ? REVIEWED_COLOR : LLM_COLOR;
+}
+// Re-apply a card's provenance colour in place (and refresh the doc highlight) after
+// a human edit flips an LLM item to "reviewed" (blue→purple) — without rebuilding the
+// panel, so an open comment textarea isn't disturbed.
+function refreshCardColor(r) {
+  const col = colorForRule(r);
+  const el = document.getElementById('rl-' + r.id);
+  if (el) { el.style.setProperty('--rc-bdr', col.bdr); el.style.setProperty('--rc-bg', col.bg); }
+  renderViewer();
 }
 // Colour by ENTITY TYPE (deontic tag / context) — used in relation mode so the
 // highlight hue hints what kind of rule you're linking, regardless of who made it.
@@ -2079,14 +2107,9 @@ function typeBadgeColor(r) {
 }
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 
-// Two independent axes that AND together.
-// Source bucket: 'all' | 'hand' (human) | 'llm' (machine = extract + revise).
+// Provenance (human / LLM / reviewed) is conveyed by COLOUR in both the list and the
+// document — it is not a fade-filter. Only the TYPE axis and the keyword search fade.
 function ruleCtxType(r) { return r.context_type || null; }   // condition|example|definition
-function matchesSrc(r, src) {
-  src = src || S.filterSrc || 'all';
-  if (src === 'all') return true;
-  return src === 'hand' ? r.source === 'hand' : r.source !== 'hand';
-}
 // Type axis: 'all' | 'rule' | 'rule:<TAG>' | 'context' | 'context:<subtype>'.
 function matchesType(r, ft) {
   ft = ft || S.filterType || 'all';
@@ -2096,14 +2119,32 @@ function matchesType(r, ft) {
   if (!sub) return true;
   return kind === 'rule' ? r.tag === sub : ruleCtxType(r) === sub;
 }
-function matchesFilter(r) { return matchesType(r) && matchesSrc(r); }
-// A filter is "active" when either axis is narrowed away from All.
-function filterActive() { return (S.filterSrc && S.filterSrc !== 'all') || (S.filterType && S.filterType !== 'all'); }
-// Nothing is ever hidden. The filter just FADES non-matching rules (in the list and
-// the document) while keeping every rule fully clickable/editable — so it's easy to
-// reassign things across a filter. Relation mode doesn't fade at all (the filter is
-// irrelevant there; every entity must stay pickable). So this is simply every rule.
-function visibleRules() { return S.rules; }
+// Keyword search over the rule text, comment, and LLM rationale (case-insensitive).
+function matchesSearch(r) {
+  const q = (S.search || '').trim().toLowerCase();
+  if (!q) return true;
+  return ((r.rule_text || '') + ' ' + (r.notes || '') + ' ' + (r.llm_rationale || ''))
+    .toLowerCase().includes(q);
+}
+function matchesFilter(r) { return matchesType(r) && matchesSearch(r); }
+// A filter is "active" (i.e. fades non-matches) when the TYPE dropdown is narrowed or a
+// search term is set. Provenance (human/LLM) never fades — it's shown by colour.
+function filterActive() {
+  return (S.filterType && S.filterType !== 'all') || !!(S.search && S.search.trim());
+}
+// SOURCE filter (human / LLM) is a HIDE filter — it shows only the chosen category.
+// visibleRules() is what the list AND the document render; the TYPE filter and search
+// then FADE within that set (matchesFilter). Relation mode shows everything (all
+// entities must stay pickable).
+function matchesSrc(r, src) {
+  src = src || S.filterSrc || 'all';
+  if (src === 'all') return true;
+  return src === 'hand' ? r.source === 'hand' : r.source !== 'hand';
+}
+function visibleRules() {
+  if (S.mode === 'relation') return S.rules;
+  return S.rules.filter(r => matchesSrc(r));
+}
 
 function setFilterSrc(v) {
   if (v === S.filterSrc) return;
@@ -2116,9 +2157,27 @@ function setFilterType(v) {
   afterFilterChange();
 }
 function afterFilterChange() {
-  // nothing is hidden now, so the focused rule never disappears — just re-fade.
-  renderViewer();        // re-fade the document highlights
-  renderRightPanel();    // re-fade the rule list (incl. both filter selects)
+  // the source filter HIDES — if the focused rule is now hidden, collapse it.
+  if (S.focusedRuleId && !visibleRules().some(r => r.id === S.focusedRuleId)) S.focusedRuleId = null;
+  renderViewer();        // source-hidden rules drop out of the document; type/search fade within
+  renderRightPanel();    // re-render the rule list + filter selects
+}
+// Live keyword search: re-fade matching/non-matching cards IN PLACE (so the search box
+// keeps focus while typing) and re-fade the document. Full re-renders honour S.search
+// via matchesFilter too, so the two stay consistent.
+function liveSearch(val) {
+  S.search = val;
+  const vis = visibleRules();         // the source-filtered set the list is showing
+  const active = filterActive();
+  let match = 0;
+  for (const r of vis) {
+    const ok = matchesFilter(r);
+    if (ok) match++;
+    document.getElementById('rl-' + r.id)?.classList.toggle('rl-faded', active && !ok);
+  }
+  const head = document.querySelector('.rl-head');
+  if (head) head.textContent = `${vis.length} rule${vis.length === 1 ? '' : 's'}${active ? ` · ${match} match` : ''}`;
+  renderViewer();        // fade the document highlights to match
 }
 
 // blend rgba backgrounds — more overlap → more opaque
@@ -2302,7 +2361,7 @@ async function selectFile(id) {
   S.currentFile = file; S.rules = rules; sortRules();
   S.relations = Array.isArray(relations) ? relations : [];
   S.relSource = S.relTarget = S.focusedRelId = null;
-  S.selection = null; S.focusedRuleId = null; S.toolMode = false; S.inspectorOpen = false;
+  S.selection = null; S.focusedRuleId = null; S.toolMode = false; S.inspectorOpen = false; S.search = '';
   S.commentMode = false; S.fileComment = '';
   document.getElementById('addBtn').disabled = true;
   document.getElementById('judgeBtn').classList.remove('active');
@@ -2642,10 +2701,24 @@ function renderModeToggle() {
   // The type-colour legend shows only in relation mode.
   const leg = document.getElementById('typeLegend');
   if (leg) leg.style.display = S.mode === 'relation' ? 'flex' : 'none';
-  // Bottom-right shortcut bar reflects the active mode.
+  // Bottom-right shortcut bar reflects the active mode (+ focus state in rule mode).
+  renderKbBar();
+}
+
+// The shortcut hint bar. In rule mode, when a still-untagged RULE is focused, surface
+// the a/s/d/f tag shortcuts (they're only active in exactly that state — 'd' otherwise
+// deletes). Re-rendered on focus / tag changes.
+function renderKbBar() {
   const kb = document.getElementById('kbBar');
-  if (kb) kb.innerHTML = S.mode === 'relation'
-    ? `<span><kbd>click</kbd> source</span><span><kbd>⌘+click</kbd> target</span><span><kbd>⌘↵</kbd> add</span><span><kbd>Del</kbd> cancel</span>`
+  if (!kb) return;
+  if (S.mode === 'relation') {
+    kb.innerHTML = `<span><kbd>click</kbd> source</span><span><kbd>⌘+click</kbd> target</span><span><kbd>⌘↵</kbd> add</span><span><kbd>Del</kbd> cancel</span>`;
+    return;
+  }
+  const r = S.focusedRuleId && S.rules.find(x => x.id === S.focusedRuleId);
+  const awaitingTag = r && ruleKind(r) === 'rule' && !r.tag;
+  kb.innerHTML = awaitingTag
+    ? `<span><kbd>a</kbd><kbd>s</kbd><kbd>d</kbd><kbd>f</kbd> tag</span><span><kbd>j</kbd><kbd>k</kbd> nav</span><span><kbd>Esc</kbd> clear</span>`
     : `<span><kbd>⌘↵</kbd> add</span><span><kbd>j</kbd><kbd>k</kbd> nav</span><span><kbd>d</kbd> del</span><span><kbd>Esc</kbd> clear</span>`;
 }
 function setMode(m) {
@@ -2955,11 +3028,15 @@ function renderRuleList() {
     el.innerHTML = `<div class="insp-empty">No rules yet.<br><br>Select text in the document and press <b>+ Add</b>, or open <b>LLM judge</b> and press <b>Run</b> to extract &amp; tag every rule.</div>`;
     return;
   }
-  const vis = visibleRules();          // every rule — the filter only fades, never hides
+  const vis = visibleRules();          // source-filtered (the source filter hides; type/search fade within)
   const active = filterActive();
-  const matchN = active ? S.rules.filter(matchesFilter).length : vis.length;
+  const matchN = active ? vis.filter(matchesFilter).length : vis.length;
   const head = `<div class="rl-headbar">
-    <div class="rl-head">${vis.length} rule${vis.length === 1 ? '' : 's'}${active ? ` · ${matchN} match` : ''}</div>
+    <div class="rl-head-top">
+      <div class="rl-head">${vis.length} rule${vis.length === 1 ? '' : 's'}${active ? ` · ${matchN} match` : ''}</div>
+      <input type="search" class="rl-search" id="ruleSearch" placeholder="Search keyword…"
+        value="${escAttr(S.search || '')}" oninput="liveSearch(this.value)" autocomplete="off" spellcheck="false">
+    </div>
     ${filterBarHTML()}
   </div>`;
   const items = vis.map((r) => {
@@ -2989,26 +3066,24 @@ function renderRuleList() {
     autoGrow(document.getElementById('inspRationale'));
     autoGrow(document.getElementById('inspComment'));
   }
+  renderKbBar();   // reflect whether the focused rule is awaiting a tag
 }
 
-// Two independent dropdowns over the rule list: SOURCE (All/Human/LLM) and TYPE
-// (Rule + its deontic tags · Context + its sub-types). Each option's count reflects
-// the OTHER filter's current selection, so the numbers always match what you'd see.
+// Two dropdowns: SOURCE (human/LLM) HIDES to show only that category; TYPE (deontic
+// tags · context sub-types) FADES non-matches. Counts are cross-aware (each respects
+// the other dropdown's selection).
 function filterBarHTML() {
   const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
-  // SOURCE counts respect the active TYPE filter; TYPE counts respect the active SOURCE filter.
   const cntSrc  = src => S.rules.filter(r => matchesType(r) && matchesSrc(r, src)).length;
   const cntType = ft  => S.rules.filter(r => matchesType(r, ft) && matchesSrc(r)).length;
   const selS = v => S.filterSrc  === v ? ' selected' : '';
   const selT = v => S.filterType === v ? ' selected' : '';
   const optS = (v, label) => `<option value="${v}"${selS(v)}>${label} (${cntSrc(v)})</option>`;
   const optT = (v, label) => `<option value="${v}"${selT(v)}>${label} (${cntType(v)})</option>`;
-
-  const src = `<select class="rl-filter-select" title="Filter by who labeled it" onchange="setFilterSrc(this.value)">
+  const src = `<select class="rl-filter-select" title="Show only this category (human / LLM)" onchange="setFilterSrc(this.value)">
     ${optS('all', 'All')}${optS('hand', 'Human')}${optS('llm', 'LLM')}
   </select>`;
-
-  const type = `<select class="rl-filter-select" title="Filter by rule / context type" onchange="setFilterType(this.value)">
+  const type = `<select class="rl-filter-select" title="Filter by rule / context type — fades non-matches" onchange="setFilterType(this.value)">
     ${optT('all', 'All types')}
     <optgroup label="Rule">
       ${optT('rule', 'Rule · All')}
@@ -3084,8 +3159,9 @@ async function setKind(k) {
   const patch = { kind: k };
   if (k === 'context') { r.tag = null; patch.tag = null; }            // rules-only deontic tag
   else { r.context_type = null; patch.context_type = null; }          // context-only sub-type
+  if (markReviewed(r)) patch.reviewed = true;                          // changing kind = human review
   await api(`/api/rules/${r.id}`, 'PATCH', patch);
-  renderViewer();        // highlight colour changes (grey for context)
+  renderViewer();        // highlight colour changes (grey for context); re-paints purple
   renderRightPanel();    // re-render: swap Tag↔Context-type picker, update filter membership
 }
 
@@ -3125,13 +3201,25 @@ function refreshTagSection(r) {
   }
 }
 
+// Mark an LLM item as human-reviewed (purple). Returns true if it just flipped.
+function markReviewed(r) {
+  if (r.source === 'hand' || r.reviewed) return false;
+  r.reviewed = true;
+  return true;
+}
+
 async function setTag(t) {
   const r = S.rules.find(x => x.id === S.focusedRuleId);
   if (!r) return;
   const newTag = r.tag === t ? null : t;   // toggle in place
   r.tag = newTag;
+  const patch = { tag: newTag };
+  const flipped = markReviewed(r);          // editing an LLM tag = human review
+  if (flipped) patch.reviewed = true;
   refreshTagSection(r);                     // update buttons only — don't rebuild the panel
-  await api(`/api/rules/${r.id}`, 'PATCH', { tag: newTag });
+  if (flipped) refreshCardColor(r);         // blue → purple in place
+  renderKbBar();                            // tag set/cleared → toggle the a/s/d/f hint
+  await api(`/api/rules/${r.id}`, 'PATCH', patch);
 }
 
 // Context sub-type (condition / reference / definition) — parallel to setTag.
@@ -3139,8 +3227,12 @@ async function setContextType(t) {
   const r = S.rules.find(x => x.id === S.focusedRuleId);
   if (!r) return;
   r.context_type = r.context_type === t ? null : t;   // click the active one to clear
+  const patch = { context_type: r.context_type };
+  const flipped = markReviewed(r);
+  if (flipped) patch.reviewed = true;
   refreshTagSection(r);                                // update buttons + header badge in place
-  await api(`/api/rules/${r.id}`, 'PATCH', { context_type: r.context_type });
+  if (flipped) refreshCardColor(r);
+  await api(`/api/rules/${r.id}`, 'PATCH', patch);
 }
 
 async function saveComment() {
@@ -3149,7 +3241,9 @@ async function saveComment() {
   if (!r || !inp) return;
   const notes = inp.value.trim() || null;
   if (notes === (r.notes || null)) return;
+  const wasReviewed = isReviewed(r);
   r.notes = notes;
+  if (isReviewed(r) !== wasReviewed) refreshCardColor(r);   // comment added/removed → toggle purple
   await api(`/api/rules/${r.id}`, 'PATCH', { notes });
   setInspStatus('Comment saved', 'ok');
 }
@@ -3532,6 +3626,18 @@ document.addEventListener('keydown', e => {
       else if (S.focusedRelId) { S.focusedRelId = null; renderViewer(); renderRightPanel(); }
     }
     return;   // j/k/d rule-nav don't apply while labeling relations
+  }
+  // a/s/d/f assign a deontic tag (in on-screen order: PROHIBITION/PRESCRIPTION/
+  // PERMISSION/PREFERENCE) to a focused, still-UNTAGGED rule. Only in that state —
+  // otherwise 'd' falls through to delete below.
+  const TAG_KEYS = { a: 0, s: 1, d: 2, f: 3 };
+  if (S.focusedRuleId && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key in TAG_KEYS)) {
+    const fr = S.rules.find(x => x.id === S.focusedRuleId);
+    if (fr && ruleKind(fr) === 'rule' && !fr.tag) {
+      e.preventDefault();
+      setTag(TAGS[TAG_KEYS[e.key]]);
+      return;
+    }
   }
   switch (e.key) {
     case 'j': case 'ArrowDown': e.preventDefault(); moveFocus(+1); break;
