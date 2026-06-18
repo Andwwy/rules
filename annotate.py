@@ -387,13 +387,18 @@ def save_rule():
 
 @app.route("/api/rules/<rid>", methods=["PATCH"])
 def patch_rule(rid):
-    """Update any of: notes (Comment), tag, power_type, llm_rationale, kind, context_type."""
+    """Update notes/tag/power_type/llm_rationale/kind/context_type/reviewed, or the
+    rule's text + position (rule_text, char_start/end, line_start/end) when re-selected."""
     b = request.json or {}
     updates, params = [], []
-    for k in ("notes", "tag", "power_type", "llm_rationale", "kind", "context_type", "reviewed"):
+    for k in ("notes", "tag", "power_type", "llm_rationale", "kind", "context_type", "reviewed", "rule_text"):
         if k in b:
             updates.append(f"{k}=?")
             params.append(b.get(k) or None)
+    for k in ("char_start", "char_end", "line_start", "line_end"):   # numeric: keep 0, don't coerce
+        if k in b:
+            updates.append(f"{k}=?")
+            params.append(b.get(k))
     if not updates:
         return jsonify({"ok": True})
     params.append(rid)
@@ -2024,6 +2029,8 @@ const S = {
                      .concat(['condition','reference','definition'].map(t=>'context:'+t));
                    return ok.includes(v) ? v : 'all'; })(),
   search:        '',        // keyword search over the rule list (fades non-matches)
+  editingRuleId: null,      // rule whose text is being re-selected (press E); its span greys out
+  editSelection: null,      // the new {start,end,text} picked while editing
   judgeRunning:  false,
   judgeMode:     'extract',   // which judge pass the modal is editing/running
   judgePrompts:  { extract: DEFAULT_EXTRACT, revise: DEFAULT_REVISE, relation: DEFAULT_RELATION },
@@ -2381,6 +2388,7 @@ async function selectFile(id) {
   S.relations = Array.isArray(relations) ? relations : [];
   S.relSource = S.relTarget = S.focusedRelId = null;
   S.selection = null; S.focusedRuleId = null; S.toolMode = false; S.inspectorOpen = false; S.search = '';
+  S.editingRuleId = null; S.editSelection = null;
   S.commentMode = false; S.fileComment = '';
   document.getElementById('addBtn').disabled = true;
   document.getElementById('judgeBtn').classList.remove('active');
@@ -2471,6 +2479,8 @@ function renderViewer() {
     }
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) return;   // rule mode: text selection handled on mouseup
+    // While editing a rule's text, a plain click (no drag = "unselect") aborts the edit.
+    if (S.editingRuleId) { cancelRuleEdit(); return; }
     if (span) focusSpan(span);
     else clearSelection();                 // clicking empty space clears a pending selection
   });
@@ -2581,14 +2591,16 @@ function renderContent(content, rules) {
     const hov = blendBgs(cover.map(c => c.col.hov));
     const act = blendBgs(cover.map(c => c.col.act));
     const focused = rids.includes(S.focusedRuleId);
+    // The rule being re-selected (press E) greys out so you can drag a new span for it.
+    const editing = S.editingRuleId && rids.includes(S.editingRuleId);
     // Fade a highlight when NONE of the rules under it match the filter. A faded span
     // does NOT brighten on hover (data-hov = its faint bg) so the filtered view stays
     // clear; matching spans still brighten on hover as usual.
     const dim = filterActive() && !cover.some(c => matchesFilter(c.r));
-    const rest = dim ? fadeRgba(bg, 0.3) : bg;
-    html += `<span class="rule-hl${focused ? ' focused' : ''}" data-rids="${rids.join(',')}"`
-      + ` data-bg="${rest}" data-hov="${dim ? rest : hov}" data-act="${act}"`
-      + ` style="background:${focused ? act : rest}" title="${title}">${escHtml(seg)}</span>`;
+    const rest = editing ? 'rgba(150,150,170,0.28)' : (dim ? fadeRgba(bg, 0.3) : bg);
+    html += `<span class="rule-hl${focused && !editing ? ' focused' : ''}" data-rids="${rids.join(',')}"`
+      + ` data-bg="${rest}" data-hov="${editing || dim ? rest : hov}" data-act="${editing ? rest : act}"`
+      + ` style="background:${focused && !editing ? act : rest}" title="${title}">${escHtml(seg)}</span>`;
   }
   return html;
 }
@@ -2605,12 +2617,55 @@ function onViewerMouseUp() {
   if (!sel || sel.isCollapsed) return;          // not a drag-selection
   const offsets = getSelectionOffsets(pre);
   if (!offsets) return;                          // selection isn't in the document
-  S.selection = offsets;
   const preview = offsets.text.slice(0, 55).replace(/\s+/g, ' ');
+  // Editing a rule's text: the drag re-defines THIS rule, not a new one.
+  if (S.editingRuleId) {
+    S.editSelection = offsets;
+    setSelInfo(`new text: "${preview}${offsets.text.length > 55 ? '…' : ''}" — <kbd>↵</kbd> save · <kbd>Esc</kbd> cancel`);
+    return;
+  }
+  S.selection = offsets;
   setSelInfo(`"${preview}${offsets.text.length > 55 ? '…' : ''}" (${offsets.end - offsets.start} chars) — <kbd>⌘↵</kbd>`);
   document.getElementById('addBtn').disabled = false;
 }
 document.addEventListener('mouseup', onViewerMouseUp);
+
+// ── Edit a rule's TEXT by re-selecting (press E on a focused rule) ──
+function startRuleEdit() {
+  if (!S.focusedRuleId) return;
+  S.editingRuleId = S.focusedRuleId;
+  S.editSelection = null;
+  window.getSelection()?.removeAllRanges();
+  document.getElementById('addBtn').disabled = true;
+  setSelInfo('editing rule text — drag-select the new text · <kbd>↵</kbd> save · <kbd>Esc</kbd> cancel');
+  renderViewer();          // grey out the rule's current highlight
+  renderKbBar();
+}
+function commitRuleEdit() {
+  const r = ruleById(S.editingRuleId);
+  const sel = S.editSelection;
+  if (r && sel && sel.text.trim()) {            // new text picked → save it to the rule
+    const content = S.currentFile.content;
+    r.rule_text  = sel.text.trim();
+    r.char_start = sel.start; r.char_end = sel.end;
+    r.line_start = content.slice(0, sel.start).split('\n').length;
+    r.line_end   = content.slice(0, sel.end).split('\n').length;
+    r._spans = null;                            // force the highlight to re-derive
+    const patch = { rule_text: r.rule_text, char_start: r.char_start, char_end: r.char_end,
+                    line_start: r.line_start, line_end: r.line_end };
+    if (markReviewed(r)) patch.reviewed = true; // editing an LLM rule = human review
+    api(`/api/rules/${r.id}`, 'PATCH', patch);
+  }
+  endRuleEdit();                                 // no selection → abort (just exits)
+}
+function cancelRuleEdit() { endRuleEdit(); }
+function endRuleEdit() {
+  S.editingRuleId = null; S.editSelection = null;
+  window.getSelection()?.removeAllRanges();
+  setSelInfo(null);
+  sortRules();             // position may have changed
+  renderViewer(); renderRuleList(); renderKbBar();
+}
 
 function focusSpan(span) {
   const rids = span.dataset.rids.split(',');
@@ -2743,11 +2798,16 @@ function renderKbBar() {
     kb.innerHTML = `<span><kbd>click</kbd> source</span><span><kbd>⌘+click</kbd> target</span><span><kbd>⌘↵</kbd> add</span><span><kbd>Del</kbd> cancel</span>`;
     return;
   }
+  if (S.editingRuleId) {   // re-selecting a rule's text
+    kb.innerHTML = `<span>drag to re-select text</span><span><kbd>↵</kbd> save</span><span><kbd>Esc</kbd> cancel</span>`;
+    return;
+  }
   const r = S.focusedRuleId && S.rules.find(x => x.id === S.focusedRuleId);
   const segs = [];
   segs.push(r && ruleKind(r) === 'rule'        // a/s/d/f switch tags whenever a rule is focused
     ? `<span><kbd>a</kbd><kbd>s</kbd><kbd>d</kbd><kbd>f</kbd> tag</span>`
     : `<span><kbd>⌘↵</kbd> add</span>`);
+  if (r) segs.push(`<span><kbd>e</kbd> edit text</span>`);   // re-select to redefine the rule's text
   segs.push(`<span><kbd>j</kbd><kbd>k</kbd> nav</span>`);
   if (r) segs.push(`<span><kbd>⌫</kbd> del</span>`);   // delete the focused item
   segs.push(`<span><kbd>Esc</kbd> clear</span>`);
@@ -2759,6 +2819,7 @@ function setMode(m) {
   localStorage.setItem('annotatorMode', m);
   S.relSource = S.relTarget = S.focusedRelId = null;   // drop any in-progress/focused edge
   S.focusedRuleId = null;                  // collapse rule inspector when leaving
+  S.editingRuleId = null; S.editSelection = null;      // abort any in-progress text edit
   renderModeToggle();
   setSelInfo(null);
   clearSelection();
@@ -3662,6 +3723,18 @@ document.addEventListener('keydown', e => {
       else if (S.focusedRelId) { S.focusedRelId = null; renderViewer(); renderRightPanel(); }
     }
     return;   // j/k/d rule-nav don't apply while labeling relations
+  }
+  // Editing a rule's text (press E): Enter saves the re-selection (or aborts if none),
+  // Esc cancels. Other keys are swallowed so the drag-to-select isn't disturbed.
+  if (S.editingRuleId) {
+    if (e.key === 'Enter')  { e.preventDefault(); commitRuleEdit(); }
+    if (e.key === 'Escape') { e.preventDefault(); cancelRuleEdit(); }
+    return;
+  }
+  // E starts "edit text" mode for the focused rule — its highlight greys out and the
+  // next drag-select redefines its text/position.
+  if (S.focusedRuleId && !e.metaKey && !e.ctrlKey && !e.altKey && e.key === 'e') {
+    e.preventDefault(); startRuleEdit(); return;
   }
   // a/s/d/f SET the deontic tag (in on-screen order: PROHIBITION/PRESCRIPTION/
   // PERMISSION/PREFERENCE) whenever a RULE is focused — so you can switch tags freely.
