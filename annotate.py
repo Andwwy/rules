@@ -20,7 +20,8 @@ Usage:
   open http://localhost:5002
 """
 
-import hashlib, json, os, re, threading, urllib.request, urllib.error
+import hashlib, json, os, re, threading, time, urllib.request, urllib.error
+import concurrent.futures, contextlib
 from datetime import datetime, timezone
 import duckdb
 from flask import Flask, jsonify, request, make_response
@@ -53,7 +54,9 @@ if os.path.exists(_env_path):
 # read from the environment (.env locally, Render env vars in production).
 # ---------------------------------------------------------------------------
 MOTHERDUCK_TOKEN = os.environ.get("MOTHERDUCK_TOKEN") or os.environ.get("motherduck_token")
-MOTHERDUCK_DATABASE = os.environ.get("MOTHERDUCK_DATABASE", "rules")
+# Canonical DB is the v2 set ("rules v2.0"). Override with MOTHERDUCK_DATABASE to point
+# elsewhere (the old "rules" DB and snapshots remain attached but are no longer the default).
+MOTHERDUCK_DATABASE = os.environ.get("MOTHERDUCK_DATABASE", "rules_v2_6_18")
 USE_MOTHERDUCK = bool(MOTHERDUCK_TOKEN)
 
 def _ensure_schema(con):
@@ -78,10 +81,19 @@ def _ensure_schema(con):
     # kind == 'rule' (a directive — gets a deontic tag) or 'context' (background, no tag)
     # context_type == sub-type of a 'context' node: 'condition' | 'reference' |
     # 'definition' (NULL for rules and for unclassified context).
+    # accepted   == passed an Extract multi-judge vote (solid highlight) — always
+    #               true for hand rules; candidate (sub-threshold) spans are NOT rows.
+    # vote_count == # distinct judges that backed this item (ring numerator)
+    # judge_total== # judges in the run that produced it (ring denominator)
+    # tag        == the EFFECTIVE deontic tag (a human edit overrides the LLM's pick).
+    # llm_tag     == the tag the Label vote decided, preserved so a human change can be
+    #               contrasted/reverted. "Revised" = llm_tag set AND tag != llm_tag.
     for col in ("notes VARCHAR", "extracted_by VARCHAR",
                 "tag VARCHAR", "power_type VARCHAR", "llm_rationale TEXT",
                 "annotator VARCHAR", "kind VARCHAR", "context_type VARCHAR",
-                "reviewed BOOLEAN"):   # set when a human edits an LLM-extracted item's tag/kind/context
+                "reviewed BOOLEAN",   # set when a human edits an LLM-extracted item's tag/kind/context
+                "accepted BOOLEAN", "vote_count INTEGER", "judge_total INTEGER",
+                "llm_tag VARCHAR"):
         try: con.execute(f"ALTER TABLE extracted_rules ADD COLUMN {col}")
         except Exception: pass
     con.execute("CREATE TABLE IF NOT EXISTS annotators (name VARCHAR PRIMARY KEY, created_at TIMESTAMP DEFAULT now())")
@@ -127,6 +139,32 @@ def _ensure_schema(con):
     # contrasted. Effective/displayed label = relation_type (user) ?? llm_relation_type.
     try: con.execute("ALTER TABLE relations ADD COLUMN llm_relation_type VARCHAR")
     except Exception: pass
+    # accepted/vote_count/judge_total mirror extracted_rules — set when a relation
+    # passes the multi-judge Relation vote (hand relations: accepted, null counts).
+    for col in ("accepted BOOLEAN", "vote_count INTEGER", "judge_total INTEGER"):
+        try: con.execute(f"ALTER TABLE relations ADD COLUMN {col}")
+        except Exception: pass
+    # ── Multi-judge voting ──────────────────────────────────────────────────
+    # judge_runs: one row per Extract/Label/Relation multi-judge pass.
+    # judge_votes: every individual judge output (powers the vote rings, the
+    #   inspection panel, and the Extract candidate/light highlights).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS judge_runs (
+            id VARCHAR PRIMARY KEY, file_id VARCHAR NOT NULL, annotator VARCHAR,
+            mode VARCHAR NOT NULL, threshold INTEGER, judge_total INTEGER,
+            models TEXT, created_at TIMESTAMP DEFAULT now()
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS judge_votes (
+            id VARCHAR PRIMARY KEY, run_id VARCHAR NOT NULL, file_id VARCHAR NOT NULL,
+            annotator VARCHAR, mode VARCHAR NOT NULL,
+            judge_idx INTEGER, model VARCHAR,
+            char_start INTEGER, char_end INTEGER, kind VARCHAR,
+            rule_id VARCHAR, source_id VARCHAR, target_id VARCHAR,
+            value VARCHAR, rationale TEXT, created_at TIMESTAMP DEFAULT now()
+        )
+    """)
 
 def _md_connect(target):
     # On Render, point DuckDB's extension/home dir at the writable /tmp so the
@@ -299,6 +337,11 @@ def _rule_row(r):
         "tag": r[11], "power_type": r[12], "llm_rationale": r[13],
         "annotator": r[14], "kind": r[15] or "rule",
         "context_type": r[16], "reviewed": bool(r[17]),
+        # accepted: NULL (legacy / hand) is treated as accepted; only explicit
+        # False marks a sub-threshold candidate (currently candidates aren't rows).
+        "accepted": (r[18] is not False),
+        "vote_count": r[19], "judge_total": r[20],
+        "llm_tag": r[21],   # the Label vote's pick, preserved under a human override
     }
 
 @app.route("/api/all-rules")
@@ -337,7 +380,7 @@ def api_rules(fid):
         SELECT id, rule_text, char_start, char_end, line_start, line_end,
                source, llm_run_id, notes, extracted_by, created_at,
                tag, power_type, llm_rationale, annotator, kind, context_type,
-               reviewed
+               reviewed, accepted, vote_count, judge_total, llm_tag
         FROM extracted_rules WHERE file_id=?
     """
     params = [fid]
@@ -367,8 +410,8 @@ def save_rule():
     con.execute("""
         INSERT OR IGNORE INTO extracted_rules
             (id,file_id,rule_text,char_start,char_end,line_start,line_end,
-             source,llm_run_id,notes,extracted_by,annotator,kind)
-        VALUES(?,?,?,?,?,?,?,'hand',NULL,NULL,?,?,?)
+             source,llm_run_id,notes,extracted_by,annotator,kind,accepted)
+        VALUES(?,?,?,?,?,?,?,'hand',NULL,NULL,?,?,?,TRUE)
     """, [rid, fid, rule_text,
           b.get("char_start"), b.get("char_end"),
           b.get("line_start"), b.get("line_end"), by, annotator, kind])
@@ -383,6 +426,7 @@ def save_rule():
         "extracted_by": by, "annotator": annotator, "kind": kind,
         "tag": None, "power_type": None, "llm_rationale": None,
         "context_type": None, "reviewed": False,
+        "accepted": True, "vote_count": None, "judge_total": None, "llm_tag": None,
     })
 
 @app.route("/api/rules/<rid>", methods=["PATCH"])
@@ -425,10 +469,12 @@ def _relation_row(r):
         "relation_type": r[4], "notes": r[5], "source": r[6],
         "llm_run_id": r[7], "llm_rationale": r[8], "annotator": r[9],
         "created_at": str(r[10]), "llm_relation_type": r[11],
+        "accepted": (r[12] is not False), "vote_count": r[13], "judge_total": r[14],
     }
 
 _REL_COLS = ("id, file_id, source_id, target_id, relation_type, notes, source, "
-             "llm_run_id, llm_rationale, annotator, created_at, llm_relation_type")
+             "llm_run_id, llm_rationale, annotator, created_at, llm_relation_type, "
+             "accepted, vote_count, judge_total")
 
 @app.route("/api/relations/<fid>")
 def api_relations(fid):
@@ -909,6 +955,534 @@ def delete_llm_run(run_id):
     return jsonify({"ok": True})
 
 # ---------------------------------------------------------------------------
+# Routes – multi-judge voting (Extract / Label / Relation)
+# ---------------------------------------------------------------------------
+_TAGS = ("PROHIBITION", "PRESCRIPTION", "PERMISSION", "PREFERENCE")
+
+def _norm_tag(t):
+    t = (t or "").strip().upper()
+    return t if t in _TAGS else None
+
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    n = len(xs)
+    if n == 0: return None
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) // 2
+
+def _overlap_frac(a, b):
+    """Reciprocal char-overlap of two [start,end) spans (min of the two ratios)."""
+    inter = max(0, min(a[1], b[1]) - max(a[0], b[0]))
+    if inter <= 0: return 0.0
+    la, lb = a[1] - a[0], b[1] - b[0]
+    if la <= 0 or lb <= 0: return 0.0
+    return min(inter / la, inter / lb)
+
+def _cluster_spans(spans, thresh_frac=0.5):
+    """Single-linkage cluster span proposals of the SAME kind whose char ranges
+    reciprocally overlap ≥ thresh_frac. Returns a list of groups (lists of spans)."""
+    n = len(spans)
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    for i in range(n):
+        for j in range(i + 1, n):
+            if spans[i].get("kind") != spans[j].get("kind"): continue
+            ai = (spans[i]["char_start"], spans[i]["char_end"])
+            aj = (spans[j]["char_start"], spans[j]["char_end"])
+            if _overlap_frac(ai, aj) >= thresh_frac:
+                ra, rb = find(i), find(j)
+                if ra != rb: parent[ra] = rb
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(spans[i])
+    return list(groups.values())
+
+class JudgeError(Exception):
+    """A user-facing judge failure (bad state / API error) surfaced via the job."""
+    def __init__(self, msg, code=400):
+        super().__init__(msg); self.msg = msg; self.code = code
+
+# In-flight multi-judge jobs, so the loading UI can poll per-judge progress. Each
+# judge is an opaque single LLM call, so a judge's bar is indeterminate while
+# 'running' and fills on 'done'/'error' — letting the user watch them finish in
+# parallel at their own pace.
+_JUDGE_JOBS = {}
+_JUDGE_LOCK = threading.Lock()
+
+# Serializes multi-statement judge writes on the shared MotherDuck session so a
+# concurrent reader (e.g. another viewer's GET /api/rules) never sees a half-applied
+# DELETE+INSERT, and two writers can't conflict on the same tuples.
+_DB_WRITE_LOCK = threading.Lock()
+
+@contextlib.contextmanager
+def _atomic(con):
+    """Run a judge save under the write lock inside one transaction (commit on
+    success, rollback on error) so it's atomic to other cursors on the session.
+    Hold this ONLY around DB writes — never around the slow LLM fan-out."""
+    with _DB_WRITE_LOCK:
+        con.execute("BEGIN TRANSACTION")
+        try:
+            yield
+            con.execute("COMMIT")
+        except Exception:
+            try: con.execute("ROLLBACK")
+            except Exception: pass
+            raise
+
+def _cleanup_jobs():
+    """Drop finished/stale jobs (called under _JUDGE_LOCK). Only reap a job that is
+    done OR has gone quiet past the ceiling — never one whose thread is still
+    actively reporting progress (its ts is refreshed by the progress callback)."""
+    now = time.time()
+    for k in [k for k, v in _JUDGE_JOBS.items()
+              if (v.get("done") and now - v.get("ts", 0) > 60) or now - v.get("ts", 0) > 1800]:
+        _JUDGE_JOBS.pop(k, None)
+
+def _judge_fanout(judges, sys_msg, usr_msg, api_key, progress_cb=None):
+    """Run N judges CONCURRENTLY (one Perplexity call each). Returns a list of
+    (judge_idx, model, raw_text, error) preserving judge order. progress_cb(idx,
+    status) fires as each judge completes ('done' / 'error') — used for the
+    per-judge progress bars on the loading screen."""
+    results = [None] * len(judges)
+    def work(i):
+        model = (judges[i].get("model") or "sonar").strip()
+        try:
+            raw = _perplexity_complete(model, sys_msg, usr_msg, api_key, max_out=32000)
+            return i, model, raw, None
+        except urllib.error.HTTPError as e:
+            return i, model, "", f"API {e.code}: {e.read().decode()[:200]}"
+        except Exception as e:
+            return i, model, "", str(e)
+    # max_workers == judge count (capped) so every judge in a normal panel runs at once.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, max(1, len(judges)))) as ex:
+        futs = [ex.submit(work, i) for i in range(len(judges))]
+        for fut in concurrent.futures.as_completed(futs):
+            i, model, raw, err = fut.result()
+            results[i] = (i, model, raw, err)
+            if progress_cb:
+                try: progress_cb(i, "error" if err else "done")
+                except Exception: pass
+    return results
+
+def _save_run_and_votes(con, run_id, fid, annotator, mode, threshold, judges, votes):
+    """Persist a judge_runs row + every raw per-judge vote, replacing this
+    annotator's previous run/votes for the same (file, mode)."""
+    con.execute("DELETE FROM judge_votes WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?",
+                [fid, mode, annotator or None])
+    con.execute("DELETE FROM judge_runs WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?",
+                [fid, mode, annotator or None])
+    con.execute("INSERT INTO judge_runs(id,file_id,annotator,mode,threshold,judge_total,models) VALUES(?,?,?,?,?,?,?)",
+                [run_id, fid, annotator or None, mode, threshold, len(judges),
+                 json.dumps([j.get("model") for j in judges])])
+    # ONE batched multi-row INSERT instead of a network round-trip per vote — the
+    # per-row version made the post-fanout "aggregating" wait take seconds on MotherDuck.
+    if votes:
+        ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        flat = []
+        for k, v in enumerate(votes):
+            vid = make_id(run_id, v.get("judge_idx"), v.get("rule_id") or "", v.get("source_id") or "",
+                          v.get("target_id") or "", v.get("char_start"), v.get("char_end"), v.get("value") or "", k)
+            flat += [vid, run_id, fid, annotator or None, mode, v.get("judge_idx"), v.get("model"),
+                     v.get("char_start"), v.get("char_end"), v.get("kind"), v.get("rule_id"),
+                     v.get("source_id"), v.get("target_id"), v.get("value"), v.get("rationale")]
+        con.execute(
+            "INSERT OR IGNORE INTO judge_votes"
+            " (id,run_id,file_id,annotator,mode,judge_idx,model,char_start,char_end,kind,rule_id,source_id,target_id,value,rationale)"
+            " VALUES " + ",".join([ph] * len(votes)), flat)
+
+def _judge_gate(mode, fid, annotator):
+    """Synchronous pre-flight checks so the UI gets an immediate error (not via
+    polling). Label needs ≥1 rule; Relation needs ≥2 entities AND every rule
+    tagged (relations are built from context + tagged rules)."""
+    if mode not in ("label", "relation"):
+        return None
+    con = annot_con()
+    rows = con.execute(
+        "SELECT kind, tag FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?"
+        " AND (accepted IS NULL OR accepted=TRUE)", [fid, annotator or None]).fetchall()
+    con.close()
+    rules = [r for r in rows if (r[0] or "rule") == "rule"]
+    if mode == "label":
+        if not rules:
+            return "No rules to label — run Extract first."
+        return None
+    # relation
+    if len(rows) < 2:
+        return "Need at least 2 rules/context in this file to relate — run Extract first."
+    untagged = sum(1 for r in rules if not r[1])
+    if untagged:
+        return (f"Tag every rule in Label first — {untagged} rule{'s' if untagged != 1 else ''} "
+                "still untagged. (Relations are built from context + tagged rules.)")
+    return None
+
+@app.route("/api/judge", methods=["POST"])
+def run_judge():
+    """Kick off multi-judge voting for one stage. Judges run CONCURRENTLY in a
+    background thread; this returns a run_id immediately and the client polls
+    /api/judge-progress/<run_id> to watch each judge finish and collect the result.
+    Aggregation: Extract = char-overlap clusters; Label = per-rule majority tag;
+    Relation = per-edge majority type (over context + tagged rules)."""
+    b = request.json or {}
+    fid       = (b.get("file_id") or "").strip()
+    mode      = (b.get("mode") or "extract").strip().lower()
+    annotator = (b.get("annotator") or "").strip()
+    prompt    = (b.get("prompt") or "").strip()
+    judges    = b.get("judges") or []
+    if isinstance(judges, list) and judges and isinstance(judges[0], str):
+        judges = [{"model": m} for m in judges]
+    if not judges:
+        judges = [{"model": (b.get("model") or "sonar")}]
+    judges = [{"model": (j.get("model") or "sonar").strip()} for j in judges]
+    try: threshold = int(b.get("threshold") or 1)
+    except Exception: threshold = 1
+    threshold = max(1, min(threshold, len(judges)))
+    if mode not in ("extract", "label", "relation"):
+        return jsonify({"error": "mode must be extract|label|relation"}), 400
+    if not fid or not prompt:
+        return jsonify({"error": "file_id and prompt required"}), 400
+    api_key = os.environ.get("PERPLEXITY_API_KEY", "")
+    if not api_key:
+        return jsonify({"error": "PERPLEXITY_API_KEY not set"}), 400
+    sc = sample_con()
+    row = sc.execute("SELECT content FROM sample WHERE id=?", [fid]).fetchone()
+    if not row: return jsonify({"error": "file not found"}), 404
+    content = row[0] or ""
+    gate = _judge_gate(mode, fid, annotator)
+    if gate:
+        return jsonify({"error": gate}), 400
+    run_id = make_id(fid, mode, annotator, prompt, datetime.now(timezone.utc).isoformat())
+    with _JUDGE_LOCK:
+        _cleanup_jobs()
+        _JUDGE_JOBS[run_id] = {
+            "mode": mode, "judge_total": len(judges), "threshold": threshold,
+            "judges": [{"model": j["model"], "status": "running"} for j in judges],
+            "done": False, "result": None, "error": None, "ts": time.time(),
+        }
+    t = threading.Thread(target=_run_judge_job,
+                         args=(run_id, mode, fid, annotator, prompt, judges, threshold, content, api_key),
+                         daemon=True)
+    t.start()
+    return jsonify({"run_id": run_id, "started": True, "judge_total": len(judges),
+                    "judges": [j["model"] for j in judges]})
+
+def _run_judge_job(run_id, mode, fid, annotator, prompt, judges, threshold, content, api_key):
+    """Background worker: run the stage's judges (with live per-judge progress),
+    aggregate, and stash the result/error on the job for the client to poll."""
+    def cb(idx, status):
+        with _JUDGE_LOCK:
+            job = _JUDGE_JOBS.get(run_id)
+            if job and 0 <= idx < len(job["judges"]):
+                job["judges"][idx]["status"] = status
+                job["ts"] = time.time()   # keep the job fresh so _cleanup_jobs won't reap it mid-run
+    fn = {"extract": _judge_extract, "label": _judge_label, "relation": _judge_relation}[mode]
+    try:
+        payload = fn(fid, annotator, prompt, judges, threshold, content, api_key, run_id, cb)
+        with _JUDGE_LOCK:
+            job = _JUDGE_JOBS.get(run_id)
+            if job: job["result"] = payload; job["done"] = True; job["ts"] = time.time()
+    except JudgeError as je:
+        with _JUDGE_LOCK:
+            job = _JUDGE_JOBS.get(run_id)
+            if job: job["error"] = je.msg; job["done"] = True; job["ts"] = time.time()
+    except Exception as e:
+        with _JUDGE_LOCK:
+            job = _JUDGE_JOBS.get(run_id)
+            if job: job["error"] = str(e); job["done"] = True; job["ts"] = time.time()
+
+@app.route("/api/judge-progress/<run_id>")
+def judge_progress(run_id):
+    """Poll a running/finished multi-judge job. While running, returns each judge's
+    status; once done, returns the aggregation result (then drops the job)."""
+    with _JUDGE_LOCK:
+        job = _JUDGE_JOBS.get(run_id)
+        if not job:
+            return jsonify({"error": "unknown or expired run", "missing": True}), 404
+        out = {
+            "run_id": run_id, "mode": job["mode"], "judge_total": job["judge_total"],
+            "threshold": job["threshold"], "judges": [dict(j) for j in job["judges"]],
+            "done": job["done"], "error": job["error"],
+            "result": job["result"] if job["done"] else None,
+        }
+        if job["done"]:
+            _JUDGE_JOBS.pop(run_id, None)   # one final read, then free it
+    return jsonify(out)
+
+def _judge_extract(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None):
+    sys_msg = ("You identify spans in a document and return ONLY a single valid JSON array — "
+               "no prose, no markdown fences. Use exactly the field schema in the user's instructions.")
+    usr_msg = f"{prompt}\n\nDocument:\n---\n{content[:30000]}\n---\n\nReturn ONLY a JSON array."
+    fan = _judge_fanout(judges, sys_msg, usr_msg, api_key, progress_cb)
+    errors = [e for (_, _, _, e) in fan if e]
+    cl = content.lower()
+    votes, span_props = [], []
+    for idx, model, raw, err in fan:
+        if err: continue
+        for item in _parse_llm_rules(raw):
+            rt = (item.get("rule_text") or "").strip()
+            if not rt: continue
+            loc = _locate_rule(content, cl, rt)
+            if not loc: continue
+            cs, ce = loc
+            kind = "context" if (item.get("kind") == "context") else "rule"
+            rationale = item.get("rationale") or item.get("llm_rationale")
+            votes.append({"judge_idx": idx, "model": model, "char_start": cs, "char_end": ce,
+                          "kind": kind, "value": kind, "rationale": rationale})
+            span_props.append({"judge_idx": idx, "char_start": cs, "char_end": ce,
+                               "kind": kind, "rationale": rationale})
+    if not votes and errors:
+        raise JudgeError(errors[0], 502)
+    clusters = _cluster_spans(span_props)
+    # Build the accepted rows first (pure work, no DB) so the write lock is held only
+    # for the actual save below.
+    accepted, insert_rows = 0, []
+    for grp in clusters:
+        nj = len({s["judge_idx"] for s in grp})
+        if nj < threshold: continue          # sub-threshold → candidate (light), not a row
+        cs, ce = _median([s["char_start"] for s in grp]), _median([s["char_end"] for s in grp])
+        rt = content[cs:ce].strip()
+        if not rt: continue
+        kinds = [s["kind"] for s in grp]
+        kind = "context" if kinds.count("context") > kinds.count("rule") else "rule"
+        ls = content[:cs].count("\n") + 1
+        le = content[:ce].count("\n") + 1
+        rationale = next((s.get("rationale") for s in grp if s.get("rationale")), None)
+        eid = make_id(fid, "extract", annotator, cs, ce)   # stable per span → relations survive re-runs
+        insert_rows.append([eid, fid, rt, cs, ce, ls, le, "llm", run_id, None, "judge",
+                            None, kind, rationale, annotator or None, True, nj, len(judges)])
+        accepted += 1
+    con = annot_con()
+    try:
+        with _atomic(con):
+            if annotator:
+                con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
+            _save_run_and_votes(con, run_id, fid, annotator, "extract", threshold, judges, votes)
+            # An Extract run replaces this annotator's previous machine rules (keeps hand).
+            con.execute("DELETE FROM extracted_rules WHERE file_id=? AND source IN ('llm','revise')"
+                        " AND annotator IS NOT DISTINCT FROM ?", [fid, annotator or None])
+            if insert_rows:
+                ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                flat = [v for r in insert_rows for v in r]
+                con.execute(
+                    "INSERT OR IGNORE INTO extracted_rules"
+                    " (id,file_id,rule_text,char_start,char_end,line_start,line_end,source,llm_run_id,"
+                    "  notes,extracted_by,tag,kind,llm_rationale,annotator,accepted,vote_count,judge_total)"
+                    " VALUES " + ",".join([ph] * len(insert_rows)), flat)
+    finally:
+        con.close()
+    return {"run_id": run_id, "mode": "extract", "accepted": accepted,
+            "judge_total": len(judges), "threshold": threshold, "errors": errors}
+
+def _judge_label(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None):
+    con = annot_con()
+    rows = con.execute(
+        "SELECT id, kind, rule_text, line_start FROM extracted_rules"
+        " WHERE file_id=? AND annotator IS NOT DISTINCT FROM ? AND (accepted IS NULL OR accepted=TRUE)"
+        " ORDER BY COALESCE(line_start,999999), COALESCE(char_start,999999)",
+        [fid, annotator or None]).fetchall()
+    targets = [r for r in rows if (r[1] or "rule") == "rule"]
+    if not targets:
+        con.close()
+        raise JudgeError("No rules to label — run Extract first (or add rules).")
+    label_to_id, lines = {}, []
+    for i, (rid, kind, text, ls) in enumerate(targets, 1):
+        lab = f"R{i}"; label_to_id[lab] = rid
+        lines.append(f'{lab} (line {ls}): {(text or "")[:200].strip()}')
+    node_block = "\n".join(lines)
+    sys_msg = ("You assign exactly one deontic tag to each listed rule and return ONLY a valid "
+               "JSON array — no prose, no fences. Use exactly the field schema in the user's instructions.")
+    usr_msg = (f"{prompt}\n\nRULES to tag (reference each by its R-label):\n{node_block}\n\n"
+               f"Document:\n---\n{content[:25000]}\n---\n\nReturn ONLY a JSON array.")
+    fan = _judge_fanout(judges, sys_msg, usr_msg, api_key, progress_cb)
+    errors = [e for (_, _, _, e) in fan if e]
+    votes, tally = [], {}
+    for idx, model, raw, err in fan:
+        if err: continue
+        for item in _parse_llm_rules(raw):
+            lab = str(item.get("rule") or item.get("rule_ref") or item.get("ref")
+                      or item.get("R") or item.get("id") or "").strip()
+            rid = label_to_id.get(lab)
+            if not rid: continue
+            tag = _norm_tag(item.get("tag") or item.get("value") or item.get("label"))
+            rationale = item.get("rationale") or item.get("llm_rationale")
+            votes.append({"judge_idx": idx, "model": model, "rule_id": rid,
+                          "value": tag, "rationale": rationale})
+            if tag:
+                tally.setdefault(rid, {}).setdefault(tag, 0)
+                tally[rid][tag] += 1
+    if not votes and errors:
+        con.close(); raise JudgeError(errors[0], 502)
+    labeled = 0
+    try:
+        with _atomic(con):
+            if annotator:
+                con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
+            _save_run_and_votes(con, run_id, fid, annotator, "label", threshold, judges, votes)
+            for rid, counts in tally.items():
+                best_n = max(counts.values())
+                winners = [t for t, c in counts.items() if c == best_n]
+                # record ring counts regardless; only APPLY the tag on a clear ≥threshold
+                # win. Store the LLM's pick in BOTH tag (effective) and llm_tag (preserved
+                # so a later human change can be detected/reverted).
+                if len(winners) == 1 and best_n >= threshold:
+                    con.execute("UPDATE extracted_rules SET tag=?, llm_tag=?, llm_run_id=?, vote_count=?, judge_total=? WHERE id=?",
+                                [winners[0], winners[0], run_id, best_n, len(judges), rid])
+                    labeled += 1
+                else:
+                    con.execute("UPDATE extracted_rules SET llm_run_id=?, vote_count=?, judge_total=? WHERE id=?",
+                                [run_id, best_n, len(judges), rid])
+    finally:
+        con.close()
+    return {"run_id": run_id, "mode": "label", "labeled": labeled,
+            "judge_total": len(judges), "threshold": threshold, "errors": errors}
+
+def _judge_relation(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None):
+    con = annot_con()
+    nodes = con.execute(
+        "SELECT id, kind, tag, rule_text, line_start FROM extracted_rules"
+        " WHERE file_id=? AND annotator IS NOT DISTINCT FROM ? AND (accepted IS NULL OR accepted=TRUE)"
+        " ORDER BY COALESCE(line_start,999999), COALESCE(char_start,999999)",
+        [fid, annotator or None]).fetchall()
+    if len(nodes) < 2:
+        con.close()
+        raise JudgeError("Need at least 2 rules/context in this file to relate.")
+    # Present each entity WITH its deontic tag (rules) or CONTEXT, so the judges
+    # relate based on both the context spans and the rules' tags.
+    label_to_id, lines = {}, []
+    for i, (nid, kind, tag, text, ls) in enumerate(nodes, 1):
+        lab = f"R{i}"; label_to_id[lab] = nid
+        kindlab = "context" if (kind == "context") else ("rule/" + (tag or "UNTAGGED"))
+        lines.append(f'{lab} [{kindlab}] (line {ls}): {(text or "")[:200].strip()}')
+    node_block = "\n".join(lines)
+    # PROJECT CONTEXT — relations must reflect how the rules actually interact in THIS
+    # project, not just surface wording. Feed the repo identity so a web-capable judge
+    # can consult the real repository when it helps. (Repo metadata lives in `sample`,
+    # keyed by the rule's file_id.)
+    proj = ""
+    try:
+        mrow = sample_con().execute(
+            "SELECT repo_name, source_url, file_type FROM sample WHERE id=?", [fid]).fetchone()
+    except Exception:
+        mrow = None
+    if mrow:
+        repo, url, ftype = mrow[0], mrow[1], mrow[2]
+        bits = []
+        if repo:  bits.append(f"repository **{repo}**")
+        if ftype: bits.append(f"config file type `{ftype}`")
+        proj = ("\n\nPROJECT CONTEXT — these rules come from the " + (", ".join(bits) or "project")
+                + (f" (source: {url})" if url else "") + ". Ground every relation in what THIS project "
+                "actually is and how its rules interact in practice — not just surface textual similarity. "
+                "If it would help and you are able to, consult the actual repository"
+                + (f" at {url}" if url else "") + " (its README, structure, and related files) to understand "
+                "the project's purpose before deciding how the rules relate.")
+    sys_msg = ("You propose directed relations between the listed entities and return ONLY a single "
+               "valid JSON array — no prose, no fences. Use exactly the field schema in the user's instructions. "
+               "Judge relations by the project's real semantics, not just wording; consult the repository when useful.")
+    usr_msg = (f"{prompt}{proj}\n\nENTITIES in this document — each is either a CONTEXT span or a rule with its "
+               f"deontic tag (PROHIBITION/PRESCRIPTION/PERMISSION/PREFERENCE). Use BOTH the tags and the "
+               f"context when deciding how they relate. Reference them by their R-label:\n{node_block}\n\n"
+               f"Document:\n---\n{content[:25000]}\n---\n\nReturn ONLY a JSON array of relations.")
+    fan = _judge_fanout(judges, sys_msg, usr_msg, api_key, progress_cb)
+    errors = [e for (_, _, _, e) in fan if e]
+    # Tally agreement on the (source, target, TYPE) — a judge counts toward an edge
+    # only for the type it actually voted, so the acceptance threshold and the stored
+    # vote_count reflect agreement on the relation TYPE, not just "some edge here".
+    # One judge's first vote for a given (pair, type) is what counts (no double-count).
+    votes = []
+    edge_type_judges = {}    # (src,tgt,type) -> set(judge_idx)
+    edge_type_rat = {}       # (src,tgt,type) -> a representative rationale
+    for idx, model, raw, err in fan:
+        if err: continue
+        for e in _parse_llm_rules(raw):
+            s_lab = str(e.get("source") or e.get("source_id") or "").strip()
+            t_lab = str(e.get("target") or e.get("target_id") or "").strip()
+            src, tgt = label_to_id.get(s_lab), label_to_id.get(t_lab)
+            if not src or not tgt or src == tgt: continue
+            rtype = (e.get("type") or e.get("relation_type") or "").strip().lower()
+            if rtype not in _REL_TYPES:
+                rtype = "define" if rtype.startswith(("support", "define")) else None
+            rationale = e.get("rationale") or e.get("llm_rationale")
+            votes.append({"judge_idx": idx, "model": model, "source_id": src, "target_id": tgt,
+                          "value": rtype, "rationale": rationale})
+            if rtype:   # only typed votes contribute to an acceptable edge
+                edge_type_judges.setdefault((src, tgt, rtype), set()).add(idx)
+                if rationale and (src, tgt, rtype) not in edge_type_rat:
+                    edge_type_rat[(src, tgt, rtype)] = rationale
+    if not votes and errors:
+        con.close(); raise JudgeError(errors[0], 502)
+    # Per ordered pair, pick the type with the most distinct-judge support (plurality);
+    # accept ONE majority edge per pair when that winning type reaches the threshold.
+    pair_best = {}           # (src,tgt) -> (type, n_judges, rationale)
+    for (src, tgt, rtype), jset in edge_type_judges.items():
+        n = len(jset)
+        cur = pair_best.get((src, tgt))
+        if cur is None or n > cur[1]:
+            pair_best[(src, tgt)] = (rtype, n, edge_type_rat.get((src, tgt, rtype)))
+    accepted = 0
+    try:
+        with _atomic(con):
+            if annotator:
+                con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
+            _save_run_and_votes(con, run_id, fid, annotator, "relation", threshold, judges, votes)
+            con.execute("DELETE FROM relations WHERE file_id=? AND source='llm' AND annotator IS NOT DISTINCT FROM ?",
+                        [fid, annotator or None])
+            for (src, tgt), (rtype, nj, rat) in pair_best.items():
+                if nj < threshold: continue          # winning type didn't reach agreement
+                rid = make_id(fid, src, tgt, "llm", annotator)   # one majority llm edge per pair
+                con.execute(
+                    "INSERT OR IGNORE INTO relations"
+                    " (id,file_id,source_id,target_id,relation_type,notes,source,llm_run_id,llm_rationale,"
+                    "  annotator,llm_relation_type,accepted,vote_count,judge_total)"
+                    " VALUES (?,?,?,?,NULL,NULL,'llm',?,?,?,?,TRUE,?,?)",
+                    [rid, fid, src, tgt, run_id, rat, annotator or None, rtype, nj, len(judges)])
+                accepted += 1
+    finally:
+        con.close()
+    return {"run_id": run_id, "mode": "relation", "accepted": accepted,
+            "judge_total": len(judges), "threshold": threshold, "errors": errors}
+
+@app.route("/api/judge-data/<fid>")
+def judge_data(fid):
+    """Latest multi-judge run + every per-judge vote for each mode — powers the
+    vote rings, the inspection panel, and Extract candidate/light highlights."""
+    annotator = (request.args.get("annotator") or "").strip()
+    con = annot_con()
+    out = {}
+    for mode in ("extract", "label", "relation"):
+        run = con.execute(
+            "SELECT id, threshold, judge_total, models FROM judge_runs"
+            " WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?"
+            " ORDER BY created_at DESC LIMIT 1", [fid, mode, annotator or None]).fetchone()
+        if not run:
+            out[mode] = None; continue
+        run_id, threshold, judge_total, models = run
+        vrows = con.execute(
+            "SELECT judge_idx, model, char_start, char_end, kind, rule_id, source_id, target_id, value, rationale"
+            " FROM judge_votes WHERE run_id=? ORDER BY judge_idx", [run_id]).fetchall()
+        votes = [{"judge_idx": v[0], "model": v[1], "char_start": v[2], "char_end": v[3],
+                  "kind": v[4], "rule_id": v[5], "source_id": v[6], "target_id": v[7],
+                  "value": v[8], "rationale": v[9]} for v in vrows]
+        info = {"run_id": run_id, "threshold": threshold, "judge_total": judge_total,
+                "models": json.loads(models) if models else [], "votes": votes}
+        if mode == "extract":
+            spans = [{"judge_idx": v["judge_idx"], "char_start": v["char_start"],
+                      "char_end": v["char_end"], "kind": v["kind"]}
+                     for v in votes if v["char_start"] is not None and v["char_end"] is not None]
+            cands = []
+            for grp in _cluster_spans(spans):
+                nj = len({s["judge_idx"] for s in grp})
+                if nj >= (threshold or 1): continue   # accepted clusters are already rules
+                cs, ce = _median([s["char_start"] for s in grp]), _median([s["char_end"] for s in grp])
+                kinds = [s["kind"] for s in grp]
+                kind = "context" if kinds.count("context") > kinds.count("rule") else "rule"
+                cands.append({"char_start": cs, "char_end": ce, "kind": kind, "vote_count": nj})
+            info["candidates"] = cands
+        out[mode] = info
+    con.close()
+    return jsonify(out)
+
+# ---------------------------------------------------------------------------
 # Routes – CSV export page
 # ---------------------------------------------------------------------------
 @app.route("/export")
@@ -1125,7 +1699,11 @@ def create_annotator():
 # The judge/extract/relation prompts are PER-ANNOTATOR: stored as "<key>::<annotator>".
 # Everything else (e.g. judge_model) stays global. An annotator with no saved value
 # falls back to the built-in default the frontend already holds.
-PROMPT_KEYS = ("llm_judge_prompt", "llm_judge_prompt_revise", "llm_relation_prompt")
+# Per-annotator, resettable settings. The three judge_cfg_* hold a JSON blob per
+# mode: {threshold, judges:[{model}], prompt}. The legacy prompt keys are kept so
+# old per-annotator prompts still resolve (and Restore-default still works).
+PROMPT_KEYS = ("llm_judge_prompt", "llm_judge_prompt_revise", "llm_relation_prompt",
+               "judge_cfg_extract", "judge_cfg_label", "judge_cfg_relation")
 
 @app.route("/api/settings")
 def get_settings():
@@ -1397,24 +1975,27 @@ kbd {
 .rule-hl.rel-hl.hl-tgt  { box-shadow: inset 0 -3px 0 0 #4a6fd8; }
 .rule-hl.rel-hl.hl-both { box-shadow: inset 0 -3px 0 0 #4a6fd8; }
 
-/* ── Rule / Relation mode toggle (sel-bar) ── */
+/* ── Extract / Label / Relation mode toggle (sel-bar) ── */
 .mode-toggle {
-  position: relative; display: grid; grid-template-columns: 1fr 1fr;
+  position: relative; display: grid; grid-template-columns: 1fr 1fr 1fr;
   background: #cccdd8; border-radius: 999px; padding: 3px; isolation: isolate;
   box-shadow: inset 0 1px 2px rgba(0,0,0,0.12); flex-shrink: 0;
 }
 .mode-toggle::before {
   content: ''; position: absolute; z-index: 0; top: 3px; bottom: 3px; left: 3px;
-  width: calc(50% - 3px); border-radius: 999px; background: #fff;
+  width: calc(33.333% - 2px); border-radius: 999px; background: #fff;
   box-shadow: 0 1px 3px rgba(0,0,0,0.22); transition: transform 0.2s cubic-bezier(.4,0,.2,1);
 }
-.mode-toggle.m-relation::before { transform: translateX(100%); }
+.mode-toggle.m-label::before    { transform: translateX(100%); }
+.mode-toggle.m-relation::before { transform: translateX(200%); }
 .mode-toggle button {
   position: relative; z-index: 1; border: 0; background: transparent; cursor: pointer;
   font: inherit; font-size: 11px; font-weight: 700; letter-spacing: 0.2px;
-  padding: 4px 14px; border-radius: 999px; color: #66667a; transition: color 0.16s;
+  padding: 4px 12px; border-radius: 999px; color: #66667a; transition: color 0.16s;
 }
-.mode-toggle.m-rule #modeRuleBtn, .mode-toggle.m-relation #modeRelBtn { color: #33334a; }
+.mode-toggle.m-extract #modeExtractBtn,
+.mode-toggle.m-label #modeLabelBtn,
+.mode-toggle.m-relation #modeRelBtn { color: #33334a; }
 
 /* ── Relation build bar (floating, while picking endpoints) ── */
 .viewer-panel { position: relative; }
@@ -1556,6 +2137,78 @@ kbd {
 .btn.primary:disabled { opacity: 0.5; cursor: default; }
 .btn.ghost { background: white; color: #6060a0; border: 1px solid #d0d0e0; }
 .btn.ghost:hover { border-color: #6366f1; color: #4338ca; }
+
+/* ── Multi-judge config (in the LLM judge modal) ── */
+.judge-cfg { display: flex; flex-direction: column; gap: 9px; flex-shrink: 0; }
+.judge-cfg-row { display: flex; align-items: center; gap: 8px; }
+.judge-cfg-row .lbl { font-size: 11px; color: #7a7aaa; font-weight: 700; min-width: 54px; }
+.judge-list { display: flex; flex-direction: column; gap: 6px; }
+.judge-item { display: flex; align-items: center; gap: 7px; }
+.judge-item .jn { font-size: 11px; color: #9090b0; font-weight: 700; min-width: 54px; }
+.judge-item select { flex: 1; padding: 5px 7px; border-radius: 6px; border: 1px solid #d0d0e0; background: #fff; font-size: 12px; color: #333; }
+.judge-item select:focus { outline: none; border-color: #6366f1; }
+.judge-del { border: 0; background: #f0f0f6; color: #9a4a4a; border-radius: 6px; width: 24px; height: 26px; cursor: pointer; font-size: 14px; }
+.judge-del:hover { background: #fde2e2; color: #c0392b; }
+.judge-add { align-self: flex-start; border: 1px dashed #c0c0d8; background: #fcfcff; color: #5a5a90; border-radius: 7px; padding: 5px 11px; font-size: 11px; font-weight: 600; cursor: pointer; }
+.judge-add:hover { border-color: #6366f1; color: #4338ca; }
+.thr-row { display: flex; align-items: center; gap: 9px; }
+.thr-row input[type=range] { flex: 1; accent-color: #6366f1; }
+.thr-val { font-size: 12px; color: #4338ca; font-weight: 700; min-width: 116px; }
+.thr-val small { color: #9090b0; font-weight: 500; }
+
+/* ── Per-judge progress (loading screen) ── */
+.jp-list { display: flex; flex-direction: column; gap: 14px; width: min(520px, 80%); margin-top: 22px; }
+.jp-item { display: flex; flex-direction: column; gap: 6px; }
+.jp-name { font-size: 12px; color: #5a5a80; font-weight: 600; font-family: 'SFMono-Regular', Consolas, Menlo, monospace; }
+.jp-bar { position: relative; height: 9px; background: #e7e7f2; border-radius: 6px; overflow: hidden; }
+.jp-fill { position: absolute; top: 0; bottom: 0; border-radius: 6px; }
+.jp-running .jp-fill { width: 38%; background: linear-gradient(90deg, #a5b4fc, #6366f1); animation: jp-slide 1.15s ease-in-out infinite; }
+@keyframes jp-slide { 0% { left: -40%; } 100% { left: 100%; } }
+.jp-done .jp-fill  { left: 0; width: 100%; background: #22c55e; transition: width .25s ease; }
+.jp-error .jp-fill { left: 0; width: 100%; background: #ef4444; }
+
+/* ── Vote ring (per-item agreement donut) ── */
+.vote-ring {
+  display: inline-block; width: 16px; height: 16px; border-radius: 50%;
+  flex-shrink: 0; cursor: pointer; position: relative; vertical-align: middle;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.10);
+}
+.vote-ring::after {
+  content: ''; position: absolute; inset: 4px; border-radius: 50%; background: #fff;
+}
+.vote-ring.solid::after { inset: 5px; }
+.vote-ring:hover { box-shadow: 0 0 0 2px rgba(99,102,241,0.45); }
+.rl-ring-wrap { display: inline-flex; align-items: center; gap: 4px; }
+.rl-ring-cnt { font-size: 10px; color: #8a8aa6; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+/* LLM-vs-you tag contrast (Label) — preserved llm_tag shown under the tag picker */
+.tag-contrast { margin-top: 6px; font-size: 11px; color: #8a8aa6; display: flex; align-items: center; gap: 6px; }
+.tag-contrast.revised { color: #6a5acd; }
+.tag-revert { border: 1px solid #c7d2fe; background: #eef2ff; color: #4338ca; border-radius: 10px;
+  padding: 1px 8px; font-size: 10px; font-weight: 700; cursor: pointer; }
+.tag-revert:hover { background: #e0e7ff; }
+
+/* ── Vote inspection panel (centered modal) ── */
+.vi-card { width: min(640px, 92vw); max-height: 80vh; }
+.vi-quote { font-size: 12px; color: #44445a; background: #f5f5fb; border-radius: 8px;
+  padding: 9px 11px; margin: 0 0 4px; line-height: 1.45; max-height: 110px; overflow: auto; }
+.vi-tally { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 8px; }
+.vi-chip { font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 11px; color: #fff; }
+.vi-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.vi-table th { text-align: left; color: #8a8aa6; font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .4px; padding: 4px 8px; border-bottom: 1px solid #ececf4; }
+.vi-table td { padding: 7px 8px; border-bottom: 1px solid #f1f1f8; vertical-align: top; }
+.vi-model { font-family: 'SFMono-Regular', Consolas, Menlo, monospace; font-size: 11px; color: #555; white-space: nowrap; }
+.vi-vote { font-weight: 700; white-space: nowrap; }
+.vi-rat { color: #555; line-height: 1.4; }
+
+/* ── Extract-mode highlight legend + candidate spans ── */
+.cand-hl { border-bottom: 1px dashed rgba(120,120,140,0.5); }
+.rl-kind { display: inline-block; font-size: 9px; font-weight: 800; letter-spacing: .4px;
+  padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+.rl-kind.rule { background: #dcfce7; color: #15803d; }
+.rl-kind.context { background: #fef3c7; color: #a16207; }
+.rl-kind.cand { background: #eceef2; color: #6a6a86; }
 
 /* ── Resizer ── */
 .panel-resizer {
@@ -1709,6 +2362,7 @@ kbd {
 .rl-pos { font-size: 10px; color: #9090b0; }
 .rl-flags { margin-left: auto; display: flex; gap: 5px; align-items: center; }
 .rl-flag { font-size: 11px; color: #8080b0; }
+.rl-flag-rev { color: #6a5acd; font-weight: 700; }
 .rl-caret { font-size: 9px; color: #a0a0c0; }
 .rl-text { font-size: 12px; line-height: 1.45; color: #2a2a3e; word-break: break-word; }
 
@@ -1833,54 +2487,44 @@ Prefer exact or near-exact quotes from the file. Extract each independently enfo
 
 Return only a valid JSON array. Each element:
 {"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</script>
-<script type="text/plain" id="defaultJudgePrompt">You are the LLM judge. Read the document below and extract two kinds of item: RULES and CONTEXT. Set "kind" to "rule" or "context" on every item.
+<script type="text/plain" id="defaultJudgePrompt">You are an EXTRACTION judge. Your only job is to identify which spans of the document are atomic items — do NOT assign deontic tags (that happens in a later stage). Set "kind" to "rule" or "context" on every item.
 
-A RULE is any natural-language instruction, constraint, prohibition, requirement, permission, or grant of authority given to an LLM or agent. A CONTEXT span is background information that frames how the agent should operate but is NOT itself a directive — the agent's role or persona, its environment/tools/platform, definitions of key terms, scope or applicability statements ("this applies when…"), or situational framing that the rules depend on.
+A RULE is any natural-language instruction, constraint, prohibition, requirement, permission, or grant of authority given to an LLM or agent. A CONTEXT span is background that frames how the agent should operate but is NOT itself a directive — the agent's role or persona, its environment/tools/platform, definitions of key terms, scope or applicability statements ("this applies when…"), or situational framing that the rules depend on.
 
-Prefer exact or near-exact quotes from the document. Extract each independently meaningful span as its own item — do not merge unrelated items, and skip purely motivational text with no directive force and no framing value.
+Guidelines:
+- Use exact or near-exact quotes from the document for "rule_text".
+- Extract each independently meaningful span as its OWN item at an atomic granularity — one directive per item. Do not merge unrelated instructions; do not split a single instruction across items.
+- Skip purely motivational text with no directive force and no framing value.
+- Mark the span boundaries tightly around the meaningful content.
 
-Assign exactly ONE tag to every RULE (context items have no tag — omit it or set it to null), using these definitions, cue words, and concrete examples:
+For each item, write a short "rationale": ONE plain-English sentence on why this span is an atomic rule or context. Keep it simple and conversational.
+
+Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single line — no markdown fences, no indentation. Each element:
+{"rule_text": "<exact or near-exact quote>", "kind": "rule|context", "rationale": "<one short plain-English sentence>"}</script>
+
+<script type="text/plain" id="defaultLabelPrompt">You are a LABELING judge. You are given a numbered list of RULES already extracted from the document (each with an R-label like R1, R2). Assign exactly ONE deontic tag to each rule, using these definitions, cue words, and examples:
 
 Quick mapping (tag = modal force, with an example):
-- Prohibition = MUST NOT — "Do not accept, process, store, or repeat sensitive client data."
-- Prescription / obligation = MUST — "Read `pickle-bot/SOUL.md` for your personality, values, and communication style."
-- Permission = CAN — "You can search the web and fetch web pages."
-- Preference / strategy / norm = SHOULD — "For report drafting, work from a template or de-identified summary the staff member provides."
+- PROHIBITION = MUST NOT — "Do not accept, process, store, or repeat sensitive client data."
+- PRESCRIPTION = MUST — "Read `pickle-bot/SOUL.md` for your personality, values, and communication style."
+- PERMISSION = CAN — "You can search the web and fetch web pages."
+- PREFERENCE = SHOULD — "For report drafting, work from a template or de-identified summary the staff member provides."
 
 - PROHIBITION — forbids an action; the agent must NOT do it.
   Cues: "never", "do not", "must not", "avoid", "don't", "under no circumstances".
-  Examples:
-    - "Never commit secrets or API keys to the repository."
-    - "Do not accept, process, or store sensitive client data."
-    - "Don't run destructive git commands without confirmation."
-
 - PRESCRIPTION — requires an action; the agent MUST do it.
   Cues: "must", "always", "shall", "is required to", "ensure", "make sure".
-  Examples:
-    - "Always run the test suite before committing."
-    - "You must log every change in CHANGELOG.md."
-    - "Ensure all new code follows PEP 8."
-
 - PERMISSION — allows an action without requiring it; the agent MAY do it.
   Cues: "may", "can", "is allowed to", "feel free to", "optionally".
-  Examples:
-    - "You may reply directly if the sender is a known contact."
-    - "Feel free to suggest refactors, but don't apply them automatically."
-    - "You can use the web search tool when you need current information."
-
-- PREFERENCE — expresses a soft preference or recommends HOW to do something (a preferred approach, ordering, or method) rather than a strict requirement.
+- PREFERENCE — a soft preference or recommends HOW to do something (preferred approach, ordering, method) rather than a strict requirement.
   Cues: "prefer", "ideally", "when possible", "it's best to", "try to", "consider".
-  Examples:
-    - "Prefer small, focused commits."
-    - "Read all memory-bank files at the start of every task."
-    - "When unsure, ask a clarifying question before proceeding."
 
-When a rule could fit more than one tag, choose the tag matching its strongest directive force (PROHIBITION/PRESCRIPTION outrank PERMISSION/PREFERENCE).
+When a rule could fit more than one tag, choose the strongest directive force (PROHIBITION/PRESCRIPTION outrank PERMISSION/PREFERENCE).
 
-For each item, write a short "rationale": ONE plain-English sentence — for a rule, why that tag fits; for context, what kind of framing it provides (role, environment, definition, scope). Keep it simple and conversational; no jargon, no enforcement analysis, no mention of other tags.
+For each rule, write a short "rationale": ONE plain-English sentence on why that tag fits. Keep it simple and conversational; no jargon, no mention of other tags.
 
-Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single line — no markdown fences, no indentation, no extra whitespace (pretty-printing wastes time). Each element:
-{"rule_text": "<exact or near-exact quote>", "kind": "rule|context", "line_start": <int>, "line_end": <int>, "tag": "PROHIBITION|PRESCRIPTION|PERMISSION|PREFERENCE (null for context)", "rationale": "<one short plain-English sentence>"}</script>
+Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single line — no markdown fences, no indentation. One element PER rule:
+{"rule": "R<n>", "tag": "PROHIBITION|PRESCRIPTION|PERMISSION|PREFERENCE", "rationale": "<one short plain-English sentence>"}</script>
 
 <script type="text/plain" id="defaultRevisePrompt">You are the LLM judge in REVISE mode. A human annotator has already labeled RULES and CONTEXT in this document. Their labels (provided separately below) are your primary guidance — produce a refined, complete labeling of the whole document that strongly respects them.
 
@@ -1898,7 +2542,11 @@ For each item, write a short "rationale": ONE plain-English sentence on why it's
 Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single line — no markdown fences, no indentation, no extra whitespace. Each element:
 {"rule_text": "<exact or near-exact quote>", "kind": "rule|context", "line_start": <int>, "line_end": <int>, "tag": "PROHIBITION|PRESCRIPTION|PERMISSION|PREFERENCE (null for context)", "rationale": "<one short plain-English sentence>"}</script>
 
-<script type="text/plain" id="defaultRelationPrompt">You are the LLM judge in RELATION mode. Below is a list of ENTITIES (rules and context spans) already extracted from a document, each with a short label (R1, R2, …). Read the document and the entities, then propose meaningful, directed RELATIONS between pairs of entities.
+<script type="text/plain" id="defaultRelationPrompt">You are the LLM judge in RELATION mode. Below is a list of ENTITIES already extracted from a document, each with a short label (R1, R2, …). Each entity is either a CONTEXT span or a RULE tagged with its deontic force (PROHIBITION / PRESCRIPTION / PERMISSION / PREFERENCE). Read the document and the entities, then propose meaningful, directed RELATIONS between pairs of entities.
+
+Build the graph from BOTH the rules' tags AND the context: a context span often gates, triggers, or defines a rule; a stricter rule (PROHIBITION/PRESCRIPTION) may refine or conflict with a softer one (PERMISSION/PREFERENCE). Use the tags and context together to decide direction and type.
+
+Don't judge relations by wording alone — apply the context of the actual project. A PROJECT CONTEXT note (the repository this file belongs to) is provided below; use it, and if it helps and you're able to, consult the real repository (its README, layout, and related files) to understand how these rules actually interact before linking them.
 
 Each relation has a "source" and a "target" (entity R-labels), a "type", and a one-sentence "rationale". Direction matters (source → target). Use these types:
 - refinement — the source narrows, specifies, or details the target (a more specific case of a more general rule).
@@ -1907,11 +2555,12 @@ Each relation has a "source" and a "target" (entity R-labels), a "type", and a o
 - checkpoint — the source is a verification step or gate for the target.
 - conflict — the source conflicts with or contradicts the target.
 - duplication — the source restates or duplicates the target.
+- trigger — the source (often a CONTEXT condition) fires or activates the target rule when it holds.
 
 Only propose relations you are reasonably confident about — skip weak or spurious links. At most one relation per ordered pair.
 
 Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single line — no markdown fences, no indentation. Each element:
-{"source": "R<n>", "target": "R<n>", "type": "refinement|exception|define|checkpoint|conflict|duplication", "rationale": "<one short plain-English sentence>"}</script>
+{"source": "R<n>", "target": "R<n>", "type": "refinement|exception|define|checkpoint|conflict|duplication|trigger", "rationale": "<one short plain-English sentence>"}</script>
 
 <div class="layout">
 
@@ -1930,8 +2579,9 @@ Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single 
       <span class="viewer-title" style="color:#b0b0c8">Select a file</span>
     </div>
     <div class="sel-bar">
-      <div class="mode-toggle m-rule" id="modeToggle" title="Switch between labeling rules and relations">
-        <button id="modeRuleBtn" onclick="setMode('rule')">Rule</button>
+      <div class="mode-toggle m-extract" id="modeToggle" title="Extract spans · Label tags · Relate rules">
+        <button id="modeExtractBtn" onclick="setMode('extract')">Extract</button>
+        <button id="modeLabelBtn" onclick="setMode('label')">Label</button>
         <button id="modeRelBtn" onclick="setMode('relation')">Relation</button>
       </div>
       <span class="sel-info" id="selInfo"></span>
@@ -1975,7 +2625,7 @@ Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single 
 <script>
 // ─── Constants ───────────────────────────────────────────────
 const DEFAULT_EXTRACT  = document.getElementById('defaultJudgePrompt').textContent.trim();
-const DEFAULT_REVISE   = document.getElementById('defaultRevisePrompt').textContent.trim();
+const DEFAULT_LABEL    = document.getElementById('defaultLabelPrompt').textContent.trim();
 const DEFAULT_RELATION = document.getElementById('defaultRelationPrompt').textContent.trim();
 const TAGS = ['PROHIBITION', 'PRESCRIPTION', 'PERMISSION', 'PREFERENCE'];
 // Sub-types of a 'context' node (parallel to a rule's deontic TAGS):
@@ -1992,18 +2642,27 @@ const REL_COLOR = {
 };
 // legacy "support (…)" labels still map to define's colour
 const relColor = t => REL_COLOR[t] || ((t || '').startsWith('support') ? '#5a9e4b' : '#777');
-// LLM-judge passes. Both pull rules AND context in one go (each item self-labels
-// its kind); they differ by provenance/colour and prompt. `source` is what the
-// produced items are stamped with. `needsHuman` gates Revise on human labels.
-const JUDGE_MODES = [
-  { id: 'extract', label: 'Extract', deflt: DEFAULT_EXTRACT, key: 'llm_judge_prompt',
-    source: 'llm', needsHuman: false,
-    blurb: 'Extracts every rule (with a deontic tag) and context span in one pass.' },
-  { id: 'revise',  label: 'Revise',  deflt: DEFAULT_REVISE,  key: 'llm_judge_prompt_revise',
-    source: 'revise', needsHuman: true,
-    blurb: 'Uses your human labels to refine and aggregate a new rule/context set. Keeps your labels.' },
+// The three pipeline stages — each is BOTH the interface mode (S.mode) AND a
+// multi-judge pass. `key` is the per-annotator settings key for its judge config.
+const MODE_DEFS = [
+  { id: 'extract',  label: 'Extract',  deflt: DEFAULT_EXTRACT,  key: 'judge_cfg_extract',
+    blurb: 'Multiple judges identify Rule (green) / Context (yellow) spans. Spans backed by ≥ the threshold are accepted (solid); the rest are candidates (light). You add (red) or extend spans.' },
+  { id: 'label',    label: 'Label',    deflt: DEFAULT_LABEL,    key: 'judge_cfg_label',
+    blurb: 'Multiple judges vote a deontic tag for each accepted rule. The majority wins; the vote ring on each rule shows the split — click it to inspect every judge.' },
+  { id: 'relation', label: 'Relation', deflt: DEFAULT_RELATION, key: 'judge_cfg_relation',
+    blurb: 'Multiple judges propose typed edges between rules. Edges backed by ≥ the threshold are accepted (editable). Your hand-drawn relations are kept.' },
 ];
-const judgeModeDef = id => JUDGE_MODES.find(m => m.id === id) || JUDGE_MODES[0];
+const modeDef = id => MODE_DEFS.find(m => m.id === id) || MODE_DEFS[0];
+// Default judge panel + acceptance threshold for a fresh config (per mode).
+const DEFAULT_JUDGE_MODELS = ['anthropic/claude-opus-4-8', 'openai/gpt-5.5'];
+// Strict-majority default: 2→2, 3→2, 4→3, 5→3 (more than half; for 2 judges both must agree).
+function majorityThreshold(n) { return Math.floor(n / 2) + 1; }
+function defaultJudgeCfg(modeId) {
+  const judges = DEFAULT_JUDGE_MODELS.map(m => ({ model: m }));
+  return { judges, threshold: majorityThreshold(judges.length), prompt: modeDef(modeId).deflt };
+}
+// migrate a legacy stored mode value ('rule' → 'extract') to the new 3-way set
+function normMode(m) { return (m === 'extract' || m === 'label' || m === 'relation') ? m : 'extract'; }
 
 // ─── State ───────────────────────────────────────────────────
 const S = {
@@ -2020,23 +2679,41 @@ const S = {
   fileComment:   '',      // current annotator's saved comment for the open file
   // Rule-list filters:
   //   filterSrc:  'all' | 'hand' | 'llm'  — HIDE filter: shows only that category
-  //   filterType: 'all' | 'rule' | 'rule:<TAG>' | 'context' | 'context:<subtype>'  — FADE filter
-  filterSrc:     (function(){ const v = localStorage.getItem('filterSrc') || 'all';
-                   return ['all','hand','llm'].includes(v) ? v : 'all'; })(),
-  filterType:    (function(){ const v = localStorage.getItem('filterType') || 'all';
-                   const ok = ['all','rule','rule:none','context']
-                     .concat(['PROHIBITION','PRESCRIPTION','PERMISSION','PREFERENCE'].map(t=>'rule:'+t))
-                     .concat(['condition','reference','definition'].map(t=>'context:'+t));
-                   return ok.includes(v) ? v : 'all'; })(),
+  //   filterType: PER-MODE FADE filter. Extract filters by KIND (all/rule/context);
+  //   Label by deontic tag / context sub-type (incl. 'rule:none' = untagged). The two
+  //   are kept separate so a Label-only value (e.g. 'rule:none') never leaks into Extract.
+  //   filterSrc: PER-MODE HIDE filter. Extract = all/you/llm (provenance);
+  //   Label = all/revised (revised = a human changed the LLM's tag).
+  filterSrc:     (function(){
+                   const okBy = { extract: ['all','hand','llm'], label: ['all','revised'] };
+                   const read = m => { const v = localStorage.getItem('filterSrc.'+m) || 'all';
+                                       return okBy[m].includes(v) ? v : 'all'; };
+                   return { extract: read('extract'), label: read('label') };
+                 })(),
+  filterType:    (function(){
+                   const okBy = {
+                     extract: ['all','rule','context'],
+                     label: ['all','rule','rule:none','context']
+                       .concat(['PROHIBITION','PRESCRIPTION','PERMISSION','PREFERENCE'].map(t=>'rule:'+t))
+                       .concat(['condition','reference','definition'].map(t=>'context:'+t)),
+                   };
+                   const read = m => { const v = localStorage.getItem('filterType.'+m) || 'all';
+                                       return okBy[m].includes(v) ? v : 'all'; };
+                   return { extract: read('extract'), label: read('label') };
+                 })(),
   search:        '',        // keyword search over the rule list (fades non-matches)
   editingRuleId: null,      // rule whose text is being re-selected (press E); its span greys out
   editSelection: null,      // the new {start,end,text} picked while editing
   judgeRunning:  false,
-  judgeMode:     'extract',   // which judge pass the modal is editing/running
-  judgePrompts:  { extract: DEFAULT_EXTRACT, revise: DEFAULT_REVISE, relation: DEFAULT_RELATION },
-  judgeModel:    'anthropic/claude-sonnet-4-6',
-  // ── Rule / Relation mode ──
-  mode:          (localStorage.getItem('annotatorMode') === 'relation') ? 'relation' : 'rule',
+  judgeProgress: null,      // {mode, judge_total, judges:[{model,status}]} while a run is polling
+  // Per-mode multi-judge config (judges[], threshold, prompt). Loaded per annotator.
+  judgeCfg:      { extract: defaultJudgeCfg('extract'), label: defaultJudgeCfg('label'), relation: defaultJudgeCfg('relation') },
+  // Latest judge run + votes for the open file, per mode (from /api/judge-data).
+  // Normalised: { run_id, threshold, judge_total, models, votes, candidates?,
+  //               byRule:{id:[votes]}, byEdge:{"s::t":[votes]} }
+  judge:         { extract: null, label: null, relation: null },
+  // ── Pipeline mode: extract | label | relation ──
+  mode:          normMode(localStorage.getItem('annotatorMode')),
   relations:     [],        // edges for the current file (this annotator)
   relSource:     null,      // rule id picked as the edge source (click)
   relTarget:     null,      // rule id picked as the edge target (⌘-click)
@@ -2091,7 +2768,7 @@ function colorForRule(r) {
 // a human edit flips an LLM item to "reviewed" (blue→purple) — without rebuilding the
 // panel, so an open comment textarea isn't disturbed.
 function refreshCardColor(r) {
-  const col = colorForRule(r);
+  const col = listBarColor(r);   // mode-aware: Extract → kind colour, Label → tag colour
   const el = document.getElementById('rl-' + r.id);
   if (el) { el.style.setProperty('--rc-bdr', col.bdr); el.style.setProperty('--rc-bg', col.bg); }
   renderViewer();
@@ -2124,10 +2801,13 @@ function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 // Provenance (human / LLM / reviewed) is conveyed by COLOUR in both the list and the
 // document — it is not a fade-filter. Only the TYPE axis and the keyword search fade.
 function ruleCtxType(r) { return r.context_type || null; }   // condition|example|definition
-// Type axis: 'all' | 'rule' | 'rule:<TAG>' | 'rule:none' | 'context' | 'context:<subtype>'.
-// 'rule:none' = a rule with no deontic tag yet (the uncertain ones to revisit).
+// The active TYPE filter for the CURRENT mode (Relation uses its own relFilter).
+function curFilterType() { return (S.filterType && S.filterType[S.mode]) || 'all'; }
+// Type axis: Extract → 'all'|'rule'|'context' (kind only); Label → also '<TAG>' /
+// 'rule:none' (untagged) / 'context:<subtype>'. Kept per-mode so an untagged/tag
+// filter from Label never fades anything during rule Extraction.
 function matchesType(r, ft) {
-  ft = ft || S.filterType || 'all';
+  ft = ft || curFilterType() || 'all';
   if (ft === 'all') return true;
   const [kind, sub] = ft.split(':');
   if (ruleKind(r) !== kind) return false;
@@ -2146,30 +2826,43 @@ function matchesFilter(r) { return matchesType(r) && matchesSearch(r); }
 // A filter is "active" (i.e. fades non-matches) when the TYPE dropdown is narrowed or a
 // search term is set. Provenance (human/LLM) never fades — it's shown by colour.
 function filterActive() {
-  return (S.filterType && S.filterType !== 'all') || !!(S.search && S.search.trim());
+  return (curFilterType() !== 'all') || !!(S.search && S.search.trim());
 }
-// SOURCE filter (human / LLM) is a HIDE filter — it shows only the chosen category.
-// visibleRules() is what the list AND the document render; the TYPE filter and search
-// then FADE within that set (matchesFilter). Relation mode shows everything (all
-// entities must stay pickable).
+// True when a human changed the tag away from the LLM vote's pick (llm_tag preserved).
+function tagRevised(r) { return !!r.llm_tag && (r.tag || null) !== r.llm_tag; }
+// The active SOURCE filter for the current mode.
+function curFilterSrc() { return (S.filterSrc && S.filterSrc[S.mode]) || 'all'; }
+// SOURCE filter is a HIDE filter — shows only the chosen category. Extract = provenance
+// (you / LLM); Label = 'revised' (human re-tagged). visibleRules() is what the list AND
+// the document render; the TYPE filter + search then FADE within that set. Relation mode
+// shows everything (all entities must stay pickable).
 function matchesSrc(r, src) {
-  src = src || S.filterSrc || 'all';
+  src = src || curFilterSrc();
   if (src === 'all') return true;
-  return src === 'hand' ? r.source === 'hand' : r.source !== 'hand';
+  if (S.mode === 'label') return src === 'revised' ? tagRevised(r) : true;
+  return src === 'hand' ? r.source === 'hand' : r.source !== 'hand';   // extract
+}
+// The KIND a type filter restricts to ('rule' / 'context'), or null for 'all'. A
+// Rule-* filter shows ONLY rules; a Context-* filter shows ONLY context — the other
+// kind is HIDDEN (not just faded). The specific tag / sub-type still FADES within.
+function typeFilterKind() {
+  const ft = curFilterType();
+  return ft === 'all' ? null : ft.split(':')[0];
 }
 function visibleRules() {
   if (S.mode === 'relation') return S.rules;
-  return S.rules.filter(r => matchesSrc(r));
+  const k = typeFilterKind();
+  return S.rules.filter(r => matchesSrc(r) && (!k || ruleKind(r) === k));
 }
 
 function setFilterSrc(v) {
-  if (v === S.filterSrc) return;
-  S.filterSrc = v; localStorage.setItem('filterSrc', v);
+  if (v === curFilterSrc()) return;
+  S.filterSrc[S.mode] = v; localStorage.setItem('filterSrc.' + S.mode, v);   // per-mode
   afterFilterChange();
 }
 function setFilterType(v) {
-  if (v === S.filterType) return;
-  S.filterType = v; localStorage.setItem('filterType', v);
+  if (v === curFilterType()) return;
+  S.filterType[S.mode] = v; localStorage.setItem('filterType.' + S.mode, v);   // per-mode
   afterFilterChange();
 }
 function afterFilterChange() {
@@ -2254,17 +2947,51 @@ function initResizablePanel() {
   });
 }
 
-// Load the judge prompts for the CURRENT annotator: reset to the built-in defaults,
-// then apply any prompts this annotator has saved. (Re-run whenever the annotator
-// changes, since prompts are per-person now.)
+// Load the per-mode judge config for the CURRENT annotator: reset to built-in
+// defaults, then apply any saved config (judge panel + threshold + prompt). The
+// config is stored as one JSON blob per mode under judge_cfg_<mode>. Re-run
+// whenever the annotator changes (config is per-person).
 async function loadJudgeSettings() {
-  S.judgePrompts = { extract: DEFAULT_EXTRACT, revise: DEFAULT_REVISE, relation: DEFAULT_RELATION };
+  S.judgeCfg = { extract: defaultJudgeCfg('extract'), label: defaultJudgeCfg('label'), relation: defaultJudgeCfg('relation') };
   const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
   const settings = await api('/api/settings' + aq);
   if (settings && !settings.error) {
-    for (const m of JUDGE_MODES) if (settings[m.key]) S.judgePrompts[m.id] = settings[m.key];
-    if (settings.llm_relation_prompt) S.judgePrompts.relation = settings.llm_relation_prompt;
-    if (settings.judge_model) S.judgeModel = settings.judge_model;
+    for (const m of MODE_DEFS) {
+      const raw = settings[m.key];
+      if (!raw) continue;
+      try {
+        const cfg = JSON.parse(raw);
+        const judges = Array.isArray(cfg.judges) && cfg.judges.length
+          ? cfg.judges.map(j => ({ model: (typeof j === 'string' ? j : j.model) || 'sonar' }))
+          : S.judgeCfg[m.id].judges;
+        S.judgeCfg[m.id] = {
+          judges,
+          threshold: Math.max(1, Math.min(parseInt(cfg.threshold, 10) || Math.ceil(judges.length / 2), judges.length)),
+          prompt: (typeof cfg.prompt === 'string' && cfg.prompt.trim()) ? cfg.prompt : m.deflt,
+        };
+      } catch (e) { /* leave default */ }
+    }
+  }
+}
+
+// Normalise /api/judge-data into S.judge, indexing votes by rule id and by edge
+// so the vote rings + inspection panel can look them up cheaply.
+function normalizeJudgeData(data) {
+  S.judge = { extract: null, label: null, relation: null };
+  if (!data || data.error) return;
+  for (const mode of ['extract', 'label', 'relation']) {
+    const info = data[mode];
+    if (!info) continue;
+    const byRule = {}, byEdge = {};
+    for (const v of (info.votes || [])) {
+      if (v.rule_id) (byRule[v.rule_id] = byRule[v.rule_id] || []).push(v);
+      if (v.source_id && v.target_id) {
+        const k = v.source_id + '::' + v.target_id;
+        (byEdge[k] = byEdge[k] || []).push(v);
+      }
+    }
+    info.byRule = byRule; info.byEdge = byEdge;
+    S.judge[mode] = info;
   }
 }
 
@@ -2279,6 +3006,28 @@ async function init() {
   document.getElementById('fileCountLabel').textContent = files.length;
   renderFileList(files);
   renderModeToggle();   // reflect the persisted Rule/Relation mode
+  // Click empty space (in the document margins or in the inspector) to de-select the
+  // focused rule. Attached once — #viewerBody / #inspector persist across re-renders.
+  document.getElementById('viewerBody').addEventListener('click', onViewerBodyClick);
+  document.getElementById('inspector').addEventListener('click', onInspectorClick);
+}
+
+// De-select on a click in the viewer that isn't on a highlight and isn't a drag.
+// Empty space INSIDE <pre> is handled by the <pre> click listener; this catches the
+// gutter / area below the text. (Relation mode keeps its own click-to-pick UX.)
+function onViewerBodyClick(e) {
+  if (S.mode === 'relation' || S.editingRuleId) return;
+  if (e.target.closest('.rule-hl')) return;       // highlight click focuses a rule
+  if (e.target.closest('#contentPre')) return;    // empty space in <pre> handled there
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;            // a drag-select isn't a deselect click
+  if (S.focusedRuleId) setFocusedRule(null);
+}
+// De-select on a click in the inspector that isn't on a rule card or a control.
+function onInspectorClick(e) {
+  if (S.mode === 'relation') return;
+  if (e.target.closest('.rl-item, .rl-headbar, input, select, textarea, button')) return;
+  if (S.focusedRuleId) setFocusedRule(null);
 }
 
 // ─── Annotators ──────────────────────────────────────────────
@@ -2297,26 +3046,68 @@ async function loadAnnotators() {
 function renderAnnotatorSelect() {
   const sel = document.getElementById('annotatorSelect');
   if (!sel) return;
-  const opts = S.annotators.map(a =>
+  const names = [...S.annotators];
+  // include the current annotator even if they have no rows in this DB yet
+  if (S.userName && !names.includes(S.userName)) names.unshift(S.userName);
+  const opts = names.map(a =>
     `<option value="${esc(a)}"${a === S.userName ? ' selected' : ''}>${esc(a)}</option>`).join('');
-  sel.innerHTML = opts + `<option value="__new__">＋ New annotator…</option>`;
-  if (!S.annotators.length) sel.value = '__new__';
+  // A disabled placeholder when nobody is selected, so "＋ New annotator…" is ALWAYS a
+  // distinct value — picking it always fires onchange (the old code pre-selected
+  // __new__, so re-picking it did nothing and you couldn't add the first annotator).
+  const placeholder = S.userName ? '' : `<option value="" disabled selected hidden>Select annotator…</option>`;
+  sel.innerHTML = placeholder + opts + `<option value="__new__">＋ New annotator…</option>`;
 }
 
 async function onAnnotatorChange(v) {
-  if (v === '__new__') {
-    const name = (prompt('New annotator name:') || '').trim();
-    if (!name) { renderAnnotatorSelect(); return; }   // cancelled → restore selection
-    await api('/api/annotators', 'POST', { name });
-    S.userName = name;
-    if (!S.annotators.includes(name)) S.annotators.push(name);
-    S.annotators.sort();
-  } else {
-    S.userName = v;
-  }
+  if (v === '__new__') { addAnnotatorPrompt(); return; }   // modal handles the rest
+  S.userName = v;
   localStorage.setItem('annotatorName', S.userName);
   renderAnnotatorSelect();
   await refreshForAnnotator();
+}
+
+// Inline "new annotator" modal (replaces the native prompt(), which can be blocked /
+// not fire). Creates the annotator, switches to it, and reloads their view.
+function addAnnotatorPrompt() {
+  document.getElementById('annotModal')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'annotModal'; modal.className = 'modal-backdrop';
+  modal.innerHTML = `<div class="confirm-card">
+    <div class="confirm-title">New annotator</div>
+    <input id="annotNameInput" class="name-input" autocomplete="off" spellcheck="false"
+      placeholder="Annotator name" style="width:100%;padding:8px 10px;margin:12px 0;font-size:14px;border:1px solid #c7c7e0;border-radius:8px">
+    <div class="confirm-actions">
+      <button class="confirm-cancel">Cancel</button>
+      <button class="confirm-ok">Add</button>
+    </div></div>`;
+  document.body.appendChild(modal);
+  const inp = modal.querySelector('#annotNameInput'); inp.focus();
+  const close = (restore) => {
+    modal.remove();
+    document.removeEventListener('keydown', onKey, true);
+    if (restore) renderAnnotatorSelect();   // put the <select> back to a valid value
+  };
+  const submit = async () => {
+    const name = inp.value.trim();
+    if (!name) { inp.focus(); return; }
+    close(false);
+    const res = await api('/api/annotators', 'POST', { name });
+    if (res && res.error) { renderAnnotatorSelect(); return; }
+    S.userName = name;
+    if (!S.annotators.includes(name)) S.annotators.push(name);
+    S.annotators.sort();
+    localStorage.setItem('annotatorName', name);
+    renderAnnotatorSelect();
+    await refreshForAnnotator();
+  };
+  const onKey = e => {
+    if (e.key === 'Escape') { e.stopPropagation(); close(true); }
+    else if (e.key === 'Enter') { e.stopPropagation(); e.preventDefault(); submit(); }
+  };
+  document.addEventListener('keydown', onKey, true);
+  modal.addEventListener('mousedown', e => { if (e.target === modal) close(true); });
+  modal.querySelector('.confirm-cancel').onclick = () => close(true);
+  modal.querySelector('.confirm-ok').onclick = submit;
 }
 
 // Reload the file list (counts) and the current file's rules for the active annotator.
@@ -2380,12 +3171,14 @@ function filterFiles(q) {
 async function selectFile(id) {
   if (S.judgeRunning) return;   // locked while a judge run is in flight
   const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
-  const [file, rules, relations] = await Promise.all([
+  const [file, rules, relations, jdata] = await Promise.all([
     api(`/api/file/${id}`), api(`/api/rules/${id}${aq}`), api(`/api/relations/${id}${aq}`),
+    api(`/api/judge-data/${id}${aq}`),
   ]);
   if (file.error) return;
   S.currentFile = file; S.rules = rules; sortRules();
   S.relations = Array.isArray(relations) ? relations : [];
+  normalizeJudgeData(jdata);
   S.relSource = S.relTarget = S.focusedRelId = null;
   S.selection = null; S.focusedRuleId = null; S.toolMode = false; S.inspectorOpen = false; S.search = '';
   S.editingRuleId = null; S.editSelection = null;
@@ -2482,7 +3275,10 @@ function renderViewer() {
     // While editing a rule's text, a plain click (no drag = "unselect") aborts the edit.
     if (S.editingRuleId) { cancelRuleEdit(); return; }
     if (span) focusSpan(span);
-    else clearSelection();                 // clicking empty space clears a pending selection
+    else {                                 // clicking empty space clears a pending
+      clearSelection();                    // selection AND de-selects the focused rule
+      if (S.focusedRuleId) setFocusedRule(null);
+    }
   });
   pre.addEventListener('mouseover', e => {
     const el = e.target.closest?.('.rule-hl');
@@ -2552,13 +3348,38 @@ function locateSpans(content, rt) {
   return merged;
 }
 
-// letter-based highlighting: segment text on every rule boundary
+// Extract-mode palette: by kind (rule green / context yellow), plus red for human
+// spans. solid = accepted (≥ threshold); light = candidate; act = focused; hov = hover.
+const EXTRACT_COL = {
+  // `light` = candidate (sub-threshold) spans — kept faint (~2/3 of the prior alpha)
+  // so accepted (solid) spans clearly stand out.
+  rule:    { solid: 'rgba(34,197,94,.30)',  light: 'rgba(34,197,94,.087)', act: 'rgba(34,197,94,.52)',  hov: 'rgba(34,197,94,.42)'  },
+  context: { solid: 'rgba(234,179,8,.34)',  light: 'rgba(234,179,8,.10)',  act: 'rgba(234,179,8,.56)',  hov: 'rgba(234,179,8,.46)'  },
+  hand:    { solid: 'rgba(239,68,68,.30)',  light: 'rgba(239,68,68,.10)',  act: 'rgba(239,68,68,.54)',  hov: 'rgba(239,68,68,.44)'  },
+};
+function extractColForRule(r) {
+  if (r.source === 'hand') return EXTRACT_COL.hand;
+  return EXTRACT_COL[ruleKind(r)] || EXTRACT_COL.rule;
+}
+// Left-edge bar colour for a rule-list card: Extract → kind (green/yellow/red),
+// Label → deontic tag / context type.
+function listBarColor(r) {
+  if (S.mode === 'extract') { const c = extractColForRule(r); return { bdr: c.act, bg: c.light }; }
+  const c = typeColorForRule(r);
+  return { bdr: c.act, bg: c.bg };
+}
+
+// letter-based highlighting: segment text on every rule boundary, styled per mode.
 function renderContent(content, rules) {
   const ivs = [];
   for (const r of rules) {
-    for (const [a, b] of getRuleSpans(r)) {
-      if (b > a) ivs.push({ a, b, r, col: colorForRule(r) });
-    }
+    for (const [a, b] of getRuleSpans(r)) if (b > a) ivs.push({ a, b, r });
+  }
+  // Extract: sub-threshold judge clusters render as light, non-clickable candidates.
+  const cands = (S.mode === 'extract' && S.judge.extract) ? (S.judge.extract.candidates || []) : [];
+  for (const c of cands) {
+    if (c.char_start != null && c.char_end != null && c.char_end > c.char_start)
+      ivs.push({ a: c.char_start, b: c.char_end, cand: c });
   }
   if (!ivs.length) return escHtml(content);
   const pts = new Set([0, content.length]);
@@ -2571,36 +3392,51 @@ function renderContent(content, rules) {
     const seg = content.slice(p, q);
     const cover = ivs.filter(iv => iv.a <= p && iv.b >= q);
     if (!cover.length) { html += escHtml(seg); continue; }
-    const rids = cover.map(c => c.r.id);
-    const title = escAttr(cover.map(c => extractorOf(c.r) + ': ' + c.r.rule_text.slice(0, 60)).join(' | '));
-    if (S.mode === 'relation') {
-      // Relation mode: colour each highlight by ENTITY TYPE (deontic tag / context),
-      // heavily faded, so the hue hints what you're linking; the current pair's
-      // source/target show the full colour plus an underline marking direction.
-      const [hs, ht] = relHlPair();
-      const cs = hs && rids.includes(hs), ct = ht && rids.includes(ht);
-      const full = blendBgs(cover.map(c => typeColorForRule(c.r).act));
-      const bg = (cs || ct) ? full : fadeRgba(blendBgs(cover.map(c => typeColorForRule(c.r).bg)), 0.6);
-      const uline = (cs && ct) ? ' hl-both' : cs ? ' hl-src' : ct ? ' hl-tgt' : '';
-      html += `<span class="rule-hl rel-hl${uline}" data-rids="${rids.join(',')}"`
-        + ` data-bg="${bg}" data-hov="${bg}" data-act="${bg}"`
-        + ` style="background:${bg}" title="${title}">${escHtml(seg)}</span>`;
+    const ruleCover = cover.filter(c => c.r);
+    const candCover = cover.filter(c => c.cand);
+
+    // ── A real rule covers this segment: solid + clickable ──
+    if (ruleCover.length) {
+      const rids = ruleCover.map(c => c.r.id);
+      const title = escAttr(ruleCover.map(c => extractorOf(c.r) + ': ' + c.r.rule_text.slice(0, 60)).join(' | '));
+      if (S.mode === 'relation') {
+        const [hs, ht] = relHlPair();
+        const cs = hs && rids.includes(hs), ct = ht && rids.includes(ht);
+        const full = blendBgs(ruleCover.map(c => typeColorForRule(c.r).act));
+        const bg = (cs || ct) ? full : fadeRgba(blendBgs(ruleCover.map(c => typeColorForRule(c.r).bg)), 0.6);
+        const uline = (cs && ct) ? ' hl-both' : cs ? ' hl-src' : ct ? ' hl-tgt' : '';
+        html += `<span class="rule-hl rel-hl${uline}" data-rids="${rids.join(',')}"`
+          + ` data-bg="${bg}" data-hov="${bg}" data-act="${bg}" style="background:${bg}" title="${title}">${escHtml(seg)}</span>`;
+        continue;
+      }
+      let bg, hov, act;
+      if (S.mode === 'extract') {         // colour by kind (green/yellow) or red for human
+        bg  = blendBgs(ruleCover.map(c => extractColForRule(c.r).solid));
+        hov = blendBgs(ruleCover.map(c => extractColForRule(c.r).hov));
+        act = blendBgs(ruleCover.map(c => extractColForRule(c.r).act));
+      } else {                            // label: colour by tag/context — LIGHT until selected
+        bg  = blendBgs(ruleCover.map(c => fadeRgba(typeColorForRule(c.r).bg, 0.5)));  // not selected → light
+        hov = blendBgs(ruleCover.map(c => typeColorForRule(c.r).bg));                 // medium on hover
+        act = blendBgs(ruleCover.map(c => typeColorForRule(c.r).act));               // selected → full
+      }
+      const focused = rids.includes(S.focusedRuleId);
+      const editing = S.editingRuleId && rids.includes(S.editingRuleId);
+      const dim = filterActive() && !ruleCover.some(c => matchesFilter(c.r));
+      const rest = editing ? 'rgba(150,150,170,0.28)' : (dim ? fadeRgba(bg, 0.3) : bg);
+      html += `<span class="rule-hl${focused && !editing ? ' focused' : ''}" data-rids="${rids.join(',')}"`
+        + ` data-bg="${rest}" data-hov="${editing || dim ? rest : hov}" data-act="${editing ? rest : act}"`
+        + ` style="background:${focused && !editing ? act : rest}" title="${title}">${escHtml(seg)}</span>`;
       continue;
     }
-    const bg = blendBgs(cover.map(c => c.col.bg));
-    const hov = blendBgs(cover.map(c => c.col.hov));
-    const act = blendBgs(cover.map(c => c.col.act));
-    const focused = rids.includes(S.focusedRuleId);
-    // The rule being re-selected (press E) greys out so you can drag a new span for it.
-    const editing = S.editingRuleId && rids.includes(S.editingRuleId);
-    // Fade a highlight when NONE of the rules under it match the filter. A faded span
-    // does NOT brighten on hover (data-hov = its faint bg) so the filtered view stays
-    // clear; matching spans still brighten on hover as usual.
-    const dim = filterActive() && !cover.some(c => matchesFilter(c.r));
-    const rest = editing ? 'rgba(150,150,170,0.28)' : (dim ? fadeRgba(bg, 0.3) : bg);
-    html += `<span class="rule-hl${focused && !editing ? ' focused' : ''}" data-rids="${rids.join(',')}"`
-      + ` data-bg="${rest}" data-hov="${editing || dim ? rest : hov}" data-act="${editing ? rest : act}"`
-      + ` style="background:${focused && !editing ? act : rest}" title="${title}">${escHtml(seg)}</span>`;
+    // ── Only candidate spans here (Extract): light, not clickable ──
+    if (candCover.length) {
+      const kind = candCover[0].cand.kind === 'context' ? 'context' : 'rule';
+      const nj = Math.max(...candCover.map(c => c.cand.vote_count || 1));
+      const title = escAttr(`candidate ${kind} · ${nj} judge${nj === 1 ? '' : 's'} (below threshold)`);
+      html += `<span class="cand-hl" style="background:${EXTRACT_COL[kind].light}" title="${title}">${escHtml(seg)}</span>`;
+      continue;
+    }
+    html += escHtml(seg);
   }
   return html;
 }
@@ -2610,7 +3446,7 @@ function renderContent(content, rules) {
 // of a line) still registers. Relation mode never adds rules; collapsed clicks are
 // handled by the <pre> click listener.
 function onViewerMouseUp() {
-  if (S.mode === 'relation' || !S.currentFile) return;
+  if (S.mode !== 'extract' || !S.currentFile) return;   // spans are created in Extract only
   const pre = document.getElementById('contentPre');
   if (!pre) return;
   const sel = window.getSelection();
@@ -2774,23 +3610,41 @@ function renderRightPanel() {
   else renderRuleList();
 }
 
-// ─── Rule / Relation mode ────────────────────────────────────
+// ─── Extract / Label / Relation mode ─────────────────────────
+// Per-mode document highlight legend.
+const MODE_LEGEND = {
+  extract: `<span class="tl-label">Extract:</span>
+    <span class="tl-item"><i style="background:#22c55e"></i>Rule</span>
+    <span class="tl-item"><i style="background:#eab308"></i>Context</span>
+    <span class="tl-item"><i style="background:#ef4444"></i>You</span>
+    <span class="tl-item" style="opacity:.6"><i style="background:#9aa6b2"></i>candidate (light)</span>`,
+  label: `<span class="tl-label">Colours:</span>
+    <span class="tl-item"><i style="background:#cf4436"></i>Prohibition</span>
+    <span class="tl-item"><i style="background:#2f6cdf"></i>Prescription</span>
+    <span class="tl-item"><i style="background:#1c9b54"></i>Permission</span>
+    <span class="tl-item"><i style="background:#8a4fd0"></i>Preference</span>
+    <span class="tl-item"><i style="background:#6b7196"></i>Context</span>`,
+  relation: `<span class="tl-label">Colours:</span>
+    <span class="tl-item"><i style="background:#cf4436"></i>Prohibition</span>
+    <span class="tl-item"><i style="background:#2f6cdf"></i>Prescription</span>
+    <span class="tl-item"><i style="background:#1c9b54"></i>Permission</span>
+    <span class="tl-item"><i style="background:#8a4fd0"></i>Preference</span>
+    <span class="tl-item"><i style="background:#6b7196"></i>Context</span>`,
+};
 function renderModeToggle() {
   const t = document.getElementById('modeToggle');
   if (t) t.className = 'mode-toggle m-' + S.mode;
-  // Rules can't be added in relation mode — hide the + Add button there.
+  // + Add (select text → new span) only makes sense in Extract — that's where
+  // rules are created. Label tags them; Relation links them.
   const add = document.getElementById('addBtn');
-  if (add) add.style.display = S.mode === 'relation' ? 'none' : '';
-  // The type-colour legend shows only in relation mode.
+  if (add) add.style.display = S.mode === 'extract' ? '' : 'none';
+  // Per-mode colour legend strip.
   const leg = document.getElementById('typeLegend');
-  if (leg) leg.style.display = S.mode === 'relation' ? 'flex' : 'none';
-  // Bottom-right shortcut bar reflects the active mode (+ focus state in rule mode).
+  if (leg) { leg.innerHTML = MODE_LEGEND[S.mode] || ''; leg.style.display = 'flex'; }
   renderKbBar();
 }
 
-// The shortcut hint bar. In rule mode, when a still-untagged RULE is focused, surface
-// the a/s/d/f tag shortcuts (they're only active in exactly that state — 'd' otherwise
-// deletes). Re-rendered on focus / tag changes.
+// The shortcut hint bar — reflects the active mode + focus state.
 function renderKbBar() {
   const kb = document.getElementById('kbBar');
   if (!kb) return;
@@ -2804,17 +3658,21 @@ function renderKbBar() {
   }
   const r = S.focusedRuleId && S.rules.find(x => x.id === S.focusedRuleId);
   const segs = [];
-  segs.push(r && ruleKind(r) === 'rule'        // a/s/d/f switch tags whenever a rule is focused
-    ? `<span><kbd>a</kbd><kbd>s</kbd><kbd>d</kbd><kbd>f</kbd> tag</span>`
-    : `<span><kbd>⌘↵</kbd> add</span>`);
-  if (r) segs.push(`<span><kbd>e</kbd> edit text</span>`);   // re-select to redefine the rule's text
+  if (S.mode === 'label') {                    // Label: a/s/d/f set the deontic tag
+    segs.push(r && ruleKind(r) === 'rule'
+      ? `<span><kbd>a</kbd><kbd>s</kbd><kbd>d</kbd><kbd>f</kbd> tag</span>`
+      : `<span>pick a rule to tag</span>`);
+  } else {                                     // Extract: select text → add a span
+    segs.push(`<span><kbd>⌘↵</kbd> add span</span>`);
+    if (r) segs.push(`<span><kbd>e</kbd> edit/extend</span>`);
+  }
   segs.push(`<span><kbd>j</kbd><kbd>k</kbd> nav</span>`);
-  if (r) segs.push(`<span><kbd>⌫</kbd> del</span>`);   // delete the focused item
+  if (r) segs.push(`<span><kbd>⌫</kbd> del</span>`);
   segs.push(`<span><kbd>Esc</kbd> clear</span>`);
   kb.innerHTML = segs.join('');
 }
 function setMode(m) {
-  if (m === S.mode || (m !== 'rule' && m !== 'relation')) return;
+  if (m === S.mode || !['extract', 'label', 'relation'].includes(m)) return;
   S.mode = m;
   localStorage.setItem('annotatorMode', m);
   S.relSource = S.relTarget = S.focusedRelId = null;   // drop any in-progress/focused edge
@@ -3088,9 +3946,11 @@ function renderRelationList() {
     return `<div class="rel-item${focused ? ' active' : ''}" id="rel-${rel.id}" onclick="focusRelation('${rel.id}')">
       <div class="rel-row1">
         <span class="rel-type" style="color:${c}">${esc(eff || '—')}</span>
+        ${relRingHTML(rel)}
         ${overridden ? `<span class="rel-over" title="You changed the LLM label from ${esc(rel.llm_relation_type)}">✎ edited</span>` : ''}
         ${rel.notes ? '<span class="rl-flag" title="Has comment">✎</span>' : ''}
         ${llm ? '<span class="rel-llm">llm</span>' : ''}
+        ${rel.vote_count != null ? `<span class="rl-ring-cnt">${rel.vote_count}/${rel.judge_total}</span>` : ''}
         <span class="rel-caret">${focused ? '▾' : '▸'}</span>
       </div>
       <div class="rel-pair"><span class="rel-node" style="color:${typeBadgeColor(ruleById(rel.source_id))}">${esc(ruleShort(rel.source_id, 38))}</span>
@@ -3118,26 +3978,31 @@ function renderRuleList() {
     return;
   }
   if (!S.rules.length) {
-    el.innerHTML = `<div class="insp-empty">No rules yet.<br><br>Select text in the document and press <b>+ Add</b>, or open <b>LLM judge</b> and press <b>Run</b> to extract &amp; tag every rule.</div>`;
+    const hint = S.mode === 'label'
+      ? `No rules to label yet.<br><br>Switch to <b>Extract</b> to identify rules first, then open <b>LLM judge</b> here to vote tags.`
+      : `No rules yet.<br><br>Open <b>LLM judge</b> and press <b>Run</b> to let the judges extract rules, or select text and press <b>+ Add</b> to mark one yourself.`;
+    el.innerHTML = `<div class="insp-empty">${hint}</div>`;
     return;
   }
   const vis = visibleRules();          // source-filtered (the source filter hides; type/search fade within)
   const active = filterActive();
   const matchN = active ? vis.filter(matchesFilter).length : vis.length;
+  const noun = S.mode === 'label' ? 'rule' : 'item';
   const head = `<div class="rl-headbar">
     <div class="rl-head-top">
-      <div class="rl-head">${vis.length} rule${vis.length === 1 ? '' : 's'}${active ? ` · ${matchN} match` : ''}</div>
+      <div class="rl-head">${vis.length} ${noun}${vis.length === 1 ? '' : 's'}${active ? ` · ${matchN} match` : ''}</div>
       <input type="search" class="rl-search" id="ruleSearch" placeholder="Search keyword…"
         value="${escAttr(S.search || '')}" oninput="liveSearch(this.value)" autocomplete="off" spellcheck="false">
     </div>
     ${filterBarHTML()}
   </div>`;
   const items = vis.map((r) => {
-    const col = colorForRule(r);
+    const col = listBarColor(r);
     const expanded = r.id === S.focusedRuleId;
     const faded = active && !matchesFilter(r);
     const tag = badgeHTML(r);
     const flags = [
+      (S.mode === 'label' && tagRevised(r)) ? `<span class="rl-flag rl-flag-rev" title="You re-tagged this (LLM picked ${esc(r.llm_tag)})">↺</span>` : '',
       r.llm_rationale ? '<span class="rl-flag" title="Has LLM rationale">⚖</span>' : '',
       r.notes ? '<span class="rl-flag" title="Has comment">✎</span>' : '',
     ].join('');
@@ -3169,25 +4034,36 @@ function filterBarHTML() {
   const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
   const cntSrc  = src => S.rules.filter(r => matchesType(r) && matchesSrc(r, src)).length;
   const cntType = ft  => S.rules.filter(r => matchesType(r, ft) && matchesSrc(r)).length;
-  const selS = v => S.filterSrc  === v ? ' selected' : '';
-  const selT = v => S.filterType === v ? ' selected' : '';
+  const selS = v => curFilterSrc() === v ? ' selected' : '';
+  const selT = v => curFilterType() === v ? ' selected' : '';
   const optS = (v, label) => `<option value="${v}"${selS(v)}>${label} (${cntSrc(v)})</option>`;
   const optT = (v, label) => `<option value="${v}"${selT(v)}>${label} (${cntType(v)})</option>`;
-  const src = `<select class="rl-filter-select" title="Show only this category (human / LLM)" onchange="setFilterSrc(this.value)">
-    ${optS('all', 'All')}${optS('hand', 'Human')}${optS('llm', 'LLM')}
-  </select>`;
-  const type = `<select class="rl-filter-select" title="Filter by rule / context type — fades non-matches" onchange="setFilterType(this.value)">
-    ${optT('all', 'All types')}
-    <optgroup label="Rule">
-      ${optT('rule', 'Rule · All')}
-      ${TAGS.map(t => optT('rule:' + t, cap(t.toLowerCase()))).join('')}
-      ${optT('rule:none', 'Untagged')}
-    </optgroup>
-    <optgroup label="Context">
-      ${optT('context', 'Context · All')}
-      ${CONTEXT_TYPES.map(t => optT('context:' + t, cap(t))).join('')}
-    </optgroup>
-  </select>`;
+  // Extract = provenance (you / LLM). Label = show only rules a human re-tagged.
+  const src = (S.mode === 'label')
+    ? `<select class="rl-filter-select" title="Show only rules you re-tagged (the LLM's pick is kept)" onchange="setFilterSrc(this.value)">
+        ${optS('all', 'All')}${optS('revised', 'Revised')}
+      </select>`
+    : `<select class="rl-filter-select" title="Show only this category (you / LLM)" onchange="setFilterSrc(this.value)">
+        ${optS('all', 'All')}${optS('hand', 'You')}${optS('llm', 'LLM')}
+      </select>`;
+  // Extract = filter by KIND (Rule/Context, the green/yellow axis). Label = by
+  // deontic tag (+ Untagged) and context sub-type.
+  const type = (S.mode === 'extract')
+    ? `<select class="rl-filter-select" title="Filter by kind — fades non-matches" onchange="setFilterType(this.value)">
+        ${optT('all', 'All kinds')}${optT('rule', 'Rule')}${optT('context', 'Context')}
+      </select>`
+    : `<select class="rl-filter-select" title="Filter by tag / context type — fades non-matches" onchange="setFilterType(this.value)">
+        ${optT('all', 'All types')}
+        <optgroup label="Rule">
+          ${optT('rule', 'Rule · All')}
+          ${TAGS.map(t => optT('rule:' + t, cap(t.toLowerCase()))).join('')}
+          ${optT('rule:none', 'Untagged')}
+        </optgroup>
+        <optgroup label="Context">
+          ${optT('context', 'Context · All')}
+          ${CONTEXT_TYPES.map(t => optT('context:' + t, cap(t))).join('')}
+        </optgroup>
+      </select>`;
   return `<div class="rl-filter-row">${src}${type}</div>`;
 }
 
@@ -3210,26 +4086,41 @@ function posLabel(r) {
 
 // Expanded detail rendered inline inside the focused rule's accordion card.
 function ruleDetailHTML(r) {
-  return `<div class="rl-detail">
-    <div class="kind-toggle k-${ruleKind(r)}">
+  // Extract mode = decide the SPAN's kind (Rule/Context). Label mode = assign the
+  // deontic tag (or context sub-type) and inspect the judge votes.
+  const kindToggle = (S.mode === 'extract') ? `<div class="kind-toggle k-${ruleKind(r)}">
       <button class="${ruleKind(r) === 'context' ? 'active' : ''}" onclick="setKind('context')">Context</button>
       <button class="${ruleKind(r) === 'rule' ? 'active' : ''}" onclick="setKind('rule')">Rule</button>
-    </div>
-
-    <div id="tagSection">${tagSectionHTML(r)}</div>
-
-    ${r.source === 'hand' ? '' : `<div class="insp-label">LLM Rationale</div>
-    <textarea class="insp-rationale" id="inspRationale" readonly placeholder="Run the LLM judge (top bar) to populate this…">${esc(r.llm_rationale || '')}</textarea>`}
-
+    </div>` : '';
+  const tagSec = (S.mode === 'label') ? `<div id="tagSection">${tagSectionHTML(r)}</div>` : '';
+  const ring = (S.mode === 'label') ? voteInspectRow(r) : '';
+  const ratio = (r.source === 'hand') ? '' : `<div class="insp-label">LLM Rationale</div>
+    <textarea class="insp-rationale" id="inspRationale" readonly placeholder="Run the LLM judge (top bar) to populate this…">${esc(r.llm_rationale || '')}</textarea>`;
+  return `<div class="rl-detail">
+    ${kindToggle}
+    ${tagSec}
+    ${ring}
+    ${ratio}
     <div class="insp-label">Comment</div>
     <textarea class="insp-comment" id="inspComment" placeholder="Your comment… (Enter to save · Shift+Enter for newline)"
       oninput="autoGrow(this)" onblur="saveComment()" onkeydown="commentKey(event)">${esc(r.notes || '')}</textarea>
 
     <div class="insp-actions">
       <span class="insp-status" id="inspStatus"></span>
-      <button class="insp-del" onclick="deleteFocusedRule()">Delete rule</button>
+      <button class="insp-del" onclick="deleteFocusedRule()">Delete ${ruleKind(r) === 'context' ? 'context' : 'rule'}</button>
     </div>
   </div>`;
+}
+// A "judge votes: 2/3 PRESCRIPTION — inspect" row in the Label detail panel.
+function voteInspectRow(r) {
+  const info = S.judge.label;
+  const votes = info && info.byRule ? info.byRule[r.id] : null;
+  if (!votes || !votes.length) return '';
+  const ring = voteRingHTML(votes, 'label',
+    `event.stopPropagation();openVoteInspector('label','${r.id}')`, 'inspect all judges');
+  return `<div class="insp-label">Judge votes</div>
+    <div class="rl-ring-wrap" style="cursor:pointer" onclick="openVoteInspector('label','${r.id}')">
+      ${ring}<span class="rl-ring-cnt">${votes.length} judges · click to inspect</span></div>`;
 }
 
 // Type picker: deontic tag for 'rule' items, sub-type for 'context' items.
@@ -3243,7 +4134,28 @@ function tagSectionHTML(r) {
   const tagBtns = TAGS.map(t =>
     `<button class="tag-btn${r.tag === t ? ' active ' + t.toLowerCase() : ''}" onclick="setTag('${t}')">${t}</button>`
   ).join('');
-  return `<div class="insp-label">Tag</div><div class="tag-row">${tagBtns}</div>`;
+  // Show the LLM vote's pick so a human override is visible and revertable (its choice
+  // is preserved in llm_tag). Re-rendered in place by refreshTagSection on every change.
+  let contrast = '';
+  if (r.llm_tag) {
+    contrast = tagRevised(r)
+      ? `<div class="tag-contrast revised">LLM picked <b style="color:${TYPE_BADGE[r.llm_tag] || '#888'}">${esc(r.llm_tag)}</b> — you changed it
+           <button class="tag-revert" onclick="revertTagToLLM()" title="Restore the LLM's tag">↺ revert</button></div>`
+      : `<div class="tag-contrast">LLM picked <b style="color:${TYPE_BADGE[r.llm_tag] || '#888'}">${esc(r.llm_tag)}</b> — kept</div>`;
+  }
+  return `<div class="insp-label">Tag</div><div class="tag-row">${tagBtns}</div>${contrast}`;
+}
+// Restore the LLM vote's tag on the focused rule (clears the "revised" state).
+async function revertTagToLLM() {
+  const r = ruleById(S.focusedRuleId);
+  if (!r || !r.llm_tag || r.tag === r.llm_tag) return;
+  r.tag = r.llm_tag;
+  refreshTagSection(r);     // updates buttons + contrast + header badge in place
+  refreshCardColor(r);
+  renderKbBar();
+  await api(`/api/rules/${r.id}`, 'PATCH', { tag: r.tag });
+  // 'Revised' filter membership may have changed — keep the list count honest.
+  if (curFilterSrc() === 'revised') renderRuleList();
 }
 
 async function setKind(k) {
@@ -3274,24 +4186,106 @@ function setInspStatus(msg, cls = '') {
   if (el) { el.textContent = msg; el.className = 'insp-status' + (cls ? ' ' + cls : ''); }
 }
 
-// Header badge: the context sub-type (or plain CONTEXT) for context items,
-// else the rule's deontic tag.
-function badgeHTML(r) {
+// Solid colour for a vote value, per mode (Label = deontic tag; Relation = edge type).
+function voteColor(mode, val) {
+  if (mode === 'relation') return relColor(val);
+  return TYPE_BADGE[val] || '#b8b8c4';   // label: tag colour; null/abstain → grey
+}
+// Conic-gradient agreement ring from a list of votes. `onclick` opens the inspector.
+function voteRingHTML(votes, mode, onclick, title) {
+  if (!votes || !votes.length) return '';
+  const n = votes.length, seg = 100 / n;
+  const stops = votes.map((v, i) =>
+    `${voteColor(mode, v.value)} ${(i * seg).toFixed(2)}% ${((i + 1) * seg).toFixed(2)}%`).join(', ');
+  return `<span class="vote-ring" title="${escAttr(title || '')}" onclick="${onclick}"`
+    + ` style="background:conic-gradient(${stops})"></span>`;
+}
+// Centered modal: every judge's vote + short rationale for one rule (Label) or edge (Relation).
+function openVoteInspector(mode, key) {
+  const info = S.judge[mode];
+  if (!info) return;
+  let votes, quote;
+  if (mode === 'relation') {
+    votes = (info.byEdge || {})[key] || [];
+    const [s, t] = key.split('::');
+    quote = `${ruleShort(s, 56)}  →  ${ruleShort(t, 56)}`;
+  } else {
+    votes = (info.byRule || {})[key] || [];
+    const r = ruleById(key); quote = r ? r.rule_text : '';
+  }
+  const tally = {};
+  for (const v of votes) { const k = v.value || '—'; tally[k] = (tally[k] || 0) + 1; }
+  const total = votes.length || 1;
+  const chips = Object.entries(tally).sort((a, b) => b[1] - a[1]).map(([val, n]) =>
+    `<span class="vi-chip" style="background:${voteColor(mode, val === '—' ? null : val)}">`
+    + `${esc(val)} ${n}/${votes.length} · ${Math.round(100 * n / total)}%</span>`).join('');
+  const rows = votes.map(v => `<tr>
+    <td class="vi-model">${esc((v.model || '').split('/').pop())}</td>
+    <td class="vi-vote" style="color:${voteColor(mode, v.value)}">${esc(v.value || '—')}</td>
+    <td class="vi-rat">${esc(v.rationale || '')}</td></tr>`).join('');
+  document.getElementById('voteInspector')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'voteInspector'; modal.className = 'modal-backdrop';
+  modal.addEventListener('mousedown', e => { if (e.target === modal) modal.remove(); });
+  modal.innerHTML = `<div class="modal-card vi-card">
+    <div class="modal-head"><span class="tool-title">Judge votes · ${esc(mode)}</span>
+      <span style="font-size:11px;color:#9090b0;margin-left:6px">${info.judge_total} judges · accept ≥ ${info.threshold}</span>
+      <div style="flex:1"></div>
+      <button class="insp-exit" onclick="document.getElementById('voteInspector').remove()" title="Close (Esc)">✕</button></div>
+    <div class="modal-body" style="overflow:auto;display:block">
+      <div class="vi-quote">${esc(quote)}</div>
+      <div class="vi-tally">${chips || '<span style="color:#aaa;font-size:12px">no votes recorded</span>'}</div>
+      <table class="vi-table"><thead><tr><th>Judge</th><th>Vote</th><th>Rationale</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    </div></div>`;
+  document.body.appendChild(modal);
+}
+
+// Header badge: Extract → the span's kind (RULE/CONTEXT). Label → deontic tag /
+// context sub-type, plus the vote ring (click to inspect).
+function kindBadge(r) {
+  const k = ruleKind(r);
+  return `<span class="rl-kind ${k}">${k.toUpperCase()}</span>`;
+}
+function tagBadgeOnly(r) {
   if (ruleKind(r) === 'context')
     return `<span class="rl-tag context">${r.context_type ? r.context_type.toUpperCase() : 'CONTEXT'}</span>`;
-  return r.tag ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}</span>` : '';
+  return r.tag ? `<span class="rl-tag ${r.tag.toLowerCase()}">${r.tag}</span>`
+              : `<span class="rl-tag" style="background:#eceef2;color:#8a8aa6">UNTAGGED</span>`;
+}
+function labelRingHTML(r) {
+  const info = S.judge.label;
+  const votes = info && info.byRule ? info.byRule[r.id] : null;
+  if (!votes || !votes.length) return '';
+  const ring = voteRingHTML(votes, 'label',
+    `event.stopPropagation();openVoteInspector('label','${r.id}')`,
+    votes.length + ' judge votes — click to inspect');
+  return `<span class="rl-ring-wrap">${ring}</span>`;
+}
+function relRingHTML(rel) {
+  const info = S.judge.relation;
+  const key = rel.source_id + '::' + rel.target_id;
+  const votes = info && info.byEdge ? info.byEdge[key] : null;
+  if (!votes || !votes.length) return '';
+  return voteRingHTML(votes, 'relation',
+    `event.stopPropagation();openVoteInspector('relation','${key}')`,
+    votes.length + ' judge votes — click to inspect');
+}
+function badgeHTML(r) {
+  if (S.mode === 'extract') return kindBadge(r);
+  return tagBadgeOnly(r) + labelRingHTML(r);
 }
 
 function refreshTagSection(r) {
   const el = document.getElementById('tagSection');
   if (el) el.innerHTML = tagSectionHTML(r);
-  // keep the collapsed-header badge in sync (in place — preserves textareas)
+  // keep the collapsed-header tag badge in sync (in place — preserves textareas + ring)
   const top = document.getElementById('rl-' + r.id)?.querySelector('.rl-top');
   if (top) {
-    const html = badgeHTML(r);
+    const html = tagBadgeOnly(r);
     const old = top.querySelector('.rl-tag');
     if (old) old.outerHTML = html;
-    else if (html) top.insertAdjacentHTML('afterbegin', html);
+    else top.insertAdjacentHTML('afterbegin', html);
   }
 }
 
@@ -3313,9 +4307,12 @@ async function setTag(t, toggle = true) {
   const patch = { tag: newTag };
   const flipped = markReviewed(r);          // editing an LLM tag = human review
   if (flipped) patch.reviewed = true;
-  refreshTagSection(r);                     // update buttons only — don't rebuild the panel
+  refreshTagSection(r);                     // update buttons + LLM contrast in place
   if (flipped) refreshCardColor(r);         // blue → purple in place
   renderKbBar();                            // tag set/cleared → refresh the a/s/d/f hint
+  // The "Revised" filter membership can change with the tag — re-render the list so a
+  // rule appears/disappears from the filtered view (and the count stays honest).
+  if (curFilterSrc() === 'revised') renderRuleList();
   await api(`/api/rules/${r.id}`, 'PATCH', patch);
 }
 
@@ -3396,7 +4393,41 @@ function toggleTool() {
   renderJudgeModal();
 }
 
-// The LLM judge is a centered pop-up modal over a dimmed backdrop.
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// The loading screen: one progress bar PER judge so you can watch them run in
+// parallel and finish independently (indeterminate while running → solid on done).
+function judgeProgressHTML() {
+  const p = S.judgeProgress;
+  if (!p) return `<div class="spinner"></div><div class="judge-loading-text">Starting judges…</div>`;
+  const doneN = p.judges.filter(j => j.status !== 'running').length;
+  // All judges returned → the server is now clustering votes + recording the accepted
+  // results. Tell the user so the finished bars don't look stuck.
+  const aggregating = doneN === p.judge_total;
+  const noun = p.mode === 'relation' ? 'relations' : (p.mode === 'label' ? 'tags' : 'rules');
+  const rows = p.judges.map((j, i) => `
+    <div class="jp-item">
+      <span class="jp-name">Judge ${i + 1} · ${esc((j.model || '').split('/').pop())}</span>
+      <div class="jp-bar jp-${j.status}"><div class="jp-fill"></div></div>
+    </div>`).join('');
+  const head = aggregating
+    ? `Judges done — aggregating votes & recording accepted ${noun}…`
+    : `Running ${p.judge_total} judge${p.judge_total === 1 ? '' : 's'} in parallel · ${esc(modeDef(p.mode).label)} — ${doneN}/${p.judge_total} done`;
+  const aggRow = aggregating
+    ? `<div class="jp-item jp-agg"><span class="jp-name">Aggregating accepted ${noun}…</span>
+         <div class="jp-bar jp-running"><div class="jp-fill"></div></div></div>`
+    : '';
+  return `<div class="judge-loading-text">${head}</div>
+    <div class="jp-list">${rows}${aggRow}</div>`;
+}
+// Update the loading bars in place (no full modal rebuild → no flicker).
+function renderJudgeProgress() {
+  const el = document.getElementById('judgeLoading');
+  if (el) el.innerHTML = judgeProgressHTML();
+}
+
+// The LLM judge is a centered pop-up modal: a panel of judges (one model each), an
+// acceptance threshold, and the prompt — for the CURRENT pipeline stage (S.mode).
 function renderJudgeModal() {
   let modal = document.getElementById('judgeModal');
   if (!S.toolMode) { if (modal) modal.remove(); return; }
@@ -3404,60 +4435,33 @@ function renderJudgeModal() {
     modal = document.createElement('div');
     modal.id = 'judgeModal';
     modal.className = 'modal-backdrop';
-    // click on the dimmed backdrop (outside the card) closes it
     modal.addEventListener('mousedown', e => { if (e.target === modal && !S.judgeRunning) toggleTool(); });
     document.body.appendChild(modal);
   }
-  // While the judge is running, lock the modal: clear it and show a spinner only.
   if (S.judgeRunning) {
-    modal.innerHTML = `
-      <div class="modal-card">
-        <div class="judge-loading">
-          <div class="spinner"></div>
-          <div class="judge-loading-text">Running LLM judge over the whole document…</div>
-        </div>
-      </div>`;
+    modal.innerHTML = `<div class="modal-card"><div class="judge-loading" id="judgeLoading">${judgeProgressHTML()}</div></div>`;
     return;
   }
-  // ── Relation mode: the judge proposes typed edges between existing entities ──
+  const md = modeDef(S.mode);
+  const cfg = S.judgeCfg[S.mode];
+  const N = cfg.judges.length;
+  const judgeRows = cfg.judges.map((j, i) => `
+    <div class="judge-item">
+      <span class="jn">Judge ${i + 1}</span>
+      <select onchange="setJudgeModel(${i}, this.value)">${MODEL_OPTIONS}</select>
+      ${N > 1 ? `<button class="judge-del" title="Remove judge" onclick="removeJudge(${i})">✕</button>` : ''}
+    </div>`).join('');
+  // Stage gating.
+  const rules = S.rules.filter(r => (r.kind || 'rule') === 'rule');
+  const untaggedN = rules.filter(r => !r.tag).length;
+  let gate = '', disabled = false;
+  if (S.mode === 'label' && rules.length < 1) { gate = 'No rules to label yet — run Extract first.'; disabled = true; }
   if (S.mode === 'relation') {
-    const n = S.rules.length;
-    modal.innerHTML = `
-      <div class="modal-card">
-        <div class="modal-head">
-          <span class="tool-title">LLM judge · Relations</span>
-          <div style="flex:1"></div>
-          <button class="insp-exit" onclick="toggleTool()" title="Back to document (Esc)">✕</button>
-        </div>
-        <div class="modal-body">
-          <div class="tool-row">
-            <span class="lbl">Model</span>
-            <select class="tool-model" id="judgeModelSel">${MODEL_OPTIONS}</select>
-          </div>
-          <textarea class="tool-prompt" id="judgePromptArea">${esc(S.judgePrompts.relation || '')}</textarea>
-        </div>
-        <div class="modal-foot">
-          <span class="tool-status" id="judgeToolStatus">Proposes typed relations between this file's ${n} rule/context entit${n === 1 ? 'y' : 'ies'}. The LLM's label is editable — your change overrides it. Replaces previous LLM relations; keeps yours. Needs ≥ 2 entities.</span>
-          <button class="btn ghost" onclick="restoreDefaultPrompt()" title="Reset this prompt to the built-in default">↺ Restore default</button>
-          <button class="btn primary" id="judgeRunBtn" onclick="runJudge()"${n < 2 ? ' disabled' : ''}>▶ Extract relations</button>
-        </div>
-      </div>`;
-    document.getElementById('judgeModelSel').value = S.judgeModel;
-    document.getElementById('judgeModelSel').onchange = e => { S.judgeModel = e.target.value; };
-    document.getElementById('judgePromptArea').oninput = e => { S.judgePrompts.relation = e.target.value; };
-    return;
+    if (S.rules.length < 2) { gate = 'Need ≥ 2 rules/context to relate — run Extract first.'; disabled = true; }
+    else if (untaggedN > 0) { gate = `Tag every rule in Label first — ${untaggedN} still untagged. Relations are built from context + tagged rules.`; disabled = true; }
   }
-  // Revise is only available once this annotator has hand labels in the file.
-  const hasHuman = S.rules.some(r => r.source === 'hand');
-  if (judgeModeDef(S.judgeMode).needsHuman && !hasHuman) S.judgeMode = 'extract';
-  const md = judgeModeDef(S.judgeMode);
-  const tabs = JUDGE_MODES.map(m => {
-    const off = m.needsHuman && !hasHuman;
-    return `<button class="jm-tab${m.id === S.judgeMode ? ' active' : ''}${off ? ' disabled' : ''}"`
-      + (off ? ' title="Add human labels in this file to enable Revise"' : '')
-      + ` onclick="setJudgeMode('${m.id}')">${m.label}</button>`;
-  }).join('');
-  const runLabel = md.id === 'revise' ? '▶ Revise' : '▶ Run extraction';
+  const tabs = MODE_DEFS.map(m =>
+    `<button class="jm-tab${m.id === S.mode ? ' active' : ''}" onclick="judgeSwitchMode('${m.id}')">${m.label}</button>`).join('');
   modal.innerHTML = `
     <div class="modal-card">
       <div class="modal-head">
@@ -3467,36 +4471,55 @@ function renderJudgeModal() {
         <button class="insp-exit" onclick="toggleTool()" title="Back to document (Esc)">✕</button>
       </div>
       <div class="modal-body">
-        <div class="tool-row">
-          <span class="lbl">Model</span>
-          <select class="tool-model" id="judgeModelSel">${MODEL_OPTIONS}</select>
+        <div class="judge-cfg">
+          <div class="judge-cfg-row"><span class="lbl">Judges</span><span class="tool-status" style="flex:1">Each judge votes independently; ${md.label} is decided by their agreement.</span></div>
+          <div class="judge-list">${judgeRows}</div>
+          <button class="judge-add" onclick="addJudge()"${N >= 7 ? ' disabled' : ''}>+ Add judge</button>
+          <div class="thr-row">
+            <span class="lbl">Accept ≥</span>
+            <input type="range" min="1" max="${N}" value="${cfg.threshold}" oninput="setThreshold(this.value)">
+            <span class="thr-val" id="thrVal">${cfg.threshold} / ${N} judges <small>(${Math.round(100 * cfg.threshold / N)}%)</small></span>
+          </div>
         </div>
-        <textarea class="tool-prompt" id="judgePromptArea">${esc(S.judgePrompts[S.judgeMode] || '')}</textarea>
+        <textarea class="tool-prompt" id="judgePromptArea" oninput="S.judgeCfg['${S.mode}'].prompt=this.value">${esc(cfg.prompt || '')}</textarea>
       </div>
       <div class="modal-foot">
-        <span class="tool-status" id="judgeToolStatus">${md.blurb} Your edits are saved (per annotator) when you run.</span>
+        <span class="tool-status${disabled ? ' error' : ''}" id="judgeToolStatus">${gate || md.blurb}</span>
         <button class="btn ghost" onclick="restoreDefaultPrompt()" title="Reset this prompt to the built-in default">↺ Restore default</button>
-        <button class="btn primary" id="judgeRunBtn" onclick="runJudge()">${runLabel}</button>
+        <button class="btn primary" id="judgeRunBtn" onclick="runJudge()"${disabled ? ' disabled' : ''}>▶ Run ${md.label} · ${N} judge${N === 1 ? '' : 's'}</button>
       </div>
     </div>`;
-  document.getElementById('judgeModelSel').value = S.judgeModel;
-  document.getElementById('judgeModelSel').onchange = e => { S.judgeModel = e.target.value; };
-  document.getElementById('judgePromptArea').oninput = e => { S.judgePrompts[S.judgeMode] = e.target.value; };
+  // restore each judge's selected model
+  modal.querySelectorAll('.judge-item select').forEach((sel, i) => { if (cfg.judges[i]) sel.value = cfg.judges[i].model; });
 }
 
-// Switch which extraction the modal edits/runs. Stash the current textarea first
-// so an in-progress edit isn't lost when flipping tabs.
-function setJudgeMode(mode) {
-  if (mode === S.judgeMode || !JUDGE_MODES.some(m => m.id === mode)) return;
-  const def = judgeModeDef(mode);
-  if (def.needsHuman && !S.rules.some(r => r.source === 'hand')) {
-    setToolStatus('judgeToolStatus', 'Revise needs human labels in this file first.', 'error');
-    return;
-  }
+// Switch pipeline stage from inside the modal (also flips the interface mode).
+function judgeSwitchMode(m) {
+  if (m === S.mode) return;
   const area = document.getElementById('judgePromptArea');
-  if (area) S.judgePrompts[S.judgeMode] = area.value;
-  S.judgeMode = mode;
+  if (area) S.judgeCfg[S.mode].prompt = area.value;   // stash in-progress edit
+  setMode(m);
   renderJudgeModal();
+}
+function setJudgeModel(i, v) { const c = S.judgeCfg[S.mode]; if (c.judges[i]) c.judges[i].model = v; }
+function addJudge() {
+  const c = S.judgeCfg[S.mode];
+  if (c.judges.length >= 7) return;
+  c.judges.push({ model: DEFAULT_JUDGE_MODELS[c.judges.length % DEFAULT_JUDGE_MODELS.length] || 'sonar' });
+  renderJudgeModal();
+}
+function removeJudge(i) {
+  const c = S.judgeCfg[S.mode];
+  if (c.judges.length <= 1) return;
+  c.judges.splice(i, 1);
+  if (c.threshold > c.judges.length) c.threshold = c.judges.length;
+  renderJudgeModal();
+}
+function setThreshold(v) {
+  const c = S.judgeCfg[S.mode];
+  c.threshold = Math.max(1, Math.min(parseInt(v, 10) || 1, c.judges.length));
+  const el = document.getElementById('thrVal');
+  if (el) el.innerHTML = `${c.threshold} / ${c.judges.length} judges <small>(${Math.round(100 * c.threshold / c.judges.length)}%)</small>`;
 }
 
 function setToolStatus(id, msg, cls = '') {
@@ -3581,95 +4604,91 @@ function updateCommentBtn() {
 // attached here so every caller persists under the right person.
 async function persistSettings(obj) { await api('/api/settings', 'POST', { ...obj, annotator: S.userName || '' }); }
 
-// "Restore default": drop this annotator's saved prompt for the active mode so it
-// reverts to the built-in default (and tracks future default changes).
+// "Restore default": reset the current stage's prompt to the built-in default and
+// drop this annotator's saved config override.
 async function restoreDefaultPrompt() {
-  const aq = '?annotator=' + encodeURIComponent(S.userName || '');
-  if (S.mode === 'relation') {
-    S.judgePrompts.relation = DEFAULT_RELATION;
-    await api('/api/settings/llm_relation_prompt' + aq, 'DELETE');
-  } else {
-    const md = judgeModeDef(S.judgeMode);
-    S.judgePrompts[S.judgeMode] = md.deflt;
-    await api('/api/settings/' + md.key + aq, 'DELETE');
-  }
-  renderJudgeModal();   // rebuilds the textarea from S.judgePrompts (now the default)
+  const md = modeDef(S.mode);
+  S.judgeCfg[S.mode].prompt = md.deflt;
+  await api('/api/settings/' + md.key + '?annotator=' + encodeURIComponent(S.userName || ''), 'DELETE');
+  renderJudgeModal();
   setToolStatus('judgeToolStatus', 'Restored the default prompt for this annotator.', 'ok');
 }
 
-// The single unified LLM-judge run: extract + tag + rationale over the whole
-// document. Locks the panel behind a spinner, then releases back to the panel.
+// Run the multi-judge pass for the current stage. Kicks off a background job and
+// polls its progress so the loading screen shows each judge finishing in parallel,
+// then reloads rules / relations / votes.
 async function runJudge() {
   if (!S.currentFile || S.judgeRunning) return;
-  if (S.mode === 'relation') return runJudgeRelations();
-  const mode = S.judgeMode;
-  const md = judgeModeDef(mode);
+  const mode = S.mode;
+  const cfg = S.judgeCfg[mode];
   const area = document.getElementById('judgePromptArea');
-  if (area) S.judgePrompts[mode] = area.value;
-  const prompt = (S.judgePrompts[mode] || '').trim();
+  if (area) cfg.prompt = area.value;
+  const prompt = (cfg.prompt || '').trim();
   if (!prompt) { setToolStatus('judgeToolStatus', 'Enter a prompt', 'error'); return; }
 
   S.judgeRunning = true;
-  renderJudgeModal();   // clear modal → spinner (user is locked in)
-  await persistSettings({ [md.key]: S.judgePrompts[mode], judge_model: S.judgeModel });
+  S.judgeProgress = { mode, judge_total: cfg.judges.length,
+                      judges: cfg.judges.map(j => ({ model: j.model, status: 'running' })) };
+  renderJudgeModal();   // → per-judge progress bars
+  // Persist this stage's whole config (judges + threshold + prompt) per annotator.
+  await persistSettings({ [modeDef(mode).key]: JSON.stringify({ threshold: cfg.threshold, judges: cfg.judges, prompt: cfg.prompt }) });
 
-  const res = await api('/api/llm', 'POST', {
-    file_id: S.currentFile.id, prompt, model: S.judgeModel, source: md.source, replace_llm: true,
-    annotator: S.userName || 'unknown',
+  const started = await api('/api/judge', 'POST', {
+    file_id: S.currentFile.id, mode, prompt, threshold: cfg.threshold,
+    judges: cfg.judges, annotator: S.userName || 'unknown',
   });
-  if (!res.error) {
-    const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
-    const fresh = await api(`/api/rules/${S.currentFile.id}${aq}`);
-    if (Array.isArray(fresh)) { S.rules = fresh; sortRules(); }
-    S.focusedRuleId = null; S.inspectorOpen = false;
-  }
-
-  S.judgeRunning = false;
-  if (res.error) {
-    // keep the modal open so the error stays visible
-    renderJudgeModal();
-    setToolStatus('judgeToolStatus', res.error, 'error');
+  if (started.error || !started.run_id) {
+    S.judgeRunning = false; S.judgeProgress = null;
+    renderJudgeModal(); setToolStatus('judgeToolStatus', started.error || 'Failed to start', 'error');
     return;
   }
-  // success → auto-close the modal and show the freshly-tagged document
-  S.toolMode = false;
-  document.getElementById('judgeBtn').classList.remove('active');
-  renderJudgeModal();    // toolMode is false → removes the modal
-  renderViewer();        // refresh the document highlights
-  renderRightPanel();
-  refreshFileBadge(S.currentFile.id);
-}
 
-// LLM judge in relation mode: propose typed edges between existing entities.
-async function runJudgeRelations() {
-  const area = document.getElementById('judgePromptArea');
-  if (area) S.judgePrompts.relation = area.value;
-  const prompt = (S.judgePrompts.relation || '').trim();
-  if (!prompt) { setToolStatus('judgeToolStatus', 'Enter a prompt', 'error'); return; }
-  if (S.rules.length < 2) { setToolStatus('judgeToolStatus', 'Need at least 2 rules/context in this file.', 'error'); return; }
-
-  S.judgeRunning = true;
-  renderJudgeModal();   // spinner
-  await persistSettings({ llm_relation_prompt: S.judgePrompts.relation, judge_model: S.judgeModel });
-
-  const res = await api('/api/llm-relations', 'POST', {
-    file_id: S.currentFile.id, prompt, model: S.judgeModel, replace_llm: true,
-    annotator: S.userName || 'unknown',
-  });
-  if (!res.error) {
-    const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
-    const fresh = await api(`/api/relations/${S.currentFile.id}${aq}`);
-    if (Array.isArray(fresh)) S.relations = fresh;
-    S.focusedRelId = S.relSource = S.relTarget = null;
+  // Poll per-judge progress until the job finishes.
+  let prog = null;
+  for (let i = 0; i < 900; i++) {            // ~10 min ceiling at 700ms
+    await sleep(700);
+    prog = await api('/api/judge-progress/' + started.run_id);
+    if (prog && prog.missing) break;         // job expired/lost
+    if (prog && Array.isArray(prog.judges)) {
+      S.judgeProgress.judges = prog.judges;
+      renderJudgeProgress();
+    }
+    if (prog && prog.done) break;
   }
 
-  S.judgeRunning = false;
-  if (res.error) { renderJudgeModal(); setToolStatus('judgeToolStatus', res.error, 'error'); return; }
-  S.toolMode = false;
-  document.getElementById('judgeBtn').classList.remove('active');
-  renderJudgeModal();
+  S.judgeRunning = false; S.judgeProgress = null;
+
+  // Reload latest data REGARDLESS of how the poll ended — a timed-out or lost-contact
+  // job may still have committed, and a transient blip on the final poll must not be
+  // mistaken for failure (the server sets `error` only together with `done`).
+  const res = (prog && prog.result) || {};
+  const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
+  const [rules, relations, jdata] = await Promise.all([
+    api(`/api/rules/${S.currentFile.id}${aq}`),
+    api(`/api/relations/${S.currentFile.id}${aq}`),
+    api(`/api/judge-data/${S.currentFile.id}${aq}`),
+  ]);
+  if (Array.isArray(rules)) { S.rules = rules; sortRules(); }
+  if (Array.isArray(relations)) S.relations = relations;
+  normalizeJudgeData(jdata);
+  S.focusedRuleId = null; S.focusedRelId = S.relSource = S.relTarget = null;
   renderViewer();
   renderRightPanel();
+  refreshFileBadge(S.currentFile.id);
+
+  const cleanDone = prog && prog.done && !prog.error;
+  if (cleanDone) {
+    S.toolMode = false;
+    document.getElementById('judgeBtn').classList.remove('active');
+    renderJudgeModal();
+    if (res.errors && res.errors.length) console.warn('judge errors:', res.errors);
+  } else {
+    renderJudgeModal();   // keep the modal open and explain what happened
+    const msg = (prog && prog.done && prog.error) ? prog.error
+              : (prog && prog.missing) ? 'Lost contact with the run — reloaded the latest results; verify before re-running.'
+              : 'Run is taking longer than expected — reloaded the latest results; verify before re-running.';
+    setToolStatus('judgeToolStatus', msg, 'error');
+  }
 }
 
 // ─── Keyboard ────────────────────────────────────────────────
@@ -3684,6 +4703,7 @@ document.addEventListener('keydown', e => {
     e.preventDefault(); toggleComment(); return;
   }
   if (e.key === 'Escape' && document.getElementById('exportMenu')) { closeExportMenu(); return; }
+  if (e.key === 'Escape' && document.getElementById('voteInspector')) { document.getElementById('voteInspector').remove(); return; }
   if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
     if (inText) return;
     if (S.mode === 'relation') {
@@ -3731,16 +4751,15 @@ document.addEventListener('keydown', e => {
     if (e.key === 'Escape') { e.preventDefault(); cancelRuleEdit(); }
     return;
   }
-  // E starts "edit text" mode for the focused rule — its highlight greys out and the
-  // next drag-select redefines its text/position.
-  if (S.focusedRuleId && !e.metaKey && !e.ctrlKey && !e.altKey && e.key === 'e') {
+  // E starts "edit text" mode (Extract only) — the focused span greys out and the
+  // next drag-select redefines/extends its text.
+  if (S.mode === 'extract' && S.focusedRuleId && !e.metaKey && !e.ctrlKey && !e.altKey && e.key === 'e') {
     e.preventDefault(); startRuleEdit(); return;
   }
-  // a/s/d/f SET the deontic tag (in on-screen order: PROHIBITION/PRESCRIPTION/
-  // PERMISSION/PREFERENCE) whenever a RULE is focused — so you can switch tags freely.
-  // (Set, not toggle: re-pressing the current tag's key keeps it.) Delete moved to ⌫.
+  // a/s/d/f SET the deontic tag (PROHIBITION/PRESCRIPTION/PERMISSION/PREFERENCE)
+  // whenever a RULE is focused in LABEL mode. (Set, not toggle.) Delete = ⌫.
   const TAG_KEYS = { a: 0, s: 1, d: 2, f: 3 };
-  if (S.focusedRuleId && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key in TAG_KEYS)) {
+  if (S.mode === 'label' && S.focusedRuleId && !e.metaKey && !e.ctrlKey && !e.altKey && (e.key in TAG_KEYS)) {
     const fr = S.rules.find(x => x.id === S.focusedRuleId);
     if (fr && ruleKind(fr) === 'rule') {
       e.preventDefault();
