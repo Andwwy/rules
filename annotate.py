@@ -219,6 +219,41 @@ def _ensure_schema(con):
             PRIMARY KEY (run_id, judge_idx)
         )
     """)
+    # ── Shared extraction batches + per-user label layer ─────────────────────
+    # A BATCH is one Extract/Revise run, SHARED across all users and kept forever (the
+    # run history). Its rules (source 'llm'/'revise', owner NULL) are the shared
+    # extraction. LABELS/RELATIONS are PER-USER, scoped to (batch, annotator): tags live
+    # in `rule_labels`; relations carry batch_id + annotator. Hand-adds / span edits are
+    # per-user rows (`owner` set) tied to a batch. This SUPERSEDES the rules_archive /
+    # relations_archive "rounds" model, which is now write-frozen (kept only to preserve
+    # any rows already archived).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS batches (
+            batch_id VARCHAR PRIMARY KEY, file_id VARCHAR NOT NULL,
+            mode VARCHAR, creator VARCHAR,
+            threshold INTEGER, judge_total INTEGER, models TEXT, prompt TEXT,
+            created_at TIMESTAMP DEFAULT now()
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS rule_labels (
+            batch_id VARCHAR NOT NULL, rule_id VARCHAR NOT NULL, annotator VARCHAR NOT NULL,
+            tag VARCHAR, base_tag VARCHAR, llm_tag VARCHAR, reviewed BOOLEAN,
+            context_type VARCHAR, notes VARCHAR, updated_at TIMESTAMP DEFAULT now(),
+            PRIMARY KEY (batch_id, rule_id, annotator)
+        )
+    """)
+    # batch_id links each rule to its shared extraction batch (STABLE — never overwritten
+    # by Label, unlike the legacy llm_run_id). owner = the annotator who owns a per-user
+    # hand-add / fork row (NULL = shared LLM/revise span). The per-user columns on
+    # extracted_rules (tag/base_tag/llm_tag/reviewed/context_type/notes) are now IGNORED
+    # for shared rows — `rule_labels` is authoritative.
+    for col in ("batch_id VARCHAR", "owner VARCHAR"):
+        try: con.execute(f"ALTER TABLE extracted_rules ADD COLUMN {col}")
+        except Exception: pass
+    for tbl in ("relations", "judge_runs", "judge_votes"):
+        try: con.execute(f"ALTER TABLE {tbl} ADD COLUMN batch_id VARCHAR")
+        except Exception: pass
 
 def _md_connect(target):
     # On Render, point DuckDB's extension/home dir at the writable /tmp so the
@@ -301,30 +336,26 @@ def api_files():
     ).fetchall()
     annotator = (request.args.get("annotator") or "").strip()
     con = annot_con()
-    if annotator:
-        raw = con.execute(
-            "SELECT file_id, source, COUNT(*) FROM extracted_rules WHERE annotator=? GROUP BY 1,2",
-            [annotator]
-        ).fetchall()
-    else:
-        raw = con.execute(
-            "SELECT file_id, source, COUNT(*) FROM extracted_rules GROUP BY 1,2"
-        ).fetchall()
+    # Badges are computed over each file's LATEST batch: llm_count = shared spans, hand_count =
+    # this annotator's own rows, revised = the latest batch came from a Revise run. batch_count =
+    # how many shared batches the file has (the history depth).
+    lb = {r[0]: {"mode": r[1], "llm": r[2], "hand": r[3]} for r in con.execute(
+        "WITH lb AS (SELECT file_id, batch_id, mode FROM (SELECT file_id, batch_id, mode,"
+        "   row_number() OVER (PARTITION BY file_id ORDER BY created_at DESC) rn FROM batches) WHERE rn=1)"
+        " SELECT lb.file_id, lb.mode,"
+        "   (SELECT count(*) FROM extracted_rules er WHERE er.batch_id=lb.batch_id AND er.owner IS NULL),"
+        "   (SELECT count(*) FROM extracted_rules er WHERE er.batch_id=lb.batch_id AND er.owner=?)"
+        " FROM lb", [annotator or ""]).fetchall()}
+    bcount = {r[0]: r[1] for r in con.execute(
+        "SELECT file_id, count(*) FROM batches GROUP BY 1").fetchall()}
     con.close()
-    counts = {}
-    for fid, src, n in raw:
-        counts.setdefault(fid, {})[src] = n
-    # "machine" = everything the judge produced — extract ('llm') AND revise — so the
-    # count badge survives a revise pass (which swaps 'llm' rows for 'revise' rows).
-    def _machine(d):
-        return sum(n for s, n in d.items() if s != "hand")
     return jsonify([{
         "id": r[0], "source_url": r[1], "repo_name": r[2],
         "file_type": r[3], "content_len": r[4], "source": r[5],
-        "hand_count": counts.get(r[0], {}).get("hand", 0),
-        "llm_count":  _machine(counts.get(r[0], {})),
-        # revised == a 'revise' pass has been run (badge turns green vs. blue for extract-only)
-        "revised":    "revise" in counts.get(r[0], {}),
+        "hand_count": lb.get(r[0], {}).get("hand", 0),
+        "llm_count":  lb.get(r[0], {}).get("llm", 0),
+        "revised":    lb.get(r[0], {}).get("mode") == "revise",
+        "batch_count": bcount.get(r[0], 0),
     } for r in rows])
 
 @app.route("/api/file/<fid>")
@@ -430,24 +461,115 @@ def api_all_rules():
         "source": r[5], "extracted_by": r[6], "notes": r[7], "created_at": str(r[8]),
     } for r in rows])
 
+def _latest_batch(con, fid):
+    r = con.execute("SELECT batch_id FROM batches WHERE file_id=? ORDER BY created_at DESC LIMIT 1",
+                    [fid]).fetchone()
+    return r[0] if r else None
+
+@app.route("/api/batches/<fid>")
+def api_batches(fid):
+    """All SHARED extraction batches for a file (the run history), newest first."""
+    con = annot_con()
+    rows = con.execute(
+        "SELECT b.batch_id, b.mode, b.models, b.threshold, b.judge_total, b.creator, b.created_at,"
+        " (SELECT count(*) FROM extracted_rules r WHERE r.batch_id=b.batch_id AND r.owner IS NULL) AS rule_count"
+        " FROM batches b WHERE b.file_id=? ORDER BY b.created_at DESC", [fid]).fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        try: models = json.loads(r[2]) if r[2] else []
+        except Exception: models = []
+        out.append({"batch_id": r[0], "mode": r[1], "models": models, "threshold": r[3],
+                    "judge_total": r[4], "creator": r[5], "created_at": str(r[6]), "rule_count": r[7]})
+    return jsonify(out)
+
+def _accepted_spans(con, fid, batch_id, threshold, content):
+    """Re-aggregate a batch's STORED extract/revise judge votes into accepted spans at `threshold`
+    (≥ that many distinct judges) — a pure recompute from judge_votes, NO LLM. Cluster ids are
+    stable (threshold-independent), so per-user labels keyed by rule_id still attach."""
+    vrows = con.execute(
+        "SELECT judge_idx, char_start, char_end, kind FROM judge_votes"
+        " WHERE batch_id IS NOT DISTINCT FROM ? AND mode IN ('extract','revise')"
+        "   AND char_start IS NOT NULL AND char_end IS NOT NULL", [batch_id]).fetchall()
+    spans = [{"judge_idx": r[0], "char_start": r[1], "char_end": r[2], "kind": r[3]} for r in vrows]
+    out = []
+    for grp in _cluster_spans(spans):
+        nj = len({s["judge_idx"] for s in grp})
+        if nj < threshold: continue
+        cs, ce = _median([s["char_start"] for s in grp]), _median([s["char_end"] for s in grp])
+        rt = content[cs:ce].strip()
+        if not rt: continue
+        kinds = [s["kind"] for s in grp]
+        kind = "context" if kinds.count("context") > kinds.count("rule") else "rule"
+        out.append({"id": make_id(fid, batch_id, cs, ce), "cs": cs, "ce": ce, "kind": kind, "rule_text": rt,
+                    "ls": content[:cs].count("\n") + 1, "le": content[:ce].count("\n") + 1, "vote_count": nj})
+    return out
+
 @app.route("/api/rules/<fid>")
 def api_rules(fid):
+    # Shared extraction spans of the chosen batch (owner NULL) + this user's own hand/fork rows,
+    # with the user's PER-USER label fields (tag/base_tag/llm_tag/reviewed/context_type/notes)
+    # overlaid from rule_labels. batch defaults to the file's latest batch. An optional `threshold`
+    # re-aggregates the SHARED extraction from stored votes at that K (per-user VIEW; no LLM).
     annotator = (request.args.get("annotator") or "").strip()
+    batch = (request.args.get("batch") or "").strip() or None
+    thr_raw = request.args.get("threshold")
     con = annot_con()
-    sql = """
-        SELECT id, rule_text, char_start, char_end, line_start, line_end,
-               source, llm_run_id, notes, extracted_by, created_at,
-               tag, power_type, llm_rationale, annotator, kind, context_type,
-               reviewed, accepted, vote_count, judge_total, llm_tag, extract_edited,
-               llm_kind, llm_char_start, llm_char_end, base_tag
-        FROM extracted_rules WHERE file_id=?
-    """
-    params = [fid]
-    if annotator:
-        sql += " AND annotator=?"
-        params.append(annotator)
-    sql += " ORDER BY COALESCE(line_start, 999999), COALESCE(char_start, 999999), created_at"
-    rows = con.execute(sql, params).fetchall()
+    if batch is None:
+        batch = _latest_batch(con, fid)
+    try: thr = int(thr_raw) if thr_raw not in (None, "") else None
+    except Exception: thr = None
+    if thr is not None and batch:
+        crow = sample_con().execute("SELECT content FROM sample WHERE id=?", [fid]).fetchone()
+        content = (crow[0] if crow else "") or ""
+        jt = (con.execute("SELECT judge_total FROM batches WHERE batch_id=?", [batch]).fetchone() or [None])[0]
+        lab = {r[0]: r for r in con.execute(
+            "SELECT rule_id, tag, base_tag, llm_tag, reviewed, context_type, notes FROM rule_labels"
+            " WHERE batch_id IS NOT DISTINCT FROM ? AND annotator IS NOT DISTINCT FROM ?",
+            [batch, annotator or ""]).fetchall()}
+        out = []
+        for s in _accepted_spans(con, fid, batch, thr, content):
+            l = lab.get(s["id"])
+            out.append({
+                "id": s["id"], "rule_text": s["rule_text"], "char_start": s["cs"], "char_end": s["ce"],
+                "line_start": s["ls"], "line_end": s["le"], "source": "llm", "llm_run_id": batch,
+                "notes": (l[6] if l else None), "extracted_by": "judge", "created_at": "",
+                "tag": (l[1] if l else None), "power_type": None, "llm_rationale": None,
+                "annotator": annotator, "kind": s["kind"], "context_type": (l[5] if l else None),
+                "reviewed": bool(l[4]) if l else False, "accepted": True,
+                "vote_count": s["vote_count"], "judge_total": jt, "llm_tag": (l[3] if l else None),
+                "extract_edited": False, "llm_kind": s["kind"], "llm_char_start": s["cs"], "llm_char_end": s["ce"],
+                "base_tag": (l[2] if l else None),
+            })
+        hrows = con.execute("""
+            SELECT er.id, er.rule_text, er.char_start, er.char_end, er.line_start, er.line_end,
+                   er.source, er.llm_run_id, rl.notes, er.extracted_by, er.created_at,
+                   rl.tag, er.power_type, er.llm_rationale, er.annotator, er.kind, rl.context_type,
+                   rl.reviewed, er.accepted, er.vote_count, er.judge_total, rl.llm_tag, er.extract_edited,
+                   er.llm_kind, er.llm_char_start, er.llm_char_end, rl.base_tag
+            FROM extracted_rules er
+            LEFT JOIN rule_labels rl ON rl.batch_id IS NOT DISTINCT FROM er.batch_id
+                 AND rl.rule_id = er.id AND rl.annotator IS NOT DISTINCT FROM ?
+            WHERE er.file_id=? AND er.batch_id IS NOT DISTINCT FROM ? AND er.owner IS NOT DISTINCT FROM ?
+        """, [annotator or "", fid, batch, annotator or None]).fetchall()
+        out += [_rule_row(r) for r in hrows]
+        con.close()
+        out.sort(key=lambda r: (r["line_start"] if r["line_start"] is not None else 999999,
+                                r["char_start"] if r["char_start"] is not None else 999999))
+        return jsonify(out)
+    rows = con.execute("""
+        SELECT er.id, er.rule_text, er.char_start, er.char_end, er.line_start, er.line_end,
+               er.source, er.llm_run_id, rl.notes, er.extracted_by, er.created_at,
+               rl.tag, er.power_type, er.llm_rationale, er.annotator, er.kind, rl.context_type,
+               rl.reviewed, er.accepted, er.vote_count, er.judge_total, rl.llm_tag, er.extract_edited,
+               er.llm_kind, er.llm_char_start, er.llm_char_end, rl.base_tag
+        FROM extracted_rules er
+        LEFT JOIN rule_labels rl ON rl.batch_id IS NOT DISTINCT FROM er.batch_id
+             AND rl.rule_id = er.id AND rl.annotator IS NOT DISTINCT FROM ?
+        WHERE er.file_id=? AND er.batch_id IS NOT DISTINCT FROM ?
+             AND (er.owner IS NULL OR er.owner IS NOT DISTINCT FROM ?)
+        ORDER BY COALESCE(er.line_start, 999999), COALESCE(er.char_start, 999999), er.created_at
+    """, [annotator or "", fid, batch, annotator or None]).fetchall()
     con.close()
     return jsonify([_rule_row(r) for r in rows])
 
@@ -459,23 +581,28 @@ def save_rule():
     if not fid or not rule_text:
         return jsonify({"error": "file_id and rule_text required"}), 400
     annotator = (b.get("annotator") or b.get("extracted_by") or "unknown").strip()
-    # Include the selection's char position so the SAME text selected at a DIFFERENT
-    # spot is a DISTINCT rule (duplicates are independent). Same text + same position
-    # still dedupes (it's literally the same selection).
-    rid = make_id(fid, "hand", annotator, rule_text, b.get("char_start"), b.get("char_end"))
+    con = annot_con()
+    batch = (b.get("batch_id") or "").strip() or _latest_batch(con, fid)
+    # A hand-add is a PER-USER row OWNED by this annotator, tied to the selected batch. Its id is
+    # scoped to (batch, annotator, position) so two users / two batches don't collide.
+    rid = make_id(fid, batch, "hand", annotator, rule_text, b.get("char_start"), b.get("char_end"))
     by  = b.get("extracted_by") or annotator
     kind = "context" if (b.get("kind") == "context") else "rule"
-    # Optional deontic tag at creation time (e.g. ⌘A in Label = add as PROHIBITION).
+    # Optional deontic tag at creation time (e.g. ⌘A in Label = add as PROHIBITION) → rule_labels.
     tag = _norm_tag(b.get("tag")) if kind == "rule" else None
-    con = annot_con()
     con.execute("""
         INSERT OR IGNORE INTO extracted_rules
             (id,file_id,rule_text,char_start,char_end,line_start,line_end,
-             source,llm_run_id,notes,extracted_by,annotator,kind,tag,accepted)
-        VALUES(?,?,?,?,?,?,?,'hand',NULL,NULL,?,?,?,?,TRUE)
+             source,llm_run_id,notes,extracted_by,annotator,kind,accepted,batch_id,owner)
+        VALUES(?,?,?,?,?,?,?,'hand',NULL,NULL,?,?,?,TRUE,?,?)
     """, [rid, fid, rule_text,
           b.get("char_start"), b.get("char_end"),
-          b.get("line_start"), b.get("line_end"), by, annotator, kind, tag])
+          b.get("line_start"), b.get("line_end"), by, annotator, kind, batch, annotator])
+    if tag and batch:
+        con.execute(
+            "INSERT INTO rule_labels(batch_id,rule_id,annotator,tag,updated_at) VALUES (?,?,?,?,now())"
+            " ON CONFLICT (batch_id,rule_id,annotator) DO UPDATE SET tag=excluded.tag, updated_at=now()",
+            [batch, rid, annotator or "", tag])
     if annotator:
         con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
     con.close()
@@ -494,23 +621,34 @@ def save_rule():
 
 @app.route("/api/rules/<rid>", methods=["PATCH"])
 def patch_rule(rid):
-    """Update notes/tag/power_type/llm_rationale/kind/context_type/reviewed, or the
-    rule's text + position (rule_text, char_start/end, line_start/end) when re-selected."""
+    """PER-USER label fields (tag/base_tag/llm_tag/reviewed/context_type/notes) → rule_labels
+    (UPSERT keyed by batch+rule+annotator; the shared span is never mutated). Extraction fields
+    (kind/text/span) update the row in place. Body must include batch_id + annotator for labels."""
     b = request.json or {}
-    updates, params = [], []
-    for k in ("notes", "tag", "power_type", "llm_rationale", "kind", "context_type", "reviewed", "rule_text", "extract_edited", "llm_kind", "base_tag"):
-        if k in b:
-            updates.append(f"{k}=?")
-            params.append(b.get(k) or None)
-    for k in ("char_start", "char_end", "line_start", "line_end", "llm_char_start", "llm_char_end"):   # numeric: keep 0, don't coerce
-        if k in b:
-            updates.append(f"{k}=?")
-            params.append(b.get(k))
-    if not updates:
-        return jsonify({"ok": True})
-    params.append(rid)
+    annotator = (b.get("annotator") or "").strip()
+    batch = (b.get("batch_id") or "").strip() or None
     con = annot_con()
-    con.execute(f"UPDATE extracted_rules SET {', '.join(updates)} WHERE id=?", params)
+    LAB = ("tag", "base_tag", "llm_tag", "reviewed", "context_type", "notes")
+    cols = [k for k in LAB if k in b]
+    if cols and batch:
+        def _v(k):
+            v = b.get(k)
+            return bool(v) if k == "reviewed" else (v or None)
+        upd = ", ".join(f"{k}=excluded.{k}" for k in cols) + ", updated_at=now()"
+        con.execute(
+            f"INSERT INTO rule_labels(batch_id,rule_id,annotator,{','.join(cols)},updated_at)"
+            f" VALUES ({','.join(['?']*(3+len(cols)))},now())"
+            f" ON CONFLICT (batch_id,rule_id,annotator) DO UPDATE SET {upd}",
+            [batch, rid, annotator or ""] + [_v(k) for k in cols])
+    # Extraction fields (span/kind/text) — update the row in place.
+    updates, params = [], []
+    for k in ("kind", "rule_text", "llm_kind"):
+        if k in b: updates.append(f"{k}=?"); params.append(b.get(k) or None)
+    for k in ("char_start", "char_end", "line_start", "line_end", "llm_char_start", "llm_char_end"):
+        if k in b: updates.append(f"{k}=?"); params.append(b.get(k))
+    if updates:
+        params.append(rid)
+        con.execute(f"UPDATE extracted_rules SET {', '.join(updates)} WHERE id=?", params)
     con.close()
     return jsonify({"ok": True})
 
@@ -518,8 +656,10 @@ def patch_rule(rid):
 def delete_rule(rid):
     con = annot_con()
     con.execute("DELETE FROM extracted_rules WHERE id=?", [rid])
-    # An entity can't be half of an edge once it's gone — drop relations touching it.
+    # An entity can't be half of an edge once it's gone — drop relations touching it,
+    # and any per-user labels recorded against it.
     con.execute("DELETE FROM relations WHERE source_id=? OR target_id=?", [rid, rid])
+    con.execute("DELETE FROM rule_labels WHERE rule_id=?", [rid])
     con.close()
     return jsonify({"ok": True})
 
@@ -576,9 +716,12 @@ _REL_COLS = ("id, file_id, source_id, target_id, relation_type, notes, source, "
 @app.route("/api/relations/<fid>")
 def api_relations(fid):
     annotator = (request.args.get("annotator") or "").strip()
+    batch = (request.args.get("batch") or "").strip() or None
     con = annot_con()
-    sql = f"SELECT {_REL_COLS} FROM relations WHERE file_id=?"
-    params = [fid]
+    if batch is None:
+        batch = _latest_batch(con, fid)
+    sql = f"SELECT {_REL_COLS} FROM relations WHERE file_id=? AND batch_id IS NOT DISTINCT FROM ?"
+    params = [fid, batch]
     if annotator:
         sql += " AND annotator=?"
         params.append(annotator)
@@ -599,11 +742,12 @@ def save_relation():
         return jsonify({"error": "a relation can't connect an entity to itself"}), 400
     annotator = (b.get("annotator") or "unknown").strip()
     con = annot_con()
-    # Both endpoints must be real entities in this file (and this annotator's set).
+    batch = (b.get("batch_id") or "").strip() or _latest_batch(con, fid)
+    # Both endpoints must be real entities in this batch — shared spans OR this user's own rows.
     have = con.execute(
         "SELECT id FROM extracted_rules WHERE file_id=? AND id IN (?,?)"
-        " AND annotator IS NOT DISTINCT FROM ?",
-        [fid, src, tgt, annotator or None],
+        " AND batch_id IS NOT DISTINCT FROM ? AND (owner IS NULL OR owner IS NOT DISTINCT FROM ?)",
+        [fid, src, tgt, batch, annotator or None],
     ).fetchall()
     if {r[0] for r in have} != {src, tgt}:
         con.close()
@@ -616,14 +760,14 @@ def save_relation():
     # Note: a later PATCH of relation_type does NOT change this id (refs stay stable),
     # so two rows could in theory converge to the same effective type — tolerated,
     # since multiple typed edges per pair are intentionally allowed.
-    rid = make_id(fid, src, tgt, (rtype or llm_rtype or ""), annotator)
+    rid = make_id(fid, batch, src, tgt, (rtype or llm_rtype or ""), annotator)
     con.execute(
         "INSERT OR IGNORE INTO relations"
         " (id,file_id,source_id,target_id,relation_type,notes,source,llm_run_id,"
-        "  llm_rationale,annotator,llm_relation_type)"
-        " VALUES (?,?,?,?,?,?,?,NULL,?,?,?)",
+        "  llm_rationale,annotator,llm_relation_type,batch_id)"
+        " VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?)",
         [rid, fid, src, tgt, rtype, b.get("notes") or None, edge_source,
-         b.get("llm_rationale") or None, annotator or None, llm_rtype],
+         b.get("llm_rationale") or None, annotator or None, llm_rtype, batch],
     )
     if annotator:
         con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
@@ -662,10 +806,14 @@ def delete_relations_bulk():
     annotator = (request.args.get("annotator") or "").strip()
     if not fid:
         return jsonify({"error": "file_id required"}), 400
+    batch = (request.args.get("batch") or "").strip() or None
     con = annot_con()
+    if batch is None:
+        batch = _latest_batch(con, fid)
     con.execute(
-        "DELETE FROM relations WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-        [fid, annotator or None])
+        "DELETE FROM relations WHERE file_id=? AND batch_id IS NOT DISTINCT FROM ?"
+        " AND annotator IS NOT DISTINCT FROM ?",
+        [fid, batch, annotator or None])
     con.close()
     return jsonify({"ok": True})
 
@@ -1271,67 +1419,77 @@ def _judge_fanout(judges, sys_msg, usr_msg, api_key, progress_cb=None):
                 except Exception: pass
     return results
 
-def _save_run_and_votes(con, run_id, fid, annotator, mode, threshold, judges, votes):
-    """Persist a judge_runs row + every raw per-judge vote, replacing this
-    annotator's previous run/votes for the same (file, mode)."""
-    con.execute("DELETE FROM judge_votes WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?",
-                [fid, mode, annotator or None])
-    con.execute("DELETE FROM judge_runs WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?",
-                [fid, mode, annotator or None])
-    con.execute("INSERT INTO judge_runs(id,file_id,annotator,mode,threshold,judge_total,models) VALUES(?,?,?,?,?,?,?)",
+def _save_run_and_votes(con, run_id, fid, annotator, mode, threshold, judges, votes, batch_id=None):
+    """Persist a judge_runs row + every raw per-judge vote, tagged with batch_id.
+    EXTRACT/REVISE runs are kept forever (each is its own shared batch — the history).
+    LABEL/RELATION runs are per-user: replace only this (file, batch, mode, annotator).
+    batch_id=None → legacy back-compat (replace by file+mode+annotator) so callers not yet
+    threaded with a batch don't crash mid-migration."""
+    if batch_id is None:
+        con.execute("DELETE FROM judge_votes WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?",
+                    [fid, mode, annotator or None])
+        con.execute("DELETE FROM judge_runs WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?",
+                    [fid, mode, annotator or None])
+    elif mode in ("label", "relation"):
+        con.execute("DELETE FROM judge_votes WHERE file_id=? AND mode=? AND batch_id IS NOT DISTINCT FROM ?"
+                    " AND annotator IS NOT DISTINCT FROM ?", [fid, mode, batch_id, annotator or None])
+        con.execute("DELETE FROM judge_runs WHERE file_id=? AND mode=? AND batch_id IS NOT DISTINCT FROM ?"
+                    " AND annotator IS NOT DISTINCT FROM ?", [fid, mode, batch_id, annotator or None])
+    con.execute("INSERT INTO judge_runs(id,file_id,annotator,mode,threshold,judge_total,models,batch_id) VALUES(?,?,?,?,?,?,?,?)",
                 [run_id, fid, annotator or None, mode, threshold, len(judges),
-                 json.dumps([j.get("model") for j in judges])])
+                 json.dumps([j.get("model") for j in judges]), batch_id])
     # ONE batched multi-row INSERT instead of a network round-trip per vote — the
     # per-row version made the post-fanout "aggregating" wait take seconds on MotherDuck.
     if votes:
-        ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         flat = []
         for k, v in enumerate(votes):
             vid = make_id(run_id, v.get("judge_idx"), v.get("rule_id") or "", v.get("source_id") or "",
                           v.get("target_id") or "", v.get("char_start"), v.get("char_end"), v.get("value") or "", k)
             flat += [vid, run_id, fid, annotator or None, mode, v.get("judge_idx"), v.get("model"),
                      v.get("char_start"), v.get("char_end"), v.get("kind"), v.get("rule_id"),
-                     v.get("source_id"), v.get("target_id"), v.get("value"), v.get("rationale")]
+                     v.get("source_id"), v.get("target_id"), v.get("value"), v.get("rationale"), batch_id]
         con.execute(
             "INSERT OR IGNORE INTO judge_votes"
-            " (id,run_id,file_id,annotator,mode,judge_idx,model,char_start,char_end,kind,rule_id,source_id,target_id,value,rationale)"
+            " (id,run_id,file_id,annotator,mode,judge_idx,model,char_start,char_end,kind,rule_id,source_id,target_id,value,rationale,batch_id)"
             " VALUES " + ",".join([ph] * len(votes)), flat)
 
-def _judge_gate(mode, fid, annotator):
-    """Synchronous pre-flight checks so the UI gets an immediate error (not via
-    polling). Label needs ≥1 rule; Relation needs ≥2 entities AND every rule
-    tagged (relations are built from context + tagged rules)."""
+def _judge_gate(mode, fid, annotator, batch_id=None, source_batch_id=None):
+    """Synchronous pre-flight checks (batch-scoped). Revise needs THIS user's own edits in the
+    source batch; Label needs ≥1 shared rule in the batch; Relation needs ≥2 entities AND every
+    rule tagged BY THIS USER (per-user rule_labels)."""
     if mode not in ("revise", "label", "relation"):
         return None
     if mode == "revise":
-        # Revise refines the extraction using the human's own work, so it needs some: a hand-added
-        # rule, or an LLM extraction whose kind/span the human edited.
+        # Revise folds in this user's own work on the source batch (hand-adds + span/kind forks).
         con = annot_con()
         n = con.execute(
-            "SELECT count(*) FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?"
-            " AND (accepted IS NULL OR accepted=TRUE) AND ("
-            "   source='hand'"
-            "   OR (llm_kind IS NOT NULL AND COALESCE(kind,'rule') <> llm_kind)"
-            "   OR (llm_char_start IS NOT NULL AND (char_start <> llm_char_start OR char_end <> llm_char_end)))",
-            [fid, annotator or None]).fetchone()[0]
+            "SELECT count(*) FROM extracted_rules WHERE file_id=? AND batch_id IS NOT DISTINCT FROM ?"
+            " AND owner IS NOT DISTINCT FROM ? AND (accepted IS NULL OR accepted=TRUE)",
+            [fid, source_batch_id, annotator or None]).fetchone()[0]
         con.close()
         if not n:
             return "Nothing to revise yet — add a rule or edit an extraction first."
         return None
     con = annot_con()
     rows = con.execute(
-        "SELECT kind, tag FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?"
-        " AND (accepted IS NULL OR accepted=TRUE)", [fid, annotator or None]).fetchall()
+        "SELECT er.kind, rl.tag FROM extracted_rules er"
+        " LEFT JOIN rule_labels rl ON rl.batch_id IS NOT DISTINCT FROM er.batch_id"
+        "   AND rl.rule_id = er.id AND rl.annotator IS NOT DISTINCT FROM ?"
+        " WHERE er.file_id=? AND er.batch_id IS NOT DISTINCT FROM ?"
+        "   AND (er.owner IS NULL OR er.owner IS NOT DISTINCT FROM ?)"
+        "   AND (er.accepted IS NULL OR er.accepted=TRUE)",
+        [annotator or "", fid, batch_id, annotator or None]).fetchall()
     con.close()
     rules = [r for r in rows if (r[0] or "rule") == "rule"]
     if mode == "label":
         if not rules:
-            return "No rules to label — run Extract first."
+            return "No rules to label in this batch — run Extract first."
         return None
-    # relation
+    # relation — every rule must carry a deontic tag for THIS user ('NONE'/null don't count)
     if len(rows) < 2:
-        return "Need at least 2 rules/context in this file to relate — run Extract first."
-    untagged = sum(1 for r in rules if not r[1])
+        return "Need at least 2 rules/context in this batch to relate — run Extract first."
+    untagged = sum(1 for r in rules if r[1] not in _TAGS)
     if untagged:
         return (f"Tag every rule in Label first — {untagged} rule{'s' if untagged != 1 else ''} "
                 "still untagged. (Relations are built from context + tagged rules.)")
@@ -1359,10 +1517,14 @@ def run_judge():
     try: threshold = int(b.get("threshold") or 1)
     except Exception: threshold = 1
     threshold = max(1, min(threshold, len(judges)))
+    batch_id = (b.get("batch_id") or "").strip() or None
+    source_batch_id = (b.get("source_batch_id") or "").strip() or None
     if mode not in ("extract", "revise", "label", "relation"):
         return jsonify({"error": "mode must be extract|revise|label|relation"}), 400
     if not fid or not prompt:
         return jsonify({"error": "file_id and prompt required"}), 400
+    if mode in ("label", "relation") and not batch_id:
+        return jsonify({"error": "pick an extraction batch first (batch_id required)"}), 400
     api_key = os.environ.get("PERPLEXITY_API_KEY", "")
     if not api_key:
         return jsonify({"error": "PERPLEXITY_API_KEY not set"}), 400
@@ -1370,19 +1532,21 @@ def run_judge():
     row = sc.execute("SELECT content FROM sample WHERE id=?", [fid]).fetchone()
     if not row: return jsonify({"error": "file not found"}), 404
     content = row[0] or ""
-    gate = _judge_gate(mode, fid, annotator)
+    gate = _judge_gate(mode, fid, annotator, batch_id, source_batch_id)
     if gate:
         return jsonify({"error": gate}), 400
     run_id = make_id(fid, mode, annotator, prompt, datetime.now(timezone.utc).isoformat())
     _job_create(run_id, fid, annotator, mode, threshold, judges)
     t = threading.Thread(target=_run_judge_job,
-                         args=(run_id, mode, fid, annotator, prompt, judges, threshold, content, api_key),
+                         args=(run_id, mode, fid, annotator, prompt, judges, threshold, content, api_key,
+                               batch_id, source_batch_id),
                          daemon=True)
     t.start()
     return jsonify({"run_id": run_id, "started": True, "judge_total": len(judges),
                     "judges": [j["model"] for j in judges]})
 
-def _run_judge_job(run_id, mode, fid, annotator, prompt, judges, threshold, content, api_key):
+def _run_judge_job(run_id, mode, fid, annotator, prompt, judges, threshold, content, api_key,
+                   batch_id=None, source_batch_id=None):
     """Background worker: run the stage's judges (with live per-judge progress),
     aggregate, and stash the result/error on the job for the client to poll."""
     def cb(idx, status):
@@ -1392,7 +1556,8 @@ def _run_judge_job(run_id, mode, fid, annotator, prompt, judges, threshold, cont
     fn = {"extract": _judge_extract, "revise": _judge_revise,
           "label": _judge_label, "relation": _judge_relation}[mode]
     try:
-        payload = fn(fid, annotator, prompt, judges, threshold, content, api_key, run_id, cb)
+        payload = fn(fid, annotator, prompt, judges, threshold, content, api_key, run_id,
+                     progress_cb=cb, batch_id=batch_id, source_batch_id=source_batch_id)
         _job_finish(run_id, result=payload)
     except JudgeError as je:
         _job_finish(run_id, error=je.msg)
@@ -1414,7 +1579,7 @@ def judge_progress(run_id):
         "done": job["done"], "error": job["error"], "result": job["result"],
     })
 
-def _judge_extract(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None):
+def _judge_extract(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None, batch_id=None, source_batch_id=None):
     sys_msg = ("You identify spans in a document and return ONLY a single valid JSON array — "
                "no prose, no markdown fences. Use exactly the field schema in the user's instructions.")
     usr_msg = f"{prompt}\n\nDocument:\n---\n{content[:30000]}\n---\n\nReturn ONLY a JSON array."
@@ -1453,67 +1618,50 @@ def _judge_extract(fid, annotator, prompt, judges, threshold, content, api_key, 
         ls = content[:cs].count("\n") + 1
         le = content[:ce].count("\n") + 1
         rationale = next((s.get("rationale") for s in grp if s.get("rationale")), None)
-        eid = make_id(fid, "extract", annotator, cs, ce)   # stable per span → relations survive re-runs
-        # store the LLM's original kind/span (llm_kind/llm_char_start/llm_char_end) so a
-        # later human edit can be detected by COMPARISON (and reverting goes back to green).
+        eid = make_id(fid, run_id, cs, ce)   # batch-scoped → distinct across batches
+        # store the LLM's original kind/span (llm_kind/llm_char_start/llm_char_end) so a later
+        # human EDIT (per-user fork) can be detected by COMPARISON. batch_id=run_id; owner=NULL (shared).
         insert_rows.append([eid, fid, rt, cs, ce, ls, le, "llm", run_id, None, "judge",
-                            None, kind, rationale, annotator or None, True, nj, len(judges), kind, cs, ce])
+                            None, kind, rationale, annotator or None, True, nj, len(judges), kind, cs, ce,
+                            run_id, None])
         accepted += 1
     con = annot_con()
     try:
         with _atomic(con):
             if annotator:
                 con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
-            _save_run_and_votes(con, run_id, fid, annotator, "extract", threshold, judges, votes)
-            # A new Extract run starts a FRESH ROUND. Archive this annotator's entire previous
-            # round — BOTH machine and hand rules, plus their relations — so past rounds are kept
-            # for later analysis, then clear the live tables so the view refreshes to just this new
-            # round. (Hand rules are archived too, by design: "don't show the previous round of
-            # human extraction".)
-            con.execute("INSERT INTO rules_archive BY NAME SELECT *, now() AS archived_at, ? AS archive_run_id"
-                        " FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [run_id, fid, annotator or None])
-            con.execute("INSERT INTO relations_archive BY NAME SELECT *, now() AS archived_at, ? AS archive_run_id"
-                        " FROM relations WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [run_id, fid, annotator or None])
-            con.execute("DELETE FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [fid, annotator or None])
-            con.execute("DELETE FROM relations WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [fid, annotator or None])
+            # A new Extract run = a NEW SHARED BATCH (batch_id = run_id), kept forever. No archive,
+            # no clear — prior batches and every user's labels/relations on them stay intact.
+            con.execute("INSERT OR IGNORE INTO batches(batch_id,file_id,mode,creator,threshold,judge_total,models,prompt)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        [run_id, fid, "extract", annotator or None, threshold, len(judges),
+                         json.dumps([j.get("model") for j in judges]), prompt])
+            _save_run_and_votes(con, run_id, fid, annotator, "extract", threshold, judges, votes, run_id)
             if insert_rows:
-                ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 flat = [v for r in insert_rows for v in r]
                 con.execute(
                     "INSERT OR IGNORE INTO extracted_rules"
                     " (id,file_id,rule_text,char_start,char_end,line_start,line_end,source,llm_run_id,"
                     "  notes,extracted_by,tag,kind,llm_rationale,annotator,accepted,vote_count,judge_total,"
-                    "  llm_kind,llm_char_start,llm_char_end)"
+                    "  llm_kind,llm_char_start,llm_char_end,batch_id,owner)"
                     " VALUES " + ",".join([ph] * len(insert_rows)), flat)
     finally:
         con.close()
-    return {"run_id": run_id, "mode": "extract", "accepted": accepted,
+    return {"run_id": run_id, "mode": "extract", "accepted": accepted, "batch_id": run_id,
             "judge_total": len(judges), "threshold": threshold, "errors": errors}
 
-def _judge_revise(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None):
-    # Revise = a fresh extraction ROUND that revises the current extraction using the human's own
-    # work — hand-added rules plus spans/kinds the human edited — as primary guidance. The judges
-    # re-extract the whole document; we then ABSORB the human items into one revised set
-    # (source='revise'): every human item the judges drop is RESCUED so nothing human is lost.
-    # Like Extract this archives the previous round and refreshes the view; producing 'revise' rows
-    # turns the file's badge green ("resolved extraction").
+def _judge_revise(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None, batch_id=None, source_batch_id=None):
+    # Revise = a NEW shared extraction batch that revises the SOURCE batch using THIS user's own
+    # work on it — their hand-added + span/kind-edited (fork) rows (owner=annotator) — as primary
+    # guidance. The judges re-extract the whole document; we ABSORB the human items into the revised
+    # set (source='revise', shared) and RESCUE any the judges drop. New history entry → badge green.
     rc = annot_con()
-    cur = rc.execute(
+    human = rc.execute(
         "SELECT source, char_start, char_end, kind, rule_text, llm_kind, llm_char_start, llm_char_end"
-        " FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?"
-        " AND (accepted IS NULL OR accepted=TRUE)", [fid, annotator or None]).fetchall()
+        " FROM extracted_rules WHERE file_id=? AND batch_id IS NOT DISTINCT FROM ? AND owner IS NOT DISTINCT FROM ?",
+        [fid, source_batch_id, annotator or None]).fetchall()
     rc.close()
-    def _is_human(r):
-        src, cs, ce, kind, _txt, lk, lcs, lce = r
-        if (src or "") == "hand": return True                              # hand-added
-        if lk is not None and (kind or "rule") != lk: return True          # kind edited
-        if lcs is not None and (cs != lcs or ce != lce): return True       # span edited
-        return False
-    human = [r for r in cur if _is_human(r)]
     guide = "\n".join(f'- [{(r[3] or "rule")}] "{(r[4] or "")[:200].strip()}"' for r in human) or "(none)"
     sys_msg = ("You identify spans in a document and return ONLY a single valid JSON array — "
                "no prose, no markdown fences. Use exactly the field schema in the user's instructions.")
@@ -1553,9 +1701,10 @@ def _judge_revise(fid, annotator, prompt, judges, threshold, content, api_key, r
         ls = content[:cs].count("\n") + 1
         le = content[:ce].count("\n") + 1
         rationale = next((s.get("rationale") for s in grp if s.get("rationale")), None)
-        eid = make_id(fid, "revise", annotator, cs, ce)
+        eid = make_id(fid, run_id, cs, ce)
         insert_rows.append([eid, fid, rt, cs, ce, ls, le, "revise", run_id, None, "judge",
-                            None, kind, rationale, annotator or None, True, nj, len(judges), kind, cs, ce])
+                            None, kind, rationale, annotator or None, True, nj, len(judges), kind, cs, ce,
+                            run_id, None])
         acc_ranges.append((cs, ce))
         accepted += 1
     # RESCUE every human item the judges did NOT cover (no overlap with an accepted cluster), so the
@@ -1573,71 +1722,66 @@ def _judge_revise(fid, annotator, prompt, judges, threshold, content, api_key, r
         if not rt: continue
         ls = content[:cs].count("\n") + 1
         le = content[:ce].count("\n") + 1
-        eid = make_id(fid, "revise", annotator, cs, ce)
+        eid = make_id(fid, run_id, cs, ce)
         insert_rows.append([eid, fid, rt, cs, ce, ls, le, "revise", run_id, None, "human-kept",
-                            None, kind, None, annotator or None, True, None, len(judges), kind, cs, ce])
+                            None, kind, None, annotator or None, True, None, len(judges), kind, cs, ce,
+                            run_id, None])
         rescued += 1
     con = annot_con()
     try:
         with _atomic(con):
             if annotator:
                 con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
-            _save_run_and_votes(con, run_id, fid, annotator, "revise", threshold, judges, votes)
-            # Same round refresh as Extract: archive the previous round (machine + hand + relations),
-            # then clear the live tables before inserting the revised set.
-            con.execute("INSERT INTO rules_archive BY NAME SELECT *, now() AS archived_at, ? AS archive_run_id"
-                        " FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [run_id, fid, annotator or None])
-            con.execute("INSERT INTO relations_archive BY NAME SELECT *, now() AS archived_at, ? AS archive_run_id"
-                        " FROM relations WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [run_id, fid, annotator or None])
-            con.execute("DELETE FROM extracted_rules WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [fid, annotator or None])
-            con.execute("DELETE FROM relations WHERE file_id=? AND annotator IS NOT DISTINCT FROM ?",
-                        [fid, annotator or None])
+            # Revise creates a NEW shared batch (batch_id = run_id), kept in history. No archive,
+            # no clear — the source batch and everyone's labels on it stay intact.
+            con.execute("INSERT OR IGNORE INTO batches(batch_id,file_id,mode,creator,threshold,judge_total,models,prompt)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        [run_id, fid, "revise", annotator or None, threshold, len(judges),
+                         json.dumps([j.get("model") for j in judges]), prompt])
+            _save_run_and_votes(con, run_id, fid, annotator, "revise", threshold, judges, votes, run_id)
             if insert_rows:
-                ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 flat = [v for r in insert_rows for v in r]
                 con.execute(
                     "INSERT OR IGNORE INTO extracted_rules"
                     " (id,file_id,rule_text,char_start,char_end,line_start,line_end,source,llm_run_id,"
                     "  notes,extracted_by,tag,kind,llm_rationale,annotator,accepted,vote_count,judge_total,"
-                    "  llm_kind,llm_char_start,llm_char_end)"
+                    "  llm_kind,llm_char_start,llm_char_end,batch_id,owner)"
                     " VALUES " + ",".join([ph] * len(insert_rows)), flat)
     finally:
         con.close()
-    return {"run_id": run_id, "mode": "revise", "accepted": accepted, "rescued": rescued,
+    return {"run_id": run_id, "mode": "revise", "accepted": accepted, "rescued": rescued, "batch_id": run_id,
             "judge_total": len(judges), "threshold": threshold, "errors": errors}
 
-def _judge_label(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None):
+def _judge_label(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None, batch_id=None, source_batch_id=None):
     con = annot_con()
+    # Targets = the SHARED extraction spans of the selected batch (owner NULL, rule-kind). The judge
+    # never touches a user's hand-added rows. Tags are PER-USER and live in rule_labels.
     rows = con.execute(
-        "SELECT id, kind, rule_text, line_start, source, tag, llm_tag, base_tag FROM extracted_rules"
-        " WHERE file_id=? AND annotator IS NOT DISTINCT FROM ? AND (accepted IS NULL OR accepted=TRUE)"
+        "SELECT id, kind, rule_text, line_start FROM extracted_rules"
+        " WHERE file_id=? AND batch_id IS NOT DISTINCT FROM ? AND owner IS NULL"
+        " AND (accepted IS NULL OR accepted=TRUE) AND COALESCE(kind,'rule')='rule'"
         " ORDER BY COALESCE(line_start,999999), COALESCE(char_start,999999)",
-        [fid, annotator or None]).fetchall()
-    # The Label judge only tags MACHINE-extracted rules — those produced by Extract ('llm') or
-    # Revise ('revise'). Human-added rules (source='hand') are the human's to tag; the judge never
-    # touches them. And any machine rule whose TAG a human has already set or changed is PRESERVED:
-    # re-running Label won't overwrite a human decision. A human EXTRACTION edit does NOT count as a
-    # tag decision — such a rule is still machine-sourced with no human tag, so it still gets labeled
-    # ("revise extraction = correct extraction only").
-    llm_rules = [r for r in rows if (r[1] or "rule") == "rule" and (r[4] or "") != "hand"]
-    if not llm_rules:
+        [fid, batch_id]).fetchall()
+    if not rows:
         con.close()
-        raise JudgeError("No LLM-extracted rules to label — run Extract first.")
-
-    def _human_tagged(r):
-        tag, llm_tag, base_tag = r[5], r[6], r[7]
-        # base_tag set ⇒ human tagged a never-labeled rule; tag≠llm_tag ⇒ human changed the LLM pick.
+        raise JudgeError("No LLM-extracted rules to label in this batch — run Extract first.")
+    # This user's existing per-user labels for the batch — used to PRESERVE human decisions:
+    # don't re-label a rule whose tag the user already set/changed.
+    seen = {r[0]: (r[1], r[2], r[3]) for r in con.execute(
+        "SELECT rule_id, tag, llm_tag, base_tag FROM rule_labels"
+        " WHERE batch_id IS NOT DISTINCT FROM ? AND annotator IS NOT DISTINCT FROM ?",
+        [batch_id, annotator or ""]).fetchall()}
+    def _human_tagged(rid):
+        t = seen.get(rid)
+        if not t: return False
+        tag, llm_tag, base_tag = t
         return base_tag is not None or (llm_tag is not None and tag != llm_tag)
-
-    targets = [r for r in llm_rules if not _human_tagged(r)]
-    preserved = len(llm_rules) - len(targets)
+    targets = [r for r in rows if not _human_tagged(r[0])]
+    preserved = len(rows) - len(targets)
     if not targets:
-        # Every LLM rule already carries a human tag — nothing left for the judge to decide.
         con.close()
-        return {"run_id": run_id, "mode": "label", "labeled": 0, "preserved": preserved,
+        return {"run_id": run_id, "mode": "label", "labeled": 0, "preserved": preserved, "batch_id": batch_id,
                 "judge_total": len(judges), "threshold": threshold, "errors": []}
     label_to_id, lines = {}, []
     for i, t in enumerate(targets, 1):
@@ -1673,34 +1817,42 @@ def _judge_label(fid, annotator, prompt, judges, threshold, content, api_key, ru
         with _atomic(con):
             if annotator:
                 con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
-            _save_run_and_votes(con, run_id, fid, annotator, "label", threshold, judges, votes)
-            # Decide every rule the judges were asked about. A clear ≥threshold winner →
-            # that tag (also stored in llm_tag). No agreement (tie / below threshold / no
-            # votes) → the sentinel 'NONE' so the DB DISTINGUISHES "judges saw it but
-            # couldn't agree" from NULL (= never labeled). 'NONE' displays as untagged.
+            _save_run_and_votes(con, run_id, fid, annotator, "label", threshold, judges, votes, batch_id)
+            # Write each rule's tag into rule_labels (PER-USER) — the shared span is NEVER mutated,
+            # so its batch_id link is preserved. Clear ≥threshold winner → that tag; else 'NONE'
+            # (judges saw it but couldn't agree; displays untagged, distinct from NULL=never labeled).
             for rid in [t[0] for t in targets]:
                 counts = tally.get(rid, {})
                 best_n = max(counts.values()) if counts else 0
                 winners = [t for t, c in counts.items() if c == best_n]
                 if len(winners) == 1 and best_n >= threshold:
-                    con.execute("UPDATE extracted_rules SET tag=?, llm_tag=?, llm_run_id=?, vote_count=?, judge_total=? WHERE id=?",
-                                [winners[0], winners[0], run_id, best_n, len(judges), rid])
-                    labeled += 1
+                    tag, lt = winners[0], winners[0]; labeled += 1
                 else:
-                    con.execute("UPDATE extracted_rules SET tag='NONE', llm_tag=NULL, llm_run_id=?, vote_count=?, judge_total=? WHERE id=?",
-                                [run_id, best_n, len(judges), rid])
+                    tag, lt = 'NONE', None
+                con.execute(
+                    "INSERT INTO rule_labels(batch_id,rule_id,annotator,tag,llm_tag,updated_at)"
+                    " VALUES (?,?,?,?,?,now())"
+                    " ON CONFLICT (batch_id,rule_id,annotator) DO UPDATE SET tag=excluded.tag,"
+                    " llm_tag=excluded.llm_tag, updated_at=now()",
+                    [batch_id, rid, annotator or "", tag, lt])
     finally:
         con.close()
-    return {"run_id": run_id, "mode": "label", "labeled": labeled, "preserved": preserved,
+    return {"run_id": run_id, "mode": "label", "labeled": labeled, "preserved": preserved, "batch_id": batch_id,
             "judge_total": len(judges), "threshold": threshold, "errors": errors}
 
-def _judge_relation(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None):
+def _judge_relation(fid, annotator, prompt, judges, threshold, content, api_key, run_id, progress_cb=None, batch_id=None, source_batch_id=None):
     con = annot_con()
+    # Nodes = the batch's shared spans (owner NULL) + this user's own hand/fork rows, carrying the
+    # user's PER-USER tags (from rule_labels). Relations are per-user, scoped to (batch, annotator).
     nodes = con.execute(
-        "SELECT id, kind, tag, rule_text, line_start FROM extracted_rules"
-        " WHERE file_id=? AND annotator IS NOT DISTINCT FROM ? AND (accepted IS NULL OR accepted=TRUE)"
-        " ORDER BY COALESCE(line_start,999999), COALESCE(char_start,999999)",
-        [fid, annotator or None]).fetchall()
+        "SELECT er.id, er.kind, rl.tag, er.rule_text, er.line_start FROM extracted_rules er"
+        " LEFT JOIN rule_labels rl ON rl.batch_id IS NOT DISTINCT FROM er.batch_id"
+        "   AND rl.rule_id = er.id AND rl.annotator IS NOT DISTINCT FROM ?"
+        " WHERE er.file_id=? AND er.batch_id IS NOT DISTINCT FROM ?"
+        "   AND (er.owner IS NULL OR er.owner IS NOT DISTINCT FROM ?)"
+        "   AND (er.accepted IS NULL OR er.accepted=TRUE)"
+        " ORDER BY COALESCE(er.line_start,999999), COALESCE(er.char_start,999999)",
+        [annotator or "", fid, batch_id, annotator or None]).fetchall()
     if len(nodes) < 2:
         con.close()
         raise JudgeError("Need at least 2 rules/context in this file to relate.")
@@ -1781,22 +1933,23 @@ def _judge_relation(fid, annotator, prompt, judges, threshold, content, api_key,
         with _atomic(con):
             if annotator:
                 con.execute("INSERT INTO annotators(name) VALUES(?) ON CONFLICT(name) DO NOTHING", [annotator])
-            _save_run_and_votes(con, run_id, fid, annotator, "relation", threshold, judges, votes)
-            con.execute("DELETE FROM relations WHERE file_id=? AND source='llm' AND annotator IS NOT DISTINCT FROM ?",
-                        [fid, annotator or None])
+            _save_run_and_votes(con, run_id, fid, annotator, "relation", threshold, judges, votes, batch_id)
+            con.execute("DELETE FROM relations WHERE file_id=? AND batch_id IS NOT DISTINCT FROM ?"
+                        " AND source='llm' AND annotator IS NOT DISTINCT FROM ?",
+                        [fid, batch_id, annotator or None])
             for (src, tgt), (rtype, nj, rat) in pair_best.items():
                 if nj < threshold: continue          # winning type didn't reach agreement
-                rid = make_id(fid, src, tgt, "llm", annotator)   # one majority llm edge per pair
+                rid = make_id(fid, batch_id, src, tgt, "llm", annotator)   # one majority llm edge per pair
                 con.execute(
                     "INSERT OR IGNORE INTO relations"
                     " (id,file_id,source_id,target_id,relation_type,notes,source,llm_run_id,llm_rationale,"
-                    "  annotator,llm_relation_type,accepted,vote_count,judge_total)"
-                    " VALUES (?,?,?,?,NULL,NULL,'llm',?,?,?,?,TRUE,?,?)",
-                    [rid, fid, src, tgt, run_id, rat, annotator or None, rtype, nj, len(judges)])
+                    "  annotator,llm_relation_type,accepted,vote_count,judge_total,batch_id)"
+                    " VALUES (?,?,?,?,NULL,NULL,'llm',?,?,?,?,TRUE,?,?,?)",
+                    [rid, fid, src, tgt, run_id, rat, annotator or None, rtype, nj, len(judges), batch_id])
                 accepted += 1
     finally:
         con.close()
-    return {"run_id": run_id, "mode": "relation", "accepted": accepted,
+    return {"run_id": run_id, "mode": "relation", "accepted": accepted, "batch_id": batch_id,
             "judge_total": len(judges), "threshold": threshold, "errors": errors}
 
 @app.route("/api/judge-data/<fid>")
@@ -1804,13 +1957,25 @@ def judge_data(fid):
     """Latest multi-judge run + every per-judge vote for each mode — powers the
     vote rings, the inspection panel, and Extract candidate/light highlights."""
     annotator = (request.args.get("annotator") or "").strip()
+    batch = (request.args.get("batch") or "").strip() or None
+    thr_raw = request.args.get("threshold")
+    try: view_thr = int(thr_raw) if thr_raw not in (None, "") else None
+    except Exception: view_thr = None
     con = annot_con()
+    if batch is None:
+        batch = _latest_batch(con, fid)
     out = {}
-    for mode in ("extract", "label", "relation"):
+    # extract slot = the batch's SHARED extraction run (extract or revise); label/relation = this
+    # user's latest run on that batch (per-user).
+    slots = {
+        "extract":  ("mode IN ('extract','revise') AND batch_id IS NOT DISTINCT FROM ?", [fid, batch]),
+        "label":    ("mode='label' AND batch_id IS NOT DISTINCT FROM ? AND annotator IS NOT DISTINCT FROM ?", [fid, batch, annotator or None]),
+        "relation": ("mode='relation' AND batch_id IS NOT DISTINCT FROM ? AND annotator IS NOT DISTINCT FROM ?", [fid, batch, annotator or None]),
+    }
+    for mode, (cond, params) in slots.items():
         run = con.execute(
-            "SELECT id, threshold, judge_total, models FROM judge_runs"
-            " WHERE file_id=? AND mode=? AND annotator IS NOT DISTINCT FROM ?"
-            " ORDER BY created_at DESC LIMIT 1", [fid, mode, annotator or None]).fetchone()
+            f"SELECT id, threshold, judge_total, models FROM judge_runs WHERE file_id=? AND {cond}"
+            " ORDER BY created_at DESC LIMIT 1", params).fetchone()
         if not run:
             out[mode] = None; continue
         run_id, threshold, judge_total, models = run
@@ -1829,7 +1994,7 @@ def judge_data(fid):
             cands = []
             for grp in _cluster_spans(spans):
                 nj = len({s["judge_idx"] for s in grp})
-                if nj >= (threshold or 1): continue   # accepted clusters are already rules
+                if nj >= (view_thr if view_thr is not None else (threshold or 1)): continue   # ≥ cutoff = accepted (a row), not a candidate
                 cs, ce = _median([s["char_start"] for s in grp]), _median([s["char_end"] for s in grp])
                 kinds = [s["kind"] for s in grp]
                 kind = "context" if kinds.count("context") > kinds.count("rule") else "rule"
@@ -1876,6 +2041,21 @@ def export_page():
     if econds: rel_sql += " WHERE " + " AND ".join(econds)
     rel_sql += " ORDER BY e.file_id, e.created_at"
     rel_rows = acon.execute(rel_sql, eparams).fetchall()
+
+    # ── Per-judge LLM results: every individual judge vote (extract spans, label tags,
+    #    relation edges) so the export captures what EACH model decided, not just the aggregate ──
+    vote_sql = """
+        SELECT v.id, v.file_id, v.annotator, v.mode, v.judge_idx, v.model,
+               v.char_start, v.char_end, v.kind, v.rule_id, v.source_id, v.target_id,
+               v.value, v.rationale, v.created_at
+        FROM judge_votes v
+    """
+    vconds, vparams = [], []
+    if annotator: vconds.append("v.annotator=?"); vparams.append(annotator)
+    if file_id:   vconds.append("v.file_id=?");   vparams.append(file_id)
+    if vconds: vote_sql += " WHERE " + " AND ".join(vconds)
+    vote_sql += " ORDER BY v.file_id, v.mode, v.judge_idx, v.created_at"
+    vote_rows = acon.execute(vote_sql, vparams).fetchall()
     acon.close()
 
     # id → rule_text so a relation row can show its endpoints' text, not just ids
@@ -1883,7 +2063,7 @@ def export_page():
 
     sc = sample_con()
     url_map = {}
-    fids = list({r[1] for r in rule_rows} | {e[1] for e in rel_rows})
+    fids = list({r[1] for r in rule_rows} | {e[1] for e in rel_rows} | {v[1] for v in vote_rows})
     if fids:
         placeholders = ",".join("?" * len(fids))
         url_map = {row[0]: row[1] for row in sc.execute(
@@ -1933,6 +2113,7 @@ def export_page():
         "relation_type","llm_relation_type","source_rule_text","target_rule_text",
         "user_comment","llm_rationale","id","source_id","target_id","created_at",
         "human_extracted","extraction_edited","llm_kind","label_changed","llm_tag",
+        "judge_model","judge_mode","judge_idx","vote_value",   # per-judge LLM result rows
     ])
     for r in rule_rows:
         human_extracted, extraction_edited, ex_llm_kind = _extraction_cols(
@@ -1948,6 +2129,7 @@ def export_page():
             r[0], "", "",                                    # id, (no source/target)
             str(r[14] or ""),
             human_extracted, extraction_edited, ex_llm_kind, label_changed, ex_llm_tag,
+            "", "", "", "",                                  # judge-vote-only columns
         ])
     for e in rel_rows:
         # relation_type (user) vs llm_relation_type already capture human-vs-LLM here;
@@ -1965,10 +2147,31 @@ def export_page():
             e[0], e[2], e[3],                                # id, source_id, target_id
             str(e[10] or ""),
             "", "", "", rel_changed, e[5] or "",             # human_extracted/edited n/a; label_changed=type override; llm_tag←llm_relation_type
+            "", "", "", "",                                  # judge-vote-only columns
+        ])
+    # ── one row per individual judge vote ──
+    for v in vote_rows:
+        vid, vfid, vann, vmode, vidx, vmodel, vcs, vce, vkind, vrid, vsrc, vtgt, vval, vrat, vcreated = v
+        # rule_text shows the referenced rule (label) or stays blank (extract span / relation)
+        rtext = rule_text_map.get(vrid, "") if vmode == "label" else ""
+        writer.writerow([
+            "judge_vote",
+            vann or "", url_map.get(vfid, ""), "", "",       # annotator, url, source, extracted_by
+            vkind or "", "", "", rtext,                      # kind (extract), tag, context_type, rule_text
+            "", "", blank(vcs), blank(vce),                  # line start/end (n/a), char start/end (extract)
+            (vval if vmode == "relation" else ""), "",       # relation_type (relation votes), llm_relation_type
+            rule_text_map.get(vsrc, "") if vsrc else "",     # source_rule_text (relation)
+            rule_text_map.get(vtgt, "") if vtgt else "",     # target_rule_text (relation)
+            "", vrat or "",                                  # user_comment, llm_rationale (this judge's reason)
+            vid, vsrc or vrid or "", vtgt or "",             # id, source_id (or labeled rule_id), target_id
+            str(vcreated or ""),
+            "", "", "", "", "",                              # human_*/label_* n/a for a judge vote
+            vmodel or "", vmode or "", blank(vidx), vval or "",   # judge_model, judge_mode, judge_idx, vote_value
         ])
     csv_text = buf.getvalue()
     row_count = len(rule_rows)
     rel_count = len(rel_rows)
+    vote_count = len(vote_rows)
 
     # Human-readable scope for the header + a matching download filename.
     if file_id:
@@ -2007,7 +2210,7 @@ def export_page():
 </head><body>
 <div class="bar">
   <h2>Rules &amp; Relations Export</h2>
-  <small>{scope_label} · {row_count} rule{"s" if row_count!=1 else ""} · {rel_count} relation{"s" if rel_count!=1 else ""}</small>
+  <small>{scope_label} · {row_count} rule{"s" if row_count!=1 else ""} · {rel_count} relation{"s" if rel_count!=1 else ""} · {vote_count} judge vote{"s" if vote_count!=1 else ""}</small>
   <button class="cp" onclick="copyCSV()">Copy</button>
   <button class="dl" onclick="downloadCSV()">Download CSV</button>
 </div>
@@ -2259,6 +2462,13 @@ body.resizing { cursor: col-resize; user-select: none; }
   display: flex; flex-direction: column; overflow: hidden;
   border-right: 1px solid #2a2a4a;
 }
+/* ── Runs toggle (top-bar dropdown of the file's shared extraction runs) ── */
+.run-select {
+  max-width: 230px; padding: 5px 8px; border-radius: 14px; border: 1px solid #d0d0e0;
+  background: #fff; color: #4b4b6a; font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.run-select:hover:not(:disabled) { border-color: #6366f1; color: #4338ca; }
+.run-select:disabled { opacity: 0.5; cursor: default; }
 .file-panel-head {
   padding: 12px 12px 10px; color: #fff; font-size: 13px; font-weight: 700;
   border-bottom: 1px solid #2a2a4a; flex-shrink: 0; display: flex;
@@ -2890,43 +3100,40 @@ Prefer exact or near-exact quotes from the file. Extract each independently enfo
 
 Return only a valid JSON array. Each element:
 {"rule_text": "<exact or near-exact quote>", "line_start": <int>, "line_end": <int>}</script>
-<script type="text/plain" id="defaultJudgePrompt">You are an EXTRACTION judge. Your only job is to identify which spans of the document are atomic items — do NOT assign deontic tags (that happens in a later stage). Set "kind" to "rule" or "context" on every item.
+<script type="text/plain" id="defaultJudgePrompt">You are an EXTRACTION judge. Identify which spans of the document are atomic items and set "kind" to "rule" or "context" for each. Do NOT assign deontic tags — that is a later stage.
 
-A RULE is any natural-language instruction, constraint, prohibition, requirement, permission, or grant of authority directed at the agent — something it must, must not, may, or should do. A CONTEXT span is background that frames how the agent operates but is NOT itself a directive.
+RULE = a span that DIRECTS the agent: an instruction, constraint, prohibition, requirement, permission, or grant of authority — something it must / must not / may / should do. The span itself issues the directive.
 
-YOUR BIGGEST FAILURE MODE IS UNDER-EXTRACTION — leaving out spans a careful human would mark. Earlier passes have repeatedly missed the items below. Treat this as a checklist: sweep the whole document and make sure EACH such span becomes its own atomic item. When in doubt, extract it.
+CONTEXT = a span that FRAMES or EXPLAINS but does not itself direct. Tag these as context, NOT rules (this is the most common mislabel — a span that explains or illustrates a rule is not itself a rule):
+- Worked examples and do-this-not-that blocks — "Examples of proper fixes:", "Correct pattern:", "Violations to avoid:", any ✅/❌ list. They illustrate a rule; they are not the rule.
+- Principle / rationale / philosophy statements — "Core principle: …", "Rationale: …", "Core philosophy: …". They explain WHY; the actual directive is stated elsewhere.
+- Framing or warning-sign lines that describe rather than command — "The phrase 'backward compatibility' is a CRITICAL WARNING SIGN.", "Lower complexity is a primary goal."
+- Section headings / titles with no obligation — even imperative-sounding ones ("stay flexible, plan incrementally", "keep repo clean") when they merely head the rules below.
+- Identity / role, capability or environment facts, stakes / consequences.
+- Templates and canned text the agent fills in or emits verbatim.
+- A definition or list that exists only so a rule can point at it.
 
-COMMONLY MISSED — CONTEXT (do not skip these):
-- Identity & purpose — the agent's role/persona and who relies on it for what. "You are Pickle — Recovery in Mind's AI assistant and a genuine part of the team." / "OTs use you to research conditions and evidence-based interventions…" / a "General Tasks" overview of what it helps with.
-- Tool & capability descriptions stated as fact — every named tool or capability is its OWN item. "Paper Search (Semantic Scholar) — search across arXiv, PubMed…" / "zanda_execute — run JavaScript against the live API…" / "You have access to Apple Mail." / "The API is read-only."
-- Stakes & consequences. "Pickle runs on infrastructure that is not designed, audited, or approved for handling sensitive client information." / "If you are caught reporting false or fabricated system status, you will be replaced…"
-- Referent-defining lists & definitions — the span a rule points at. When a rule says "follow it", "read these files", "this applies to everything", or "Use this to…", extract the list/definition/enumerated checks it refers to as its own item (e.g. the docker checks that define "everything", the numbered file list that defines "these files").
-- Templates, canned replies, and worked examples the agent emits — a quoted reply it should send verbatim ("Heads up — I'm not set up to handle sensitive client info safely…"), a sample JSON line, a "Topics include:…" list.
+THE RULE-vs-CONTEXT TEST: does this span, on its own, tell the agent to DO / NOT DO / MAY DO something? Yes → rule. Does it instead explain, illustrate, label, or set the scene? → context. A colon lead-in is a RULE when it commands ("Always do these before finishing:", "When encountering lint errors:") but CONTEXT when it only labels what follows ("Examples of…:", "What qualifies as…:", "Correct pattern:").
 
-COMMONLY MISSED — RULES (do not skip these):
-- Colon-terminated lead-ins that head a list or block. "This applies to everything:" / "Be honest about your limits:" / "Manage it well:" / "Always do these before finishing:" / "Include:". Extract the lead-in as its own item (a directive lead-in is a rule; a purely descriptive lead-in like "Topics include:" is context).
-- Markdown-formatted capability/permission bullets — each "- **Bold label** — description" line is its own item. "Read emails freely — check inbox, search by sender/subject/date…" / "Diagnostics: docker ps, docker logs…" / "You have access to the Giphy MCP tool." / "You can look up clients, appointments, invoices…"
-- Short imperative runs that together state one instruction. "Run the check. Read the actual log. Show the real output." / "When uncertain: run the check. Show the raw output. Let the data speak for itself."
+COVERAGE — extract every genuine directive; markdown structure and length are never reasons to skip. Sweep top to bottom; bulleted/numbered lists and fenced code/JSON blocks all hold content.
+- Short directives count: a terse one-liner under a header is a full item ("Be concise.").
+- Each "- **Label** — description" capability/permission bullet is its own item.
 
-TWO STRUCTURAL TRAPS that keep getting missed — both are mandatory:
-1) MARKDOWN STRUCTURE IS NEVER A REASON TO SKIP. A bulleted list, a numbered list, and a fenced ```code``` / ```json``` block all hold extractable content, not decoration to ignore. You MUST cover them: the docker-health checks, the numbered "read these files" list, the "Use this to:" list, the "General Tasks" list, the "Include: …" list, the research-permissions bullets, and EACH ```json incident block. (Whether a block becomes ONE item or one-item-per-bullet is decided by the GRANULARITY rule below — but never drop the structure entirely.)
-2) SHORT IS NOT SKIPPABLE. A terse one-line directive is a full item even when it is just a few words sitting as a sub-bullet under a header. Emit each of these on its own: "DO NOT expose contents" / "Be concise in memory entries." / "Keep entries tight." / "Don't duplicate existing entries." / "Log the incident — …" / "Knowledge.md is for lasting learnings." Never drop a directive just because it is short.
+PRECISION — do NOT manufacture items (the main source of uncorroborated noise):
+- Do not split one directive into fragments, and do not emit a heading, a restated example, or a pure rationale as a rule. Mark genuine framing as context; skip true filler only.
 
-GRANULARITY — one item per independently meaningful directive; do NOT over-merge:
-A later step fuses spans whose character ranges overlap, so a span that bundles two separate rules — or that bleeds past its own clause into the next — collapses distinct rules into one. Guard against it:
-- SPLIT a list into one item PER element whenever each element stands on its own — an independent directive, capability, fact, or prohibition. The email bullets "Read emails freely" / "Send emails" / "Manage" are THREE permissions, not one block; "Diagnostics…", "Restart services…", "Read files…", "Write to memory…" are each their own item; "You can't make purchases" and "You can't access other people's devices" are two prohibitions; "Be concise…", "Keep entries tight.", "Don't duplicate…" are three directives.
-- KEEP a block as ONE item only when its parts form a single unit that no element means on its own — the ordered steps of one procedure (the send-a-GIF steps), a list that exists only to enumerate/define one referent a rule points at (the checks that define "everything", the files that define "these files", the "Include:" sub-list), or a ```json``` example block.
-- THE TEST: could this line stand alone as its own rule you would check independently? If yes → its own item. If it is meaningful only as a step in a sequence or one entry in a single definition → part of the block.
-- TIGHT BOUNDARIES: start each span at the first word of its own directive and end at its last; never let a span run into the neighbouring directive — an overlapping span merges two rules downstream. When one sentence joins two independently-checkable directives ("do X, and do Y"), prefer two items.
+GRANULARITY — one item per independently meaningful directive.
+- THE TEST: could this line stand alone as a rule you'd check on its own? Yes → its own item. Meaningful only as one step of a procedure, or one entry in a list that defines a single referent → part of that block.
+- SPLIT a list into one item per element when each element is an independent directive, fact, or permission.
+- KEEP a block as one item only when its parts form a single unit (ordered steps of one procedure; a list that only defines one referent; a ```json``` example block).
+- TIGHT BOUNDARIES: start at the first word of the directive, end at its last; never bleed into the next directive (overlap merges two rules downstream). "Do X, and do Y" → two items.
 
-Guidelines:
-- Use exact or near-exact quotes from the document for "rule_text".
-- Skip only truly empty filler with neither directive force nor framing value. A list or code block is never "empty filler".
+VERBATIM: "rule_text" must be an EXACT substring copied from the document — same characters, punctuation, and markdown, no paraphrase, no added or dropped words. (Spans that don't match the source are dropped.)
 
-For each item, write a short "rationale": ONE plain-English sentence on why this span is an atomic rule or context. Keep it simple and conversational.
+Apply these criteria mechanically and in document order. For each item write a "rationale": ONE plain-English sentence on why it is a rule or context.
 
-Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single line — no markdown fences, no indentation. Each element:
-{"rule_text": "<exact or near-exact quote>", "kind": "rule|context", "rationale": "<one short plain-English sentence>"}</script>
+Return ONLY a valid minified JSON array on one line — no markdown fences, no indentation. Each element:
+{"rule_text":"<exact quote>","kind":"rule|context","rationale":"<one short sentence>"}</script>
 
 <script type="text/plain" id="defaultLabelPrompt">You are a LABELING judge. You are given a numbered list of RULES already extracted from the document (each with an R-label like R1, R2). Assign exactly ONE deontic tag to each rule.
 
@@ -3016,6 +3223,7 @@ Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single 
         <button id="modeRelBtn" onclick="setMode('relation')">Relation</button>
       </div>
       <span class="sel-info" id="selInfo"></span>
+      <select class="run-select" id="runSelect" title="Extraction run — shared across users. Switch to view a different batch (labels/relations follow)." onchange="selectBatch(this.value)"></select>
       <button class="comment-btn" id="commentBtn" onclick="toggleComment()" title="File comment (⌘?)">✎ Comment</button>
       <button class="judge-btn" id="judgeBtn" onclick="toggleTool()">LLM judge</button>
       <button class="add-btn" id="addBtn" disabled onclick="addHandRule()" title="Add the selected text as a rule (⌘A)">+ Add</button>
@@ -3106,6 +3314,8 @@ const S = {
   allFiles:      [],
   currentFile:   null,
   rules:         [],
+  batches:       [],        // shared extraction runs for the open file (newest first)
+  batchId:       null,      // the selected shared batch (extraction is shared; labels per-user)
   selection:     null,
   focusedRuleId: null,
   inspectorOpen: false,
@@ -3395,8 +3605,10 @@ function fadeRgba(c, mult) {
 function setInspWidth(px, save=true) {
   const layout = document.querySelector('.layout');
   const filePanel = document.querySelector('.file-panel');
-  const maxW = layout && filePanel
-    ? Math.max(INSP_MIN, Math.min(INSP_MAX, layout.clientWidth - filePanel.clientWidth - 340 - 8))
+  const runsPanel = document.querySelector('.runs-panel');
+  const sideW = (filePanel ? filePanel.clientWidth : 0) + (runsPanel ? runsPanel.clientWidth : 0);
+  const maxW = layout
+    ? Math.max(INSP_MIN, Math.min(INSP_MAX, layout.clientWidth - sideW - 340 - 8))
     : INSP_MAX;
   const width = clamp(Math.round(px), INSP_MIN, maxW);
   document.documentElement.style.setProperty('--insp-panel-width', `${width}px`);
@@ -3591,11 +3803,24 @@ async function refreshForAnnotator() {
   if (Array.isArray(files)) { S.allFiles = files; renderFileList(files); }
   loadFileComment();   // the comment is per-annotator — refetch on switch
   if (S.currentFile) {
-    const rules = await api(`/api/rules/${S.currentFile.id}?annotator=${encodeURIComponent(S.userName)}`);
+    // Batches are SHARED (same list), but the per-user batch pick + labels/relations follow the
+    // new annotator — re-pick the default batch and reload everything scoped to (batch, user).
+    const id = S.currentFile.id;
+    const bs = await api(`/api/batches/${id}`);
+    S.batches = Array.isArray(bs) ? bs : [];
+    S.batchId = pickDefaultBatch(id);
+    const aq = scopeQS();
+    const [rules, relations, jdata] = await Promise.all([
+      api(`/api/rules/${id}${aq}`), api(`/api/relations/${id}${aq}`), api(`/api/judge-data/${id}${aq}`),
+    ]);
     if (Array.isArray(rules)) { S.rules = rules; sortRules(); }
+    S.relations = Array.isArray(relations) ? relations : [];
+    normalizeJudgeData(jdata);
     S.focusedRuleId = null; S.selection = null; S.toolMode = false; S.undoStack = [];
+    S.relSource = S.relTarget = S.focusedRelId = null;
     document.getElementById('addBtn').disabled = true;
     document.getElementById('judgeBtn').classList.remove('active');
+    renderRunsPanel();
     renderJudgeModal();
     renderViewer();
     renderRightPanel();
@@ -3642,15 +3867,34 @@ function filterFiles(q) {
 }
 
 // ─── Select file ─────────────────────────────────────────────
+function batchKey(fid) { return 'batch.' + (S.userName || '') + '.' + fid; }
+// Query string scoping every per-file fetch to the current annotator + selected batch.
+function scopeQS() {
+  const p = [];
+  if (S.userName) p.push('annotator=' + encodeURIComponent(S.userName));
+  if (S.batchId)  p.push('batch=' + encodeURIComponent(S.batchId));
+  return p.length ? '?' + p.join('&') : '';
+}
+function pickDefaultBatch(fid) {
+  if (!S.batches.length) return null;
+  const want = localStorage.getItem(batchKey(fid));
+  if (want && S.batches.some(b => b.batch_id === want)) return want;
+  return S.batches[0].batch_id;   // newest
+}
 async function selectFile(id) {
   if (S.judgeRunning) return;   // locked while a judge run is in flight
-  const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
-  const [file, rules, relations, jdata] = await Promise.all([
-    api(`/api/file/${id}`), api(`/api/rules/${id}${aq}`), api(`/api/relations/${id}${aq}`),
-    api(`/api/judge-data/${id}${aq}`),
-  ]);
+  // Load the file + its SHARED batch history first, choose the active batch, then load that
+  // batch's rules/relations/votes (extraction is shared; labels/relations are per-user).
+  const [file, batches] = await Promise.all([api(`/api/file/${id}`), api(`/api/batches/${id}`)]);
   if (file.error) return;
-  S.currentFile = file; S.rules = rules; sortRules();
+  S.currentFile = file;
+  S.batches = Array.isArray(batches) ? batches : [];
+  S.batchId = pickDefaultBatch(id);
+  const aq = scopeQS();
+  const [rules, relations, jdata] = await Promise.all([
+    api(`/api/rules/${id}${aq}`), api(`/api/relations/${id}${aq}`), api(`/api/judge-data/${id}${aq}`),
+  ]);
+  S.rules = Array.isArray(rules) ? rules : []; sortRules();
   S.relations = Array.isArray(relations) ? relations : [];
   normalizeJudgeData(jdata);
   S.relSource = S.relTarget = S.focusedRelId = null;
@@ -3663,6 +3907,7 @@ async function selectFile(id) {
   document.getElementById('commentBtn').classList.remove('active');
   setSelInfo(null);
   renderFileList(S.allFiles);
+  renderRunsPanel();
   renderViewerHead(file);
   renderViewer();
   document.getElementById('viewerBody').scrollTop = 0;   // new file → start at the top
@@ -3672,6 +3917,49 @@ async function selectFile(id) {
   renderModeToggle();     // apply +Add visibility for the current mode
   renderRelBuild();       // hide the relation-build bar for the new file
   loadFileComment();      // async; fills the green has-comment indicator
+}
+
+// Switch the SELECTED shared batch: reload that batch's rules + this user's labels/relations/votes.
+// (Extraction is shared; labels/relations are per-user, scoped to the batch.)
+async function selectBatch(batchId) {
+  if (S.judgeRunning || !S.currentFile || batchId === S.batchId) return;
+  S.batchId = batchId;
+  localStorage.setItem(batchKey(S.currentFile.id), batchId);
+  const id = S.currentFile.id, aq = scopeQS();
+  const [rules, relations, jdata] = await Promise.all([
+    api(`/api/rules/${id}${aq}`), api(`/api/relations/${id}${aq}`), api(`/api/judge-data/${id}${aq}`),
+  ]);
+  S.rules = Array.isArray(rules) ? rules : []; sortRules();
+  S.relations = Array.isArray(relations) ? relations : [];
+  normalizeJudgeData(jdata);
+  S.focusedRuleId = null; S.selection = null; S.relSource = S.relTarget = S.focusedRelId = null;
+  S.editingRuleId = null; S.editSelection = null; S.undoStack = [];
+  document.getElementById('addBtn').disabled = true;
+  setSelInfo(null);
+  renderRunsPanel(); renderViewer(); renderRightPanel(); renderJudgeModal();
+}
+
+function fmtBatchTime(ts) {
+  try { return new Date((ts || '').replace(' ', 'T') + 'Z').toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}); }
+  catch (e) { return ts || ''; }
+}
+// The "Runs" toggle in the top bar: a dropdown of the file's SHARED extraction runs. The
+// selected batch drives the view (its shared spans + this user's labels/relations).
+function renderRunsPanel() {
+  const sel = document.getElementById('runSelect');
+  if (!sel) return;
+  if (!S.currentFile || !S.batches.length) {
+    sel.innerHTML = '<option value="">— no runs yet —</option>';
+    sel.disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  sel.innerHTML = S.batches.map(b => {
+    const models = (b.models || []).map(prettyModel).join(', ');
+    const lab = `${fmtBatchTime(b.created_at)}${b.mode === 'revise' ? ' · revise' : ''} · ${b.rule_count}`
+              + ` · ${b.creator || '—'}${models ? ' [' + models + ']' : ''}`;
+    return `<option value="${b.batch_id}"${b.batch_id === S.batchId ? ' selected' : ''}>${esc(lab)}</option>`;
+  }).join('');
 }
 
 function renderViewerHead(file) {
@@ -4809,6 +5097,25 @@ function voteColor(mode, val) {
   return TYPE_BADGE[val] || '#b8b8c4';   // label: tag colour; null/abstain → grey
 }
 // Conic-gradient agreement ring from a list of votes. `onclick` opens the inspector.
+// Friendly model display name: anthropic/claude-opus-4-8 → "Opus 4.8", openai/gpt-5.5 → "GPT 5.5".
+function prettyModel(m) {
+  const slug = String(m || '').split('/').pop();
+  const MAP = {
+    'claude-opus-4-8': 'Opus 4.8', 'claude-opus-4-6': 'Opus 4.6',
+    'claude-sonnet-4-6': 'Sonnet 4.6', 'claude-sonnet-4-5': 'Sonnet 4.5', 'claude-haiku-4-5': 'Haiku 4.5',
+    'gpt-5.5': 'GPT 5.5', 'gpt-5': 'GPT 5', 'gpt-5-mini': 'GPT 5 Mini',
+    'gemini-3.1-pro-preview': 'Gemini 3.1 Pro', 'gemini-3.5-flash': 'Gemini 3.5 Flash',
+    'gemini-2.5-pro': 'Gemini 2.5 Pro', 'gemini-2.5-flash': 'Gemini 2.5 Flash',
+    'grok-4.3': 'Grok 4.3', 'grok-4': 'Grok 4',
+    'sonar': 'Sonar', 'sonar-pro': 'Sonar Pro',
+    'sonar-reasoning': 'Sonar Reasoning', 'sonar-reasoning-pro': 'Sonar Reasoning Pro',
+  };
+  if (MAP[slug]) return MAP[slug];
+  // generic fallback: version dashes → dots (4-8 → 4.8), then Title Case
+  return slug.replace(/(\d)-(\d)/g, '$1.$2').split('-')
+    .map(w => /^(gpt|ai|llm)$/i.test(w) ? w.toUpperCase() : (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(' ');
+}
 function voteRingHTML(votes, mode, onclick, title) {
   if (!votes || !votes.length) return '';
   const n = votes.length, seg = 100 / n;
@@ -4837,7 +5144,7 @@ function openVoteInspector(mode, key) {
     `<span class="vi-chip" style="background:${voteColor(mode, val === '—' ? null : val)}">`
     + `${esc(val)} ${n}/${votes.length} · ${Math.round(100 * n / total)}%</span>`).join('');
   const rows = votes.map(v => `<tr>
-    <td class="vi-model">${esc((v.model || '').split('/').pop())}</td>
+    <td class="vi-model">${esc(prettyModel(v.model))}</td>
     <td class="vi-vote" style="color:${voteColor(mode, v.value)}">${esc(v.value || '—')}</td>
     <td class="vi-rat">${esc(v.rationale || '')}</td></tr>`).join('');
   document.getElementById('voteInspector')?.remove();
@@ -5061,7 +5368,7 @@ function judgeProgressHTML() {
   const noun = p.mode === 'relation' ? 'relations' : (p.mode === 'label' ? 'tags' : 'rules');
   const rows = p.judges.map((j, i) => `
     <div class="jp-item">
-      <span class="jp-name">Judge ${i + 1} · ${esc((j.model || '').split('/').pop())}</span>
+      <span class="jp-name">Judge ${i + 1} · ${esc(prettyModel(j.model))}</span>
       <div class="jp-bar jp-${j.status}"><div class="jp-fill"></div></div>
     </div>`).join('');
   const head = aggregating
@@ -5322,6 +5629,7 @@ async function runJudge(modeOverride) {
   const started = await api('/api/judge', 'POST', {
     file_id: S.currentFile.id, mode, prompt, threshold: cfg.threshold,
     judges: cfg.judges, annotator: S.userName || 'unknown',
+    batch_id: S.batchId, source_batch_id: S.batchId,   // label/relation use batch_id; revise uses source_batch_id
   });
   if (started.error || !started.run_id) {
     S.judgeRunning = false; S.judgeProgress = null;
@@ -5348,7 +5656,16 @@ async function runJudge(modeOverride) {
   // job may still have committed, and a transient blip on the final poll must not be
   // mistaken for failure (the server sets `error` only together with `done`).
   const res = (prog && prog.result) || {};
-  const aq = S.userName ? `?annotator=${encodeURIComponent(S.userName)}` : '';
+  // Extract/Revise created a NEW shared batch → refresh the history + auto-select it so the
+  // reload shows the new round.
+  if ((mode === 'extract' || mode === 'revise') && S.currentFile) {
+    const bs = await api(`/api/batches/${S.currentFile.id}`);
+    if (Array.isArray(bs)) S.batches = bs;
+    if (res.batch_id) { S.batchId = res.batch_id; localStorage.setItem(batchKey(S.currentFile.id), res.batch_id); }
+    else if (S.batches.length) S.batchId = S.batches[0].batch_id;
+    renderRunsPanel();
+  }
+  const aq = scopeQS();
   const [rules, relations, jdata] = await Promise.all([
     api(`/api/rules/${S.currentFile.id}${aq}`),
     api(`/api/relations/${S.currentFile.id}${aq}`),
@@ -5551,6 +5868,12 @@ function doExport(scope) {
 
 // ─── Helpers ─────────────────────────────────────────────────
 async function api(url, method = 'GET', body = null) {
+  // Rule/relation mutations are PER-USER + scoped to the selected batch — auto-attach
+  // batch_id + annotator so every caller (setTag, +Add, relations, comments…) is batch-aware.
+  if (body && (method === 'POST' || method === 'PATCH') && /\/api\/(rules|relations)\b/.test(url)) {
+    if (body.batch_id === undefined && S.batchId) body.batch_id = S.batchId;
+    if (body.annotator === undefined && S.userName) body.annotator = S.userName;
+  }
   try {
     const opts = { method, headers: {} };
     if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
