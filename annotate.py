@@ -505,6 +505,63 @@ def _accepted_spans(con, fid, batch_id, threshold, content):
                     "ls": content[:cs].count("\n") + 1, "le": content[:ce].count("\n") + 1, "vote_count": nj})
     return out
 
+@app.route("/api/judges/<fid>")
+def api_judges(fid):
+    """Every extract/revise JUDGE RESULT ever recorded for this file — one entry per
+    (run, judge slot): its model, the run's timestamp, and how many spans it proposed.
+    Powers the Runs panel's by-model judge explorer. Newest run first."""
+    con = annot_con()
+    rows = con.execute(
+        "SELECT v.run_id, v.judge_idx, v.model,"
+        " count(*) FILTER (WHERE v.char_start IS NOT NULL) AS span_count,"
+        " r.created_at, v.batch_id"
+        " FROM judge_votes v LEFT JOIN judge_runs r ON r.id = v.run_id"
+        " WHERE v.file_id=? AND v.mode IN ('extract','revise')"
+        " GROUP BY v.run_id, v.judge_idx, v.model, r.created_at, v.batch_id"
+        " ORDER BY r.created_at DESC NULLS LAST, v.run_id, v.judge_idx", [fid]).fetchall()
+    con.close()
+    return jsonify([{"run_id": r[0], "judge_idx": r[1], "model": r[2], "span_count": r[3],
+                     "created_at": str(r[4]) if r[4] is not None else "", "batch_id": r[5]} for r in rows])
+
+@app.route("/api/aggregate/<fid>", methods=["POST"])
+def api_aggregate(fid):
+    """Pool a USER-SELECTED set of judge results (across runs/models) and cluster their
+    extract/revise span votes: a span is ACCEPTED when >= threshold distinct selected
+    judges proposed it, else a (below-threshold) CANDIDATE. Pure recompute from stored
+    votes — NO LLM. View-only: returns char spans for a read-only consensus overlay."""
+    b = request.get_json(silent=True) or {}
+    sel = b.get("selection") or []
+    try: thr = int(b.get("threshold") or 1)
+    except Exception: thr = 1
+    keys = set()
+    for s in sel:
+        try: keys.add((str(s.get("run_id")), int(s.get("judge_idx"))))
+        except Exception: pass
+    if not keys:
+        return jsonify({"accepted": [], "candidates": [], "judge_total": 0})
+    con = annot_con()
+    vrows = con.execute(
+        "SELECT run_id, judge_idx, char_start, char_end, kind FROM judge_votes"
+        " WHERE file_id=? AND mode IN ('extract','revise')"
+        "   AND char_start IS NOT NULL AND char_end IS NOT NULL", [fid]).fetchall()
+    con.close()
+    spans = [{"voter": f"{r[0]}:{r[1]}", "char_start": r[2], "char_end": r[3], "kind": r[4]}
+             for r in vrows if (str(r[0]), int(r[1])) in keys]
+    crow = sample_con().execute("SELECT content FROM sample WHERE id=?", [fid]).fetchone()
+    content = (crow[0] if crow else "") or ""
+    n_sel = len(keys)
+    thr = max(1, min(thr, n_sel))
+    accepted, candidates = [], []
+    for grp in _cluster_spans(spans):
+        nj = len({s["voter"] for s in grp})
+        cs, ce = _median([s["char_start"] for s in grp]), _median([s["char_end"] for s in grp])
+        if not content[cs:ce].strip(): continue
+        kinds = [s["kind"] for s in grp]
+        kind = "context" if kinds.count("context") > kinds.count("rule") else "rule"
+        (accepted if nj >= thr else candidates).append(
+            {"char_start": cs, "char_end": ce, "kind": kind, "vote_count": nj})
+    return jsonify({"accepted": accepted, "candidates": candidates, "judge_total": n_sel})
+
 @app.route("/api/rules/<fid>")
 def api_rules(fid):
     # Shared extraction spans of the chosen batch (owner NULL) + this user's own hand/fork rows,
@@ -2769,6 +2826,59 @@ kbd {
 .thr-val { font-size: 12px; color: #4338ca; font-weight: 700; min-width: 116px; }
 .thr-val small { color: #9090b0; font-weight: 500; }
 
+/* ── Runs / per-run threshold panel ── */
+.runs-btn {
+  padding: 3px 12px; border-radius: 20px; border: 1.5px solid #7c3aed;
+  color: #7c3aed; background: transparent; font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: all 0.12s; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.runs-btn:hover { background: #7c3aed; color: #fff; }
+.runs-btn.active { background: #7c3aed; color: #fff; }
+.runs-card { width: min(560px, 92vw); height: auto; max-height: 84vh; }
+.runs-sub { font-size: 11px; color: #9090b0; margin-left: 4px; }
+.runs-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 4px; }
+.run-row { display: flex; align-items: center; gap: 10px; padding: 9px 11px;
+  border: 1px solid #ececf4; border-radius: 9px; cursor: pointer; transition: all 0.1s; }
+.run-row:hover { background: #f7f7fc; border-color: #ddd; }
+.run-row.active { border-color: #7c3aed; background: #f5f1ff; }
+.run-dot { color: #7c3aed; font-size: 11px; width: 12px; flex-shrink: 0; text-align: center; }
+.run-main { flex: 1; min-width: 0; }
+.run-line1 { display: flex; align-items: center; gap: 8px; }
+.run-time { font-size: 12.5px; font-weight: 700; color: #2a2a40; }
+.run-badge { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .3px;
+  padding: 1px 6px; border-radius: 9px; background: #eef2ff; color: #4338ca; }
+.run-badge.revise { background: #d1fae5; color: #059669; }
+.run-thr { margin-left: auto; font-size: 11px; font-weight: 700; color: #8a8aa6; font-variant-numeric: tabular-nums; }
+.run-line2 { font-size: 11px; color: #8a8aa6; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.runs-thr { border-top: 1px solid #eaeaf2; padding-top: 12px; margin-top: 6px; display: flex; flex-direction: column; gap: 8px; }
+.runs-thr-head { font-size: 12px; font-weight: 700; color: #2a2a40; }
+.runs-muted { font-size: 11px; color: #9090b0; font-weight: 500; }
+.runs-thr-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 26px; }
+/* judge-consensus explorer: lighter backdrop + left-anchored card so the document stays visible/updates live */
+.runs-backdrop { justify-content: flex-start; background: rgba(22, 22, 44, 0.12); }
+.runs-card { width: min(440px, 92vw); }
+.je-hint { font-size: 11px; color: #8a8aa6; line-height: 1.45; margin-bottom: 2px; }
+.je-list { display: flex; flex-direction: column; gap: 4px; }
+.je-group { border: 1px solid #ececf4; border-radius: 9px; padding: 1px 4px; }
+.je-model { display: flex; align-items: center; gap: 8px; padding: 7px 6px; border-radius: 6px; }
+.je-model.je-exp { cursor: pointer; }
+.je-model.je-exp:hover { background: #f7f7fc; }
+.je-cb { width: 15px; height: 15px; accent-color: #7c3aed; cursor: pointer; flex-shrink: 0; margin: 0; }
+.je-mname { font-size: 12.5px; font-weight: 700; color: #2a2a40; }
+.je-count { margin-left: auto; font-size: 10px; color: #9090b0; font-weight: 700; font-variant-numeric: tabular-nums; }
+.je-caret { width: 12px; text-align: center; flex-shrink: 0; color: #9090b0; font-size: 11px; }
+.je-run { display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 22px; }
+.je-run + .je-run { border-top: 1px solid #f4f4fa; }
+.je-time { font-size: 11.5px; color: #44445a; }
+.je-spans { margin-left: auto; font-size: 10px; color: #9090b0; font-variant-numeric: tabular-nums; }
+.exp-head { font-size: 10px; font-weight: 700; color: #8a8aa6; text-transform: uppercase; letter-spacing: .4px; margin: 12px 0 5px; }
+.exp-list { display: flex; flex-direction: column; gap: 5px; max-height: 28vh; overflow: auto; }
+.exp-item { display: flex; align-items: center; gap: 8px; font-size: 11.5px; }
+.exp-ring { font-size: 10px; font-weight: 700; color: #4338ca; min-width: 30px; font-variant-numeric: tabular-nums; }
+.exp-item.exp-ctx .exp-ring { color: #b45309; }
+.exp-txt { color: #44445a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.exp-acc { border-radius: 2px; }
+
 /* ── Per-judge progress (loading screen) ── */
 .jp-list { display: flex; flex-direction: column; gap: 14px; width: min(520px, 80%); margin-top: 22px; }
 .jp-item { display: flex; flex-direction: column; gap: 6px; }
@@ -3224,6 +3334,7 @@ Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single 
       </div>
       <span class="sel-info" id="selInfo"></span>
       <select class="run-select" id="runSelect" title="Extraction run — shared across users. Switch to view a different batch (labels/relations follow)." onchange="selectBatch(this.value)"></select>
+      <button class="runs-btn" id="runsBtn" onclick="toggleRuns()" title="Run history &amp; acceptance threshold">⚖ Runs</button>
       <button class="comment-btn" id="commentBtn" onclick="toggleComment()" title="File comment (⌘?)">✎ Comment</button>
       <button class="judge-btn" id="judgeBtn" onclick="toggleTool()">LLM judge</button>
       <button class="add-btn" id="addBtn" disabled onclick="addHandRule()" title="Add the selected text as a rule (⌘A)">+ Add</button>
@@ -3316,6 +3427,12 @@ const S = {
   rules:         [],
   batches:       [],        // shared extraction runs for the open file (newest first)
   batchId:       null,      // the selected shared batch (extraction is shared; labels per-user)
+  runsOpen:      false,     // the Runs panel (judge-consensus explorer)
+  judgeList:     [],        // every recorded extract/revise judge result for the open file
+  judgeSel:      null,      // Set of selected "run_id:judge_idx" voters
+  judgeExpanded: null,      // Set of models expanded in the explorer
+  selThreshold:  2,         // >=K of the SELECTED judges must agree
+  explore:       { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: 1 },
   selection:     null,
   focusedRuleId: null,
   inspectorOpen: false,
@@ -3809,6 +3926,7 @@ async function refreshForAnnotator() {
     const bs = await api(`/api/batches/${id}`);
     S.batches = Array.isArray(bs) ? bs : [];
     S.batchId = pickDefaultBatch(id);
+    S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: 1 };
     const aq = scopeQS();
     const [rules, relations, jdata] = await Promise.all([
       api(`/api/rules/${id}${aq}`), api(`/api/relations/${id}${aq}`), api(`/api/judge-data/${id}${aq}`),
@@ -3824,6 +3942,7 @@ async function refreshForAnnotator() {
     renderJudgeModal();
     renderViewer();
     renderRightPanel();
+    renderRunsModal();
   }
 }
 
@@ -3890,6 +4009,8 @@ async function selectFile(id) {
   S.currentFile = file;
   S.batches = Array.isArray(batches) ? batches : [];
   S.batchId = pickDefaultBatch(id);
+  S.judgeList = []; S.judgeSel = null; S.judgeExpanded = null;   // explorer is per-file
+  S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: 1 };
   const aq = scopeQS();
   const [rules, relations, jdata] = await Promise.all([
     api(`/api/rules/${id}${aq}`), api(`/api/relations/${id}${aq}`), api(`/api/judge-data/${id}${aq}`),
@@ -3902,6 +4023,7 @@ async function selectFile(id) {
   S.editingRuleId = null; S.editSelection = null;
   S.undoStack = [];   // undo history is per file
   S.commentMode = false; S.fileComment = '';
+  S.runsOpen = false;
   document.getElementById('addBtn').disabled = true;
   document.getElementById('judgeBtn').classList.remove('active');
   document.getElementById('commentBtn').classList.remove('active');
@@ -3914,6 +4036,7 @@ async function selectFile(id) {
   renderRightPanel();
   renderJudgeModal();     // close the judge modal if it was open
   renderCommentModal();   // close the comment panel if it was open
+  renderRunsModal();      // close the runs panel if it was open
   renderModeToggle();     // apply +Add visibility for the current mode
   renderRelBuild();       // hide the relation-build bar for the new file
   loadFileComment();      // async; fills the green has-comment indicator
@@ -3924,6 +4047,7 @@ async function selectFile(id) {
 async function selectBatch(batchId) {
   if (S.judgeRunning || !S.currentFile || batchId === S.batchId) return;
   S.batchId = batchId;
+  S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: 1 };   // leave the consensus view
   localStorage.setItem(batchKey(S.currentFile.id), batchId);
   const id = S.currentFile.id, aq = scopeQS();
   const [rules, relations, jdata] = await Promise.all([
@@ -3936,7 +4060,7 @@ async function selectBatch(batchId) {
   S.editingRuleId = null; S.editSelection = null; S.undoStack = [];
   document.getElementById('addBtn').disabled = true;
   setSelInfo(null);
-  renderRunsPanel(); renderViewer(); renderRightPanel(); renderJudgeModal();
+  renderRunsPanel(); renderViewer(); renderRightPanel(); renderJudgeModal(); renderRunsModal();
 }
 
 function fmtBatchTime(ts) {
@@ -3946,6 +4070,7 @@ function fmtBatchTime(ts) {
 // The "Runs" toggle in the top bar: a dropdown of the file's SHARED extraction runs. The
 // selected batch drives the view (its shared spans + this user's labels/relations).
 function renderRunsPanel() {
+  renderRunsBtn();
   const sel = document.getElementById('runSelect');
   if (!sel) return;
   if (!S.currentFile || !S.batches.length) {
@@ -3960,6 +4085,231 @@ function renderRunsPanel() {
               + ` · ${b.creator || '—'}${models ? ' [' + models + ']' : ''}`;
     return `<option value="${b.batch_id}"${b.batch_id === S.batchId ? ' selected' : ''}>${esc(lab)}</option>`;
   }).join('');
+}
+
+// The top-bar "⚖ Runs" button; lit with the live threshold while a consensus view is active.
+function renderRunsBtn() {
+  const btn = document.getElementById('runsBtn');
+  if (!btn) return;
+  if (S.explore && S.explore.active) {
+    btn.textContent = `⚖ ≥${S.explore.threshold}/${S.explore.judgeTotal}`;
+    btn.classList.add('active');
+  } else {
+    btn.textContent = '⚖ Runs';
+    btn.classList.remove('active');
+  }
+}
+
+// ─── Runs / judge-consensus explorer ─────────────────────────────────────────
+// The Runs panel lists EVERY judge result recorded for this file (grouped by model,
+// expandable across re-runs) with a checkbox each. The checked judges' stored span
+// votes are pooled and clustered; a span is "accepted" when >= threshold distinct
+// checked judges proposed it. Pure recompute from judge_votes — NO LLM. View-only:
+// it paints a read-only consensus overlay on the document (S.rules is untouched).
+function selKey(j) { return j.run_id + ':' + j.judge_idx; }
+
+async function loadJudges() {
+  S.judgeList = [];
+  if (!S.currentFile) return;
+  const list = await api(`/api/judges/${S.currentFile.id}`);
+  S.judgeList = Array.isArray(list) ? list : [];
+  // Default selection = the judges of the most recent run; threshold = strict majority.
+  if (!S.judgeSel || !S.judgeSel.size) {
+    S.judgeSel = new Set();
+    const newest = S.judgeList[0];
+    if (newest) for (const j of S.judgeList.filter(x => x.run_id === newest.run_id)) S.judgeSel.add(selKey(j));
+    S.selThreshold = majorityThreshold(S.judgeSel.size || 1);
+  }
+}
+
+// Group judge results by model (each group keeps its run instances, newest first).
+function judgeGroups() {
+  const m = new Map();
+  for (const j of (S.judgeList || [])) {
+    if (!m.has(j.model)) m.set(j.model, []);
+    m.get(j.model).push(j);
+  }
+  return [...m.entries()].map(([model, items]) => ({ model, items }))
+    .sort((a, b) => prettyModel(a.model).localeCompare(prettyModel(b.model)));
+}
+
+async function toggleRuns() {
+  if (!S.currentFile) return;
+  S.runsOpen = !S.runsOpen;
+  if (S.runsOpen) {
+    if (!S.judgeList || !S.judgeList.length) await loadJudges();
+    await recomputeExplore();   // paints the consensus overlay + lights the button
+  }
+  renderRunsModal();
+}
+
+function toggleJudge(runId, judgeIdx) {
+  if (!S.judgeSel) S.judgeSel = new Set();
+  const k = runId + ':' + judgeIdx;
+  if (S.judgeSel.has(k)) S.judgeSel.delete(k); else S.judgeSel.add(k);
+  S.selThreshold = Math.max(1, Math.min(S.selThreshold, S.judgeSel.size || 1));
+  recomputeExplore().then(renderRunsModal);
+}
+
+function toggleExpand(model) {
+  if (!S.judgeExpanded) S.judgeExpanded = new Set();
+  if (S.judgeExpanded.has(model)) S.judgeExpanded.delete(model); else S.judgeExpanded.add(model);
+  renderRunsModal();
+}
+
+// Live label while dragging (no fetch); the recompute fires on release (onchange).
+function selThrLabel(v) {
+  const N = (S.judgeSel && S.judgeSel.size) || 1;
+  const k = Math.max(1, Math.min(parseInt(v, 10) || 1, N));
+  const el = document.getElementById('selThrVal');
+  if (el) el.innerHTML = `${k} / ${N} selected <small>(${Math.round(100 * k / N)}%)</small>`;
+}
+function applySelThreshold(v) {
+  const N = (S.judgeSel && S.judgeSel.size) || 1;
+  S.selThreshold = Math.max(1, Math.min(parseInt(v, 10) || 1, N));
+  recomputeExplore().then(renderRunsModal);
+}
+
+// Pool the checked judges' votes at the threshold → consensus overlay (view-only, no LLM).
+async function recomputeExplore() {
+  if (!S.currentFile) return;
+  const selection = [...(S.judgeSel || [])].map(k => {
+    const i = k.lastIndexOf(':');
+    return { run_id: k.slice(0, i), judge_idx: parseInt(k.slice(i + 1), 10) };
+  });
+  if (!selection.length) {
+    S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: S.selThreshold };
+    renderRunsBtn(); renderViewer();
+    return;
+  }
+  const res = await api(`/api/aggregate/${S.currentFile.id}`, 'POST', { selection, threshold: S.selThreshold });
+  S.explore = {
+    active: true,
+    accepted: (res && res.accepted) || [],
+    candidates: (res && res.candidates) || [],
+    judgeTotal: (res && res.judge_total) || selection.length,
+    threshold: Math.max(1, Math.min(S.selThreshold, selection.length)),
+  };
+  renderRunsBtn(); renderViewer();
+}
+
+function resetExplore() {
+  S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: 1 };
+  renderRunsBtn(); renderViewer(); renderRunsModal();
+}
+
+function renderRunsModal() {
+  let modal = document.getElementById('runsModal');
+  if (!S.runsOpen || !S.currentFile) { if (modal) modal.remove(); return; }
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'runsModal';
+    modal.className = 'modal-backdrop runs-backdrop';
+    modal.addEventListener('mousedown', e => { if (e.target === modal) toggleRuns(); });
+    document.body.appendChild(modal);
+  }
+  const f = S.currentFile;
+  const fileName = f.repo_name ? f.repo_name.split('/').pop()
+    : (f.source_url || f.id).split('/').pop() || f.id;
+  if (!S.judgeSel) S.judgeSel = new Set();
+  if (!S.judgeExpanded) S.judgeExpanded = new Set();
+  const groups = judgeGroups();
+
+  const judgeHTML = groups.length ? groups.map(g => {
+    const items = g.items;
+    const selN = items.filter(j => S.judgeSel.has(selKey(j))).length;
+    const expanded = S.judgeExpanded.has(g.model) || items.length === 1;
+    const expandable = items.length > 1;
+    const head = `<div class="je-model${expandable ? ' je-exp' : ''}"${expandable ? ` onclick="toggleExpand('${esc(g.model)}')"` : ''}>
+        <span class="je-caret">${expandable ? (expanded ? '▾' : '▸') : ''}</span>
+        <span class="je-mname">${esc(prettyModel(g.model))}</span>
+        <span class="je-count">${selN}/${items.length}</span>
+      </div>`;
+    const leaves = expanded ? items.map(j => `
+        <div class="je-run">
+          <input type="checkbox" class="je-cb" ${S.judgeSel.has(selKey(j)) ? 'checked' : ''}
+                 onchange="toggleJudge('${esc(j.run_id)}', ${j.judge_idx})">
+          <span class="je-time">${esc(fmtBatchTime(j.created_at))}</span>
+          <span class="je-spans">${j.span_count} span${j.span_count === 1 ? '' : 's'}</span>
+        </div>`).join('') : '';
+    return `<div class="je-group">${head}${leaves}</div>`;
+  }).join('') : '<div class="insp-empty">No LLM judge runs recorded for this file.</div>';
+
+  const N = S.judgeSel.size;
+  const K = Math.max(1, Math.min(S.selThreshold, N || 1));
+  const E = S.explore || { accepted: [], candidates: [], active: false, judgeTotal: 0 };
+  const content = (f.content || '');
+  const acceptedList = (E.accepted || []).slice().sort((a, b) => a.char_start - b.char_start).map(s => {
+    const txt = content.slice(s.char_start, s.char_end).replace(/\s+/g, ' ').trim().slice(0, 90);
+    return `<div class="exp-item exp-${s.kind === 'context' ? 'ctx' : 'rule'}">
+        <span class="exp-ring">${s.vote_count}/${E.judgeTotal || N}</span>
+        <span class="exp-txt">${esc(txt)}</span></div>`;
+  }).join('');
+
+  const thrBlock = N >= 1 ? `
+      <div class="runs-thr">
+        <div class="runs-thr-head">Acceptance threshold <span class="runs-muted">· ${N} judge${N === 1 ? '' : 's'} selected · no LLM</span></div>
+        <div class="thr-row">
+          <span class="lbl">Accept ≥</span>
+          <input type="range" id="selThrRange" min="1" max="${N}" value="${K}"
+                 oninput="selThrLabel(this.value)" onchange="applySelThreshold(this.value)">
+          <span class="thr-val" id="selThrVal">${K} / ${N} selected <small>(${Math.round(100 * K / N)}%)</small></span>
+        </div>
+        <div class="runs-thr-foot">
+          <span class="runs-muted">${(E.accepted || []).length} accepted · ${(E.candidates || []).length} below threshold</span>
+          ${E.active ? `<button class="btn ghost" onclick="resetExplore()">↺ Clear view</button>` : ''}
+        </div>
+      </div>` : `<div class="runs-thr"><span class="runs-muted">Check one or more judges to see their consensus.</span></div>`;
+
+  modal.innerHTML = `
+    <div class="modal-card runs-card">
+      <div class="modal-head">
+        <span class="tool-title">Runs · judges</span>
+        <span class="runs-sub">${esc(fileName)}</span>
+        <div style="flex:1"></div>
+        <button class="insp-exit" onclick="toggleRuns()" title="Close (Esc)">✕</button>
+      </div>
+      <div class="modal-body" style="overflow:auto;display:block">
+        <div class="je-hint">Check the judge results to pool, then set the threshold. The document shows the accepted consensus (view-only).</div>
+        <div class="je-list">${judgeHTML}</div>
+        ${thrBlock}
+        ${E.active && acceptedList ? `<div class="exp-head">Accepted spans</div><div class="exp-list">${acceptedList}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+// View-only consensus overlay painter (used by renderContent when S.explore.active).
+function exploreContentHTML(content) {
+  const E = S.explore;
+  const ivs = [];
+  for (const s of (E.accepted || [])) if (s.char_end > s.char_start) ivs.push({ a: s.char_start, b: s.char_end, acc: s });
+  for (const s of (E.candidates || [])) if (s.char_end > s.char_start) ivs.push({ a: s.char_start, b: s.char_end, cand: s });
+  if (!ivs.length) return escHtml(content);
+  const pts = new Set([0, content.length]);
+  for (const iv of ivs) { pts.add(iv.a); pts.add(iv.b); }
+  const sorted = [...pts].filter(p => p >= 0 && p <= content.length).sort((x, y) => x - y);
+  let html = '';
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const p = sorted[i], q = sorted[i + 1];
+    if (q <= p) continue;
+    const seg = content.slice(p, q);
+    const cover = ivs.filter(iv => iv.a <= p && iv.b >= q);
+    const acc = cover.filter(c => c.acc), cand = cover.filter(c => c.cand);
+    if (acc.length) {
+      const kind = acc[0].acc.kind === 'context' ? 'context' : 'rule';
+      const nj = Math.max(...acc.map(c => c.acc.vote_count || 1));
+      const title = escAttr(`accepted ${kind} · ${nj}/${E.judgeTotal} judges`);
+      html += `<span class="exp-acc" style="background:${EXTRACT_COL[kind].act}" title="${title}">${escHtml(seg)}</span>`;
+    } else if (cand.length) {
+      const kind = cand[0].cand.kind === 'context' ? 'context' : 'rule';
+      const nj = Math.max(...cand.map(c => c.cand.vote_count || 1));
+      const title = escAttr(`candidate ${kind} · ${nj}/${E.judgeTotal} judges (below threshold)`);
+      html += `<span class="cand-hl" style="background:${EXTRACT_COL[kind].light}" title="${title}">${escHtml(seg)}</span>`;
+    } else {
+      html += escHtml(seg);
+    }
+  }
+  return html;
 }
 
 function renderViewerHead(file) {
@@ -4158,6 +4508,7 @@ function listBarColor(r) {
 
 // letter-based highlighting: segment text on every rule boundary, styled per mode.
 function renderContent(content, rules) {
+  if (S.explore && S.explore.active) return exploreContentHTML(content);   // read-only consensus overlay
   const ivs = [];
   for (const r of rules) {
     for (const [a, b] of getRuleSpans(r)) if (b > a) ivs.push({ a, b, r });
@@ -5665,6 +6016,9 @@ async function runJudge(modeOverride) {
     else if (S.batches.length) S.batchId = S.batches[0].batch_id;
     renderRunsPanel();
   }
+  // A fresh run added new judge results → reload the explorer list next open, leave consensus view.
+  S.judgeList = []; S.judgeSel = null;
+  S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: 1 };
   const aq = scopeQS();
   const [rules, relations, jdata] = await Promise.all([
     api(`/api/rules/${S.currentFile.id}${aq}`),
@@ -5677,6 +6031,7 @@ async function runJudge(modeOverride) {
   S.focusedRuleId = null; S.focusedRelId = S.relSource = S.relTarget = null;
   renderViewer();
   renderRightPanel();
+  renderRunsModal();
   refreshFileBadge(S.currentFile.id);
 
   const cleanDone = prog && prog.done && !prog.error;
@@ -5715,6 +6070,7 @@ document.addEventListener('keydown', e => {
   }
   if (e.key === 'Escape' && document.getElementById('exportMenu')) { closeExportMenu(); return; }
   if (e.key === 'Escape' && document.getElementById('voteInspector')) { document.getElementById('voteInspector').remove(); return; }
+  if (e.key === 'Escape' && S.runsOpen) { toggleRuns(); return; }
   // Ctrl/⌘+Z reverts the last add / labeling action. In a text field, let the browser
   // do its own text undo. (Shift+Z is left alone — no redo.)
   if ((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z') && !e.shiftKey) {
