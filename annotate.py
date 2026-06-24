@@ -254,6 +254,9 @@ def _ensure_schema(con):
     for tbl in ("relations", "judge_runs", "judge_votes"):
         try: con.execute(f"ALTER TABLE {tbl} ADD COLUMN batch_id VARCHAR")
         except Exception: pass
+    # per-judge sampling temperature, captured per vote (NULL for legacy runs predating this)
+    try: con.execute("ALTER TABLE judge_votes ADD COLUMN temperature DOUBLE")
+    except Exception: pass
 
 def _md_connect(target):
     # On Render, point DuckDB's extension/home dir at the writable /tmp so the
@@ -514,14 +517,15 @@ def api_judges(fid):
     rows = con.execute(
         "SELECT v.run_id, v.judge_idx, v.model,"
         " count(*) FILTER (WHERE v.char_start IS NOT NULL) AS span_count,"
-        " r.created_at, v.batch_id"
+        " r.created_at, v.batch_id, max(v.temperature) AS temperature"
         " FROM judge_votes v LEFT JOIN judge_runs r ON r.id = v.run_id"
         " WHERE v.file_id=? AND v.mode IN ('extract','revise')"
         " GROUP BY v.run_id, v.judge_idx, v.model, r.created_at, v.batch_id"
         " ORDER BY r.created_at DESC NULLS LAST, v.run_id, v.judge_idx", [fid]).fetchall()
     con.close()
     return jsonify([{"run_id": r[0], "judge_idx": r[1], "model": r[2], "span_count": r[3],
-                     "created_at": str(r[4]) if r[4] is not None else "", "batch_id": r[5]} for r in rows])
+                     "created_at": str(r[4]) if r[4] is not None else "", "batch_id": r[5],
+                     "temperature": r[6]} for r in rows])
 
 @app.route("/api/aggregate/<fid>", methods=["POST"])
 def api_aggregate(fid):
@@ -541,11 +545,12 @@ def api_aggregate(fid):
         return jsonify({"accepted": [], "candidates": [], "judge_total": 0})
     con = annot_con()
     vrows = con.execute(
-        "SELECT run_id, judge_idx, char_start, char_end, kind FROM judge_votes"
+        "SELECT run_id, judge_idx, char_start, char_end, kind, model FROM judge_votes"
         " WHERE file_id=? AND mode IN ('extract','revise')"
         "   AND char_start IS NOT NULL AND char_end IS NOT NULL", [fid]).fetchall()
     con.close()
-    spans = [{"voter": f"{r[0]}:{r[1]}", "char_start": r[2], "char_end": r[3], "kind": r[4]}
+    spans = [{"voter": f"{r[0]}:{r[1]}", "run_id": str(r[0]), "judge_idx": int(r[1]),
+              "char_start": r[2], "char_end": r[3], "kind": r[4], "model": r[5]}
              for r in vrows if (str(r[0]), int(r[1])) in keys]
     crow = sample_con().execute("SELECT content FROM sample WHERE id=?", [fid]).fetchone()
     content = (crow[0] if crow else "") or ""
@@ -558,9 +563,77 @@ def api_aggregate(fid):
         if not content[cs:ce].strip(): continue
         kinds = [s["kind"] for s in grp]
         kind = "context" if kinds.count("context") > kinds.count("rule") else "rule"
+        # Each selected judge's DECISION at this location: any overlapping vote (incl. a
+        # different kind) so the ring-click breakdown shows rule/context disagreement, not
+        # just the same-kind cluster members.
+        seen = {}
+        for s in spans:
+            if s["voter"] not in seen and _overlap_frac((cs, ce), (s["char_start"], s["char_end"])) >= 0.5:
+                seen[s["voter"]] = {"run_id": s["run_id"], "judge_idx": s["judge_idx"],
+                                    "model": s["model"], "kind": s["kind"]}
         (accepted if nj >= thr else candidates).append(
-            {"char_start": cs, "char_end": ce, "kind": kind, "vote_count": nj})
+            {"char_start": cs, "char_end": ce, "kind": kind, "vote_count": nj, "voters": list(seen.values())})
     return jsonify({"accepted": accepted, "candidates": candidates, "judge_total": n_sel})
+
+@app.route("/api/export/<fid>", methods=["POST"])
+def api_export_consensus(fid):
+    """CSV export for the judge-consensus explorer: the file body, the COMBINED accepted
+    consensus at the chosen threshold, and EACH selected judge's individual votes. Pure
+    recompute from stored votes (no LLM)."""
+    import csv, io
+    b = request.get_json(silent=True) or {}
+    sel = b.get("selection") or []
+    try: thr = int(b.get("threshold") or 1)
+    except Exception: thr = 1
+    keys = set()
+    for s in sel:
+        try: keys.add((str(s.get("run_id")), int(s.get("judge_idx"))))
+        except Exception: pass
+    crow = sample_con().execute("SELECT content, source_url, repo_name FROM sample WHERE id=?", [fid]).fetchone()
+    content = (crow[0] if crow else "") or ""
+    source_url = (crow[1] if crow else "") or ""
+    repo = (crow[2] if crow else "") or ""
+    con = annot_con()
+    vrows = con.execute(
+        "SELECT v.run_id, v.judge_idx, v.model, v.char_start, v.char_end, v.kind, v.rationale, r.created_at, v.temperature"
+        " FROM judge_votes v LEFT JOIN judge_runs r ON r.id = v.run_id"
+        " WHERE v.file_id=? AND v.mode IN ('extract','revise')"
+        "   AND v.char_start IS NOT NULL AND v.char_end IS NOT NULL", [fid]).fetchall()
+    con.close()
+    sel_votes = [row for row in vrows if (str(row[0]), int(row[1])) in keys]
+    n_sel = len(keys)
+    thr = max(1, min(thr, n_sel)) if n_sel else 1
+    def _lines(cs, ce): return (content[:cs].count("\n") + 1, content[:ce].count("\n") + 1)
+    # ── combined accepted consensus: clusters backed by >= threshold distinct selected judges ──
+    spans = [{"voter": f"{r[0]}:{r[1]}", "char_start": r[3], "char_end": r[4], "kind": r[5]} for r in sel_votes]
+    accepted = []
+    for grp in _cluster_spans(spans):
+        nj = len({s["voter"] for s in grp})
+        if nj < thr: continue
+        cs, ce = _median([s["char_start"] for s in grp]), _median([s["char_end"] for s in grp])
+        if not content[cs:ce].strip(): continue
+        kinds = [s["kind"] for s in grp]
+        kind = "context" if kinds.count("context") > kinds.count("rule") else "rule"
+        accepted.append((cs, ce, kind, nj))
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["record_type", "file_id", "source_url", "model", "run_time", "temperature", "judge_idx",
+                "kind", "char_start", "char_end", "line_start", "line_end",
+                "vote_count", "judge_total", "threshold", "rationale", "text"])
+    # 1) the file body (whole document, so the CSV is self-contained)
+    w.writerow(["file_body", fid, source_url, "", "", "", "", "", "", "", "", "", "", "", "", "", content])
+    # 2) the combined accepted consensus
+    for cs, ce, kind, nj in sorted(accepted):
+        ls, le = _lines(cs, ce)
+        w.writerow(["accepted", fid, source_url, "", "", "", "", kind, cs, ce, ls, le,
+                    nj, n_sel, thr, "", content[cs:ce]])
+    # 3) each selected judge's individual vote
+    for run_id, jidx, model, cs, ce, kind, rationale, created, temp in sorted(sel_votes, key=lambda r: (str(r[7]), r[1], r[3])):
+        ls, le = _lines(cs, ce)
+        w.writerow(["judge_vote", fid, source_url, model or "", str(created or ""),
+                    ("" if temp is None else temp), jidx,
+                    kind or "", cs, ce, ls, le, "", "", "", rationale or "", content[cs:ce]])
+    fname = f"consensus_{(repo or fid).replace('/', '_')}.csv"
+    return jsonify({"csv": buf.getvalue(), "filename": fname})
 
 @app.route("/api/rules/<fid>")
 def api_rules(fid):
@@ -1498,17 +1571,19 @@ def _save_run_and_votes(con, run_id, fid, annotator, mode, threshold, judges, vo
     # ONE batched multi-row INSERT instead of a network round-trip per vote — the
     # per-row version made the post-fanout "aggregating" wait take seconds on MotherDuck.
     if votes:
-        ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        ph = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         flat = []
         for k, v in enumerate(votes):
             vid = make_id(run_id, v.get("judge_idx"), v.get("rule_id") or "", v.get("source_id") or "",
                           v.get("target_id") or "", v.get("char_start"), v.get("char_end"), v.get("value") or "", k)
+            ji = v.get("judge_idx")
+            temp = judges[ji].get("temperature") if isinstance(ji, int) and 0 <= ji < len(judges) else None
             flat += [vid, run_id, fid, annotator or None, mode, v.get("judge_idx"), v.get("model"),
                      v.get("char_start"), v.get("char_end"), v.get("kind"), v.get("rule_id"),
-                     v.get("source_id"), v.get("target_id"), v.get("value"), v.get("rationale"), batch_id]
+                     v.get("source_id"), v.get("target_id"), v.get("value"), v.get("rationale"), batch_id, temp]
         con.execute(
             "INSERT OR IGNORE INTO judge_votes"
-            " (id,run_id,file_id,annotator,mode,judge_idx,model,char_start,char_end,kind,rule_id,source_id,target_id,value,rationale,batch_id)"
+            " (id,run_id,file_id,annotator,mode,judge_idx,model,char_start,char_end,kind,rule_id,source_id,target_id,value,rationale,batch_id,temperature)"
             " VALUES " + ",".join([ph] * len(votes)), flat)
 
 def _judge_gate(mode, fid, annotator, batch_id=None, source_batch_id=None):
@@ -2854,9 +2929,9 @@ kbd {
 .runs-thr-head { font-size: 12px; font-weight: 700; color: #2a2a40; }
 .runs-muted { font-size: 11px; color: #9090b0; font-weight: 500; }
 .runs-thr-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 26px; }
-/* judge-consensus explorer: lighter backdrop + left-anchored card so the document stays visible/updates live */
-.runs-backdrop { justify-content: flex-start; background: rgba(22, 22, 44, 0.12); }
-.runs-card { width: min(440px, 92vw); }
+/* judge-consensus explorer: centered, wider card over a lighter backdrop (document shows through) */
+.runs-backdrop { background: rgba(22, 22, 44, 0.12); }
+.runs-card { width: min(680px, 92vw); }
 .je-hint { font-size: 11px; color: #8a8aa6; line-height: 1.45; margin-bottom: 2px; }
 .je-list { display: flex; flex-direction: column; gap: 4px; }
 .je-group { border: 1px solid #ececf4; border-radius: 9px; padding: 1px 4px; }
@@ -2871,13 +2946,31 @@ kbd {
 .je-run + .je-run { border-top: 1px solid #f4f4fa; }
 .je-time { font-size: 11.5px; color: #44445a; }
 .je-spans { margin-left: auto; font-size: 10px; color: #9090b0; font-variant-numeric: tabular-nums; }
+.je-temp { margin-left: auto; font-size: 10px; color: #7c3aed; font-weight: 700; font-variant-numeric: tabular-nums; }
 .exp-head { font-size: 10px; font-weight: 700; color: #8a8aa6; text-transform: uppercase; letter-spacing: .4px; margin: 12px 0 5px; }
 .exp-list { display: flex; flex-direction: column; gap: 5px; max-height: 28vh; overflow: auto; }
 .exp-item { display: flex; align-items: center; gap: 8px; font-size: 11.5px; }
 .exp-ring { font-size: 10px; font-weight: 700; color: #4338ca; min-width: 30px; font-variant-numeric: tabular-nums; }
 .exp-item.exp-ctx .exp-ring { color: #b45309; }
 .exp-txt { color: #44445a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.exp-acc { border-radius: 2px; }
+.exp-acc { border-radius: 2px; cursor: pointer; }
+.exp-cand { cursor: pointer; }
+.exp-focused { box-shadow: inset 0 -2px 0 0 rgba(0,0,0,0.5); }
+/* consensus-explorer right-panel: kind filter + cards */
+.ex-filter { display: flex; gap: 6px; margin-top: 7px; }
+.ex-fbtn { font: inherit; font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 14px;
+  border: 1px solid #d8d8e8; background: #fff; color: #6060a0; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
+.ex-fbtn:hover { border-color: #7c3aed; color: #5b21b6; }
+.ex-fbtn.active { background: #7c3aed; border-color: #7c3aed; color: #fff; }
+.ex-fn { font-size: 9.5px; opacity: 0.85; font-variant-numeric: tabular-nums; }
+.ex-hint { font-size: 10.5px; color: #9090b0; margin-top: 7px; line-height: 1.4; }
+.ex-card { cursor: pointer; }
+.ex-cand { opacity: 0.5; }
+.ex-pos { font-size: 10px; color: #9090b0; }
+.ex-below { font-size: 8.5px; font-weight: 800; letter-spacing: .4px; text-transform: uppercase;
+  color: #9a6a00; background: #fff4d6; border-radius: 4px; padding: 1px 5px; }
+.rl-cand-head { font-size: 10px; font-weight: 700; color: #9090b0; text-transform: uppercase;
+  letter-spacing: .4px; margin: 12px 2px 6px; }
 
 /* ── Per-judge progress (loading screen) ── */
 .jp-list { display: flex; flex-direction: column; gap: 14px; width: min(520px, 80%); margin-top: 22px; }
@@ -3333,7 +3426,6 @@ Return ONLY a valid JSON array, no other text. Output MINIFIED JSON on a single 
         <button id="modeRelBtn" onclick="setMode('relation')">Relation</button>
       </div>
       <span class="sel-info" id="selInfo"></span>
-      <select class="run-select" id="runSelect" title="Extraction run — shared across users. Switch to view a different batch (labels/relations follow)." onchange="selectBatch(this.value)"></select>
       <button class="runs-btn" id="runsBtn" onclick="toggleRuns()" title="Run history &amp; acceptance threshold">⚖ Runs</button>
       <button class="comment-btn" id="commentBtn" onclick="toggleComment()" title="File comment (⌘?)">✎ Comment</button>
       <button class="judge-btn" id="judgeBtn" onclick="toggleTool()">LLM judge</button>
@@ -3917,7 +4009,7 @@ function addAnnotatorPrompt() {
 async function refreshForAnnotator() {
   await loadJudgeSettings();   // judge prompts are per-annotator — load this person's
   const files = await api(filesUrl());
-  if (Array.isArray(files)) { S.allFiles = files; renderFileList(files); }
+  if (Array.isArray(files)) { S.allFiles = files; renderFiles(); }
   loadFileComment();   // the comment is per-annotator — refetch on switch
   if (S.currentFile) {
     // Batches are SHARED (same list), but the per-user batch pick + labels/relations follow the
@@ -3985,6 +4077,12 @@ function filterFiles(q) {
     : S.allFiles);
 }
 
+// Re-render the file list HONOURING the current filter box — so selecting a file or switching
+// annotator doesn't reset an active search; it persists until the user clears the box.
+function renderFiles() {
+  filterFiles(document.getElementById('fileSearch')?.value || '');
+}
+
 // ─── Select file ─────────────────────────────────────────────
 function batchKey(fid) { return 'batch.' + (S.userName || '') + '.' + fid; }
 // Query string scoping every per-file fetch to the current annotator + selected batch.
@@ -4028,7 +4126,7 @@ async function selectFile(id) {
   document.getElementById('judgeBtn').classList.remove('active');
   document.getElementById('commentBtn').classList.remove('active');
   setSelInfo(null);
-  renderFileList(S.allFiles);
+  renderFiles();
   renderRunsPanel();
   renderViewerHead(file);
   renderViewer();
@@ -4179,7 +4277,8 @@ async function recomputeExplore() {
   });
   if (!selection.length) {
     S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: S.selThreshold };
-    renderRunsBtn(); renderViewer();
+    S.exploreFocus = null;
+    renderRunsBtn(); renderViewer(); renderRightPanel();
     return;
   }
   const res = await api(`/api/aggregate/${S.currentFile.id}`, 'POST', { selection, threshold: S.selThreshold });
@@ -4190,12 +4289,119 @@ async function recomputeExplore() {
     judgeTotal: (res && res.judge_total) || selection.length,
     threshold: Math.max(1, Math.min(S.selThreshold, selection.length)),
   };
-  renderRunsBtn(); renderViewer();
+  S.exploreFocus = null;
+  renderRunsBtn(); renderViewer(); renderRightPanel();
 }
 
 function resetExplore() {
   S.explore = { active: false, accepted: [], candidates: [], judgeTotal: 0, threshold: 1 };
-  renderRunsBtn(); renderViewer(); renderRunsModal();
+  S.exploreFocus = null;
+  renderRunsBtn(); renderViewer(); renderRightPanel(); renderRunsModal();
+}
+
+// A relation-style donut for an extract span: `n` of `judge_total` segments filled in the
+// kind colour, the rest grey. (Extract votes have no per-judge breakdown, so this is the
+// aggregate agreement, not a per-model ring.)
+function extractRingHTML(n, m, kind, eid) {
+  m = Math.max(m || 0, n || 0, 1);
+  const col = EXTRACT_COL[kind === 'context' ? 'context' : 'rule'].act;
+  const grey = 'rgba(150,150,170,0.22)';
+  const seg = 100 / m, stops = [];
+  for (let i = 0; i < m; i++)
+    stops.push(`${i < n ? col : grey} ${(i * seg).toFixed(2)}% ${((i + 1) * seg).toFixed(2)}%`);
+  const click = eid ? ` onclick="event.stopPropagation();openExploreVotes('${eid}')"` : '';
+  return `<span class="vote-ring" title="${n}/${m} judges proposed this — click for each model's decision"${click} style="background:conic-gradient(${stops.join(',')})"></span>`;
+}
+
+// Ring click: every SELECTED judge's decision for this consensus span (rule / context /
+// didn't propose) — the per-model breakdown for the current view, from /api/aggregate voters.
+function openExploreVotes(eid) {
+  const E = S.explore || {};
+  const span = [...(E.accepted || []), ...(E.candidates || [])].find(s => (s.char_start + '-' + s.char_end) === eid);
+  if (!span) return;
+  const voters = {};
+  for (const v of (span.voters || [])) voters[v.run_id + ':' + v.judge_idx] = v;
+  const sel = (S.judgeList || []).filter(j => S.judgeSel && S.judgeSel.has(j.run_id + ':' + j.judge_idx));
+  const rows = sel.map(j => {
+    const v = voters[j.run_id + ':' + j.judge_idx];
+    return { model: j.model, time: j.created_at, kind: v ? v.kind : null, voted: !!v };
+  }).sort((a, b) => (b.voted - a.voted) || prettyModel(a.model).localeCompare(prettyModel(b.model)));
+  const content = S.currentFile?.content || '';
+  const quote = content.slice(span.char_start, span.char_end).replace(/\s+/g, ' ').trim();
+  const colOf = k => k === 'context' ? '#a16207' : (k === 'rule' ? '#15803d' : '#b0b0c0');
+  const body = rows.map(r => `<tr>
+    <td class="vi-model">${esc(prettyModel(r.model))}</td>
+    <td class="vi-vote" style="color:${colOf(r.kind)}">${r.voted ? r.kind.toUpperCase() : '— no span'}</td>
+    <td class="vi-rat">${esc(fmtBatchTime(r.time))}</td></tr>`).join('');
+  document.getElementById('exploreVotes')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'exploreVotes'; modal.className = 'modal-backdrop';
+  modal.addEventListener('mousedown', e => { if (e.target === modal) modal.remove(); });
+  modal.innerHTML = `<div class="modal-card vi-card">
+    <div class="modal-head"><span class="tool-title">Model decisions · extract</span>
+      <span style="font-size:11px;color:#9090b0;margin-left:6px">${span.vote_count}/${E.judgeTotal} agreed ${esc(span.kind)} · accept ≥ ${E.threshold}</span>
+      <div style="flex:1"></div>
+      <button class="insp-exit" onclick="document.getElementById('exploreVotes').remove()" title="Close (Esc)">✕</button></div>
+    <div class="modal-body" style="overflow:auto;display:block">
+      <div class="vi-quote">${esc(quote)}</div>
+      <table class="vi-table"><thead><tr><th>Judge</th><th>Decision</th><th>Run</th></tr></thead>
+      <tbody>${body}</tbody></table>
+    </div></div>`;
+  document.body.appendChild(modal);
+}
+
+function setExploreKind(v) { S.exploreKind = v; renderExploreList(); }
+
+// Link a consensus span <-> its card: highlight + scroll both ways (view-only).
+function focusExplore(eid) {
+  S.exploreFocus = (S.exploreFocus === eid) ? null : eid;
+  document.querySelectorAll('#contentPre [data-eid]').forEach(el =>
+    el.classList.toggle('exp-focused', el.dataset.eid === S.exploreFocus));
+  renderExploreList();
+  if (S.exploreFocus) {
+    document.getElementById('ex-' + S.exploreFocus)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    document.querySelector(`#contentPre [data-eid="${S.exploreFocus}"]`)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+}
+
+// Right-panel list for the consensus explorer: accepted spans as cards with an agreement
+// ring; below-threshold candidates shown (shaded) only once a kind/category is chosen.
+function renderExploreList() {
+  const el = document.getElementById('inspector');
+  if (!el) return;
+  const E = S.explore || {};
+  const acc = E.accepted || [], cand = E.candidates || [], m = E.judgeTotal || 0;
+  const content = S.currentFile?.content || '';
+  const kind = S.exploreKind || 'all';
+  const kindOf = s => (s.kind === 'context' ? 'context' : 'rule');
+  const nRule = acc.filter(s => kindOf(s) === 'rule').length;
+  const nCtx = acc.filter(s => kindOf(s) === 'context').length;
+  const fAcc = acc.filter(s => kind === 'all' || kindOf(s) === kind).sort((a, b) => a.char_start - b.char_start);
+  const showCand = kind !== 'all';
+  const fCand = (showCand ? cand.filter(s => kindOf(s) === kind) : []).sort((a, b) => a.char_start - b.char_start);
+  const fbtn = (v, label, n) => `<button class="ex-fbtn${kind === v ? ' active' : ''}" onclick="setExploreKind('${v}')">${label}<span class="ex-fn">${n}</span></button>`;
+  const head = `<div class="rl-headbar">
+    <div class="rl-head-top"><div class="rl-head">${acc.length} accepted${showCand ? ` · ${fCand.length} below` : ''}</div></div>
+    <div class="ex-filter">${fbtn('all', 'All', acc.length)}${fbtn('rule', 'Rules', nRule)}${fbtn('context', 'Context', nCtx)}</div>
+    <div class="ex-hint">Consensus of the selected judges (view-only).${kind === 'all' ? ' Pick a kind to also see below-threshold spans.' : ''}</div>
+  </div>`;
+  const card = (s, isCand) => {
+    const k = kindOf(s), eid = s.char_start + '-' + s.char_end;
+    const focused = S.exploreFocus === eid;
+    const line = content.slice(0, s.char_start).split('\n').length;
+    const txt = content.slice(s.char_start, s.char_end).replace(/\s+/g, ' ').trim();
+    const ring = extractRingHTML(s.vote_count || 0, m, k, eid);
+    return `<div class="rl-item ex-card${isCand ? ' ex-cand' : ''}${focused ? ' active' : ''}" id="ex-${eid}" style="${rcVars({ bdr: EXTRACT_COL[k].act, bg: EXTRACT_COL[k].light })}" onclick="focusExplore('${eid}')">
+      <div class="rl-bar"></div>
+      <div class="rl-body"><div class="rl-header">
+        <div class="rl-top"><span class="rl-kind ${k}">${k.toUpperCase()}</span>${isCand ? '<span class="ex-below">below</span>' : ''}<span class="ex-pos">Line ${line}</span>
+          <span class="rl-flags rl-ring-wrap">${ring}<span class="rl-ring-cnt">${s.vote_count || 0}/${m}</span></span></div>
+        <div class="rl-text">${esc(txt.slice(0, 90))}${txt.length > 90 ? '…' : ''}</div>
+      </div></div>
+    </div>`;
+  };
+  const cards = fAcc.map(s => card(s, false)).join('') + fCand.map(s => card(s, true)).join('');
+  el.innerHTML = head + (cards || '<div class="insp-empty">No accepted spans for this kind.</div>');
 }
 
 function renderRunsModal() {
@@ -4218,10 +4424,9 @@ function renderRunsModal() {
   const judgeHTML = groups.length ? groups.map(g => {
     const items = g.items;
     const selN = items.filter(j => S.judgeSel.has(selKey(j))).length;
-    const expanded = S.judgeExpanded.has(g.model) || items.length === 1;
-    const expandable = items.length > 1;
-    const head = `<div class="je-model${expandable ? ' je-exp' : ''}"${expandable ? ` onclick="toggleExpand('${esc(g.model)}')"` : ''}>
-        <span class="je-caret">${expandable ? (expanded ? '▾' : '▸') : ''}</span>
+    const expanded = S.judgeExpanded.has(g.model);
+    const head = `<div class="je-model je-exp" onclick="toggleExpand('${esc(g.model)}')">
+        <span class="je-caret">${expanded ? '▾' : '▸'}</span>
         <span class="je-mname">${esc(prettyModel(g.model))}</span>
         <span class="je-count">${selN}/${items.length}</span>
       </div>`;
@@ -4230,6 +4435,7 @@ function renderRunsModal() {
           <input type="checkbox" class="je-cb" ${S.judgeSel.has(selKey(j)) ? 'checked' : ''}
                  onchange="toggleJudge('${esc(j.run_id)}', ${j.judge_idx})">
           <span class="je-time">${esc(fmtBatchTime(j.created_at))}</span>
+          ${j.temperature != null ? `<span class="je-temp" title="sampling temperature">temp ${Number.isInteger(j.temperature) ? j.temperature.toFixed(1) : j.temperature}</span>` : ''}
           <span class="je-spans">${j.span_count} span${j.span_count === 1 ? '' : 's'}</span>
         </div>`).join('') : '';
     return `<div class="je-group">${head}${leaves}</div>`;
@@ -4238,13 +4444,6 @@ function renderRunsModal() {
   const N = S.judgeSel.size;
   const K = Math.max(1, Math.min(S.selThreshold, N || 1));
   const E = S.explore || { accepted: [], candidates: [], active: false, judgeTotal: 0 };
-  const content = (f.content || '');
-  const acceptedList = (E.accepted || []).slice().sort((a, b) => a.char_start - b.char_start).map(s => {
-    const txt = content.slice(s.char_start, s.char_end).replace(/\s+/g, ' ').trim().slice(0, 90);
-    return `<div class="exp-item exp-${s.kind === 'context' ? 'ctx' : 'rule'}">
-        <span class="exp-ring">${s.vote_count}/${E.judgeTotal || N}</span>
-        <span class="exp-txt">${esc(txt)}</span></div>`;
-  }).join('');
 
   const thrBlock = N >= 1 ? `
       <div class="runs-thr">
@@ -4273,7 +4472,6 @@ function renderRunsModal() {
         <div class="je-hint">Check the judge results to pool, then set the threshold. The document shows the accepted consensus (view-only).</div>
         <div class="je-list">${judgeHTML}</div>
         ${thrBlock}
-        ${E.active && acceptedList ? `<div class="exp-head">Accepted spans</div><div class="exp-list">${acceptedList}</div>` : ''}
       </div>
     </div>`;
 }
@@ -4296,15 +4494,15 @@ function exploreContentHTML(content) {
     const cover = ivs.filter(iv => iv.a <= p && iv.b >= q);
     const acc = cover.filter(c => c.acc), cand = cover.filter(c => c.cand);
     if (acc.length) {
-      const kind = acc[0].acc.kind === 'context' ? 'context' : 'rule';
-      const nj = Math.max(...acc.map(c => c.acc.vote_count || 1));
-      const title = escAttr(`accepted ${kind} · ${nj}/${E.judgeTotal} judges`);
-      html += `<span class="exp-acc" style="background:${EXTRACT_COL[kind].act}" title="${title}">${escHtml(seg)}</span>`;
+      const sp = acc[0].acc, kind = sp.kind === 'context' ? 'context' : 'rule';
+      const eid = sp.char_start + '-' + sp.char_end;
+      const title = escAttr(`accepted ${kind} · ${sp.vote_count}/${E.judgeTotal} judges — click to locate`);
+      html += `<span class="exp-acc${S.exploreFocus === eid ? ' exp-focused' : ''}" data-eid="${eid}" style="background:${EXTRACT_COL[kind].act}" title="${title}">${escHtml(seg)}</span>`;
     } else if (cand.length) {
-      const kind = cand[0].cand.kind === 'context' ? 'context' : 'rule';
-      const nj = Math.max(...cand.map(c => c.cand.vote_count || 1));
-      const title = escAttr(`candidate ${kind} · ${nj}/${E.judgeTotal} judges (below threshold)`);
-      html += `<span class="cand-hl" style="background:${EXTRACT_COL[kind].light}" title="${title}">${escHtml(seg)}</span>`;
+      const sp = cand[0].cand, kind = sp.kind === 'context' ? 'context' : 'rule';
+      const eid = sp.char_start + '-' + sp.char_end;
+      const title = escAttr(`candidate ${kind} · ${sp.vote_count}/${E.judgeTotal} judges (below threshold) — click to locate`);
+      html += `<span class="cand-hl exp-cand${S.exploreFocus === eid ? ' exp-focused' : ''}" data-eid="${eid}" style="background:${EXTRACT_COL[kind].light}" title="${title}">${escHtml(seg)}</span>`;
     } else {
       html += escHtml(seg);
     }
@@ -4371,6 +4569,11 @@ function renderViewer() {
   // NOTE: drag-select → Add is captured by a document-level 'mouseup' (added once
   // below), so it still works when the drag is released outside the <pre>.
   pre.addEventListener('click', e => {
+    if (S.explore && S.explore.active) {            // consensus overlay: click a span to locate its card
+      const ex = e.target.closest?.('[data-eid]');
+      if (ex) focusExplore(ex.dataset.eid);
+      return;
+    }
     const span = e.target.closest?.('.rule-hl');
     if (S.mode === 'relation') {
       if (!span) return;
@@ -4508,7 +4711,7 @@ function listBarColor(r) {
 
 // letter-based highlighting: segment text on every rule boundary, styled per mode.
 function renderContent(content, rules) {
-  if (S.explore && S.explore.active) return exploreContentHTML(content);   // read-only consensus overlay
+  if (S.explore && S.explore.active && S.mode === 'extract') return exploreContentHTML(content);   // consensus overlay (Extract stage only)
   const ivs = [];
   for (const r of rules) {
     for (const [a, b] of getRuleSpans(r)) if (b > a) ivs.push({ a, b, r });
@@ -4801,6 +5004,7 @@ function setFocusedRule(id) {
 }
 
 function renderRightPanel() {
+  if (S.explore && S.explore.active && S.mode === 'extract') return renderExploreList();   // consensus list only in Extract; Label/Relation keep their own interface
   if (S.mode === 'relation') renderRelationList();
   else renderRuleList();
 }
@@ -5254,7 +5458,7 @@ function renderRuleList() {
       </div>
     </div>`;
   }).join('');
-  el.innerHTML = head + items;
+  el.innerHTML = head + items + extractCandHTML();
   if (S.focusedRuleId) {
     autoGrow(document.getElementById('inspRationale'));
     autoGrow(document.getElementById('inspComment'));
@@ -5548,8 +5752,80 @@ function relRingHTML(rel) {
     votes.length + ' judge votes — click to inspect');
 }
 function badgeHTML(r) {
-  if (S.mode === 'extract') return kindBadge(r);
+  if (S.mode === 'extract') return kindBadge(r) + extractCardRingHTML(r);
   return tagBadgeOnly(r) + labelRingHTML(r);
+}
+// Agreement ring for a committed Extract span (vote_count/judge_total); click → per-model decisions.
+function extractCardRingHTML(r) {
+  if (r.vote_count == null || !r.judge_total) return '';
+  const k = ruleKind(r);
+  return `<span class="rl-ring-wrap" style="cursor:pointer" title="${r.vote_count}/${r.judge_total} judges — click for each model's decision"`
+    + ` onclick="event.stopPropagation();openExtractVotes('${r.id}')">${extractRingHTML(r.vote_count, r.judge_total, k)}`
+    + `<span class="rl-ring-cnt">${r.vote_count}/${r.judge_total}</span></span>`;
+}
+// Each judge's decision for a committed Extract rule — overlap its span against the batch's
+// stored extract votes (client-side; extract votes carry no rule_id, so we match by span).
+function openExtractVotes(ruleId) {
+  const r = ruleById(ruleId), info = S.judge.extract;
+  if (!r || !info) return;
+  const rs = Number(r.char_start), re = Number(r.char_end);
+  if (!(re > rs)) return;
+  const seen = {};
+  for (const v of (info.votes || [])) {
+    if (v.char_start == null || v.char_end == null) continue;
+    const inter = Math.max(0, Math.min(re, v.char_end) - Math.max(rs, v.char_start));
+    if (inter <= 0) continue;
+    const recip = Math.min(inter / (re - rs), inter / ((v.char_end - v.char_start) || 1));
+    if (recip >= 0.5 && seen[v.judge_idx] == null) seen[v.judge_idx] = { model: v.model, kind: v.kind };
+  }
+  const models = info.models || [];
+  const list = (models.length
+    ? models.map((model, idx) => ({ model, kind: seen[idx] && seen[idx].kind, voted: !!seen[idx] }))
+    : Object.values(seen).map(v => ({ model: v.model, kind: v.kind, voted: true })))
+    .sort((a, b) => (b.voted - a.voted) || prettyModel(a.model).localeCompare(prettyModel(b.model)));
+  const colOf = k => k === 'context' ? '#a16207' : (k === 'rule' ? '#15803d' : '#b0b0c0');
+  const body = list.map(x => `<tr><td class="vi-model">${esc(prettyModel(x.model))}</td>`
+    + `<td class="vi-vote" style="color:${colOf(x.kind)}">${x.voted ? (x.kind || '').toUpperCase() : '— no span'}</td></tr>`).join('');
+  document.getElementById('voteInspector')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'voteInspector'; modal.className = 'modal-backdrop';
+  modal.addEventListener('mousedown', e => { if (e.target === modal) modal.remove(); });
+  modal.innerHTML = `<div class="modal-card vi-card">
+    <div class="modal-head"><span class="tool-title">Model decisions · extract</span>
+      <span style="font-size:11px;color:#9090b0;margin-left:6px">${r.vote_count}/${r.judge_total} agreed ${esc(ruleKind(r))}</span>
+      <div style="flex:1"></div>
+      <button class="insp-exit" onclick="document.getElementById('voteInspector').remove()" title="Close (Esc)">✕</button></div>
+    <div class="modal-body" style="overflow:auto;display:block">
+      <div class="vi-quote">${esc(r.rule_text)}</div>
+      <table class="vi-table"><thead><tr><th>Judge</th><th>Decision</th></tr></thead><tbody>${body}</tbody></table>
+    </div></div>`;
+  document.body.appendChild(modal);
+}
+// Below-threshold ("unmatched") Extract spans — shown shaded once a kind/category is chosen.
+function extractCandHTML() {
+  if (S.mode !== 'extract') return '';
+  const ft = curFilterType();
+  if (ft !== 'rule' && ft !== 'context') return '';
+  const info = S.judge.extract, cands = (info && info.candidates) || [], jt = (info && info.judge_total) || 0;
+  const matching = cands.filter(c => (c.kind === 'context' ? 'context' : 'rule') === ft)
+                        .sort((a, b) => a.char_start - b.char_start);
+  if (!matching.length) return '';
+  return `<div class="rl-cand-head">${matching.length} below threshold · ${ft}</div>`
+    + matching.map(c => candCardHTML(c, jt)).join('');
+}
+function candCardHTML(c, jt) {
+  const k = c.kind === 'context' ? 'context' : 'rule';
+  const content = S.currentFile?.content || '';
+  const txt = content.slice(c.char_start, c.char_end).replace(/\s+/g, ' ').trim();
+  const line = content.slice(0, c.char_start).split('\n').length;
+  return `<div class="rl-item ex-cand" style="${rcVars({ bdr: EXTRACT_COL[k].act, bg: EXTRACT_COL[k].light })}">
+    <div class="rl-bar"></div>
+    <div class="rl-body"><div class="rl-header">
+      <div class="rl-top"><span class="rl-kind ${k}">${k.toUpperCase()}</span><span class="ex-below">below</span><span class="rl-pos">Line ${line}</span>
+        <span class="rl-flags rl-ring-wrap">${extractRingHTML(c.vote_count || 0, jt, k)}<span class="rl-ring-cnt">${c.vote_count || 0}/${jt}</span></span></div>
+      <div class="rl-text">${esc(txt.slice(0, 90))}${txt.length > 90 ? '…' : ''}</div>
+    </div></div>
+  </div>`;
 }
 
 function refreshTagSection(r) {
@@ -6070,6 +6346,7 @@ document.addEventListener('keydown', e => {
   }
   if (e.key === 'Escape' && document.getElementById('exportMenu')) { closeExportMenu(); return; }
   if (e.key === 'Escape' && document.getElementById('voteInspector')) { document.getElementById('voteInspector').remove(); return; }
+  if (e.key === 'Escape' && document.getElementById('exploreVotes')) { document.getElementById('exploreVotes').remove(); return; }
   if (e.key === 'Escape' && S.runsOpen) { toggleRuns(); return; }
   // Ctrl/⌘+Z reverts the last add / labeling action. In a text field, let the browser
   // do its own text undo. (Shift+Z is left alone — no redo.)
